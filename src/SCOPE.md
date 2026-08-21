@@ -10,7 +10,9 @@ Charging points are physically exclusive resources: one connector serves one veh
 
 The system coordinates three things: which vehicle gets which connector, how the limited electrical capacity of a site is shared among the vehicles currently charging, and what happens to both when a node fails.
 
-**The network serves registered users**, not anonymous passers-by: an operator's subscribers, or a company's employees and fleet. This is what makes reservations worth offering at all — most public fast-charging networks do not allow them, because holding a scarce outlet empty while it waits for someone lowers utilisation. With identified users the trade becomes worthwhile, and it also makes the abuse of the privilege answerable (§3.3), which it would not be for anonymous ones.
+The service is open to anyone driving an electric vehicle. Users hold an account, as they do with every charging application, because a session has to be attributed to someone and billed — so drivers are identified even though the network is public.
+
+**On reservations.** Most public networks do not offer them today, and the reason is economic rather than technical: an outlet held for someone who has not arrived yet earns nothing, which lowers the utilisation of an already scarce resource. That objection is exactly what two mechanisms in this system answer. A reservation is a **short lease** (§3.3), so the idle window is bounded and closes itself rather than staying open indefinitely; and **repeated abuse suspends the privilege** (§3.3), so no one can hoard outlets at zero cost. Reserving is treated here as a feature that has to earn its keep.
 
 ## 2. Actors
 
