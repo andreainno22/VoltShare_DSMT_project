@@ -1,6 +1,3 @@
-# Ignora tutto il contenuto della root...
 /*
-
-# ...tranne la cartella src (e questo file stesso)
 !/.gitignore
 !/src/
