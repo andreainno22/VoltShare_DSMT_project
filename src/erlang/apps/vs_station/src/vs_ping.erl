@@ -4,8 +4,10 @@
 %%%
 %%% It is deliberately shaped like `vs_claim_client', the module that will
 %%% replace it in M1: a `gen_server' that owns the link to a remote node,
-%%% calls it with an explicit timeout, and re-arms a periodic tick with
-%%% `erlang:send_after/3'. What it proves is exactly what the deployment
+%%% probes it from a throw-away process with an explicit timeout, and
+%%% re-arms a periodic tick with `erlang:send_after/3'. The server itself
+%%% never blocks on the remote node — see scelte_di_progetto.md §"Chiamate
+%%% remote". What it proves is exactly what the deployment
 %%% risks (piano §10): node naming, cookie, and DNS between containers.
 %%%
 %%% Server side  — answers `ping' from anyone.
@@ -92,21 +94,27 @@ handle_cast(_Msg, State) ->
 
 %% --- client side: periodic probe ------------------------------------
 handle_info(tick, State = #state{target = Target, timeout_ms = Timeout}) ->
-    NewState =
-        case call_remote(Target, Timeout) of
-            {pong, Remote} ->
-                logger:notice("ping ~p -> pong from ~p", [Target, Remote]),
-                State#state{sent = State#state.sent + 1,
-                            ok   = State#state.ok + 1};
-            {error, Reason} ->
-                %% A dead coordinator must never stop the station: log and
-                %% keep ticking. This is the failure mode M3 builds on.
-                logger:warning("ping ~p failed: ~p", [Target, Reason]),
-                State#state{sent   = State#state.sent + 1,
-                            failed = State#state.failed + 1}
-        end,
+    %% The probe runs in a throw-away process, NOT here. A gen_server is a
+    %% single process: while it sits inside handle_info it cannot serve
+    %% handle_call. Two stations probing each other on the same tick would
+    %% each block waiting for a reply the other cannot give until it has
+    %% itself timed out — a mutual deadlock that is stable, because both
+    %% sides then re-arm in lockstep. Delegating keeps the server free to
+    %% answer while its own probe is in flight.
+    Self = self(),
+    spawn(fun() -> Self ! {ping_result, call_remote(Target, Timeout)} end),
     erlang:send_after(State#state.interval_ms, self(), tick),
-    {noreply, NewState};
+    {noreply, State#state{sent = State#state.sent + 1}};
+
+handle_info({ping_result, {pong, Remote}}, State) ->
+    logger:notice("ping ~p -> pong from ~p", [State#state.target, Remote]),
+    {noreply, State#state{ok = State#state.ok + 1}};
+
+handle_info({ping_result, {error, Reason}}, State) ->
+    %% A dead coordinator must never stop the station: log and keep
+    %% ticking. This is the failure mode M3 builds on.
+    logger:warning("ping ~p failed: ~p", [State#state.target, Reason]),
+    {noreply, State#state{failed = State#state.failed + 1}};
 
 handle_info(_Info, State) ->
     {noreply, State}.

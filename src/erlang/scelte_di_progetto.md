@@ -64,7 +64,57 @@ Questa è anche la risposta a P1: le richieste concorrenti sullo stesso connetto
 
 ---
 
-## 4. Comunicazione fra nodi
+## 4. Il connettore (`vs_connector`)
+
+### 4.1 `gen_statem` e non `gen_server`
+
+**Perché**: il connettore *è* una macchina a stati, e con `state_functions` ogni stato è una funzione: un evento che non ha senso in quello stato semplicemente non fa match. Non esiste un ramo di codice che possa avviare una sessione su un connettore prenotato da un altro, perché da `held` con il veicolo sbagliato non si arriva a `charging`. Con un `gen_server` la stessa garanzia sarebbe un `case` su un campo di stato, cioè una convenzione che si può dimenticare in una `handle_call` aggiunta sei settimane dopo.
+
+Vale anche per i timer: `state_timeout` viene annullato automaticamente a ogni cambio di stato, quindi il lease non può sopravvivere alla prenotazione a cui appartiene. Con un timer manuale servirebbe cancellarlo su ogni uscita — e la dimenticanza si manifesterebbe come una prenotazione liberata a caso mezz'ora dopo.
+
+### 4.2 `callback_mode` con `state_enter`
+
+**Perché**: il lease viene armato entrando in `held` e in nessun altro punto, quindi nessun percorso può raggiungere `held` senza scadenza. Allo stesso modo tutto ciò che deve accadere esattamente una volta a fine sessione (scrittura della riga, rilascio del claim, notifica) sta nell'ingresso in `closing`, invece di essere ripetuto in ognuna delle transizioni che ci arrivano — stop del conducente, cavo staccato, claim revocato.
+
+### 4.3 `claim_mod` e `db_mod` iniettati come opzioni
+
+**Perché**: il connettore conosce l'interfaccia del claim, non il suo trasporto. Con un modulo iniettabile la macchina a stati si testa contro tutti i rifiuti previsti dal contratto senza coordinatore, senza rete e senza MySQL — 22 test in 150 ms. È anche ciò che permette di sviluppare la parte A prima che esista `vs_coord`.
+
+*Perché non una libreria di mock?* Perché aggiungerebbe una dipendenza per ottenere ciò che due opzioni già danno, e perché un modulo stub scritto a mano è leggibile in dieci righe.
+
+### 4.4 Il default `vs_claim_null` concede sempre, ma lo urla nel log
+
+**Perché**: la stazione deve essere avviabile e giocabile dalla shell prima che il claim client esista. Il rischio è che un default permissivo resti per errore e violi P2 in silenzio: per questo ogni concessione emette un `logger:warning` con scritto che il claim non è coordinato. Un difetto che si vede nel log è un difetto che si trova.
+
+### 4.5 Il rifiuto arriva come atomo, non come codice del protocollo
+
+Il connettore restituisce `already_held`, `no_claim`, `suspended`…; è `vs_driver_ws` a trasformarli nei codici maiuscoli di `ws-driver.md`.
+
+**Perché**: la macchina a stati non deve sapere che esiste un WebSocket. Lo stesso connettore risponde identicamente a un comando che arrivasse dalla colonnina o da un test, e cambiare la formattazione del protocollo non tocca la logica.
+
+### 4.6 Walk-in senza claim
+
+Un'auto collegata a un connettore libero avvia la sessione senza chiedere nulla al coordinatore.
+
+**Perché**: la prenotazione è una promessa sul futuro, non un permesso a caricare. Rifiutare un'auto già collegata a una presa libera perché il coordinatore è irraggiungibile sarebbe assurdo, e disallineerebbe il sistema dalla realtà fisica (l'auto è lì). È anche il motivo per cui la penalità da no-show sospende il prenotare e non il caricare (SCOPE §3.3): la sanzione toglie un privilegio, non lascia a piedi nessuno.
+
+### 4.7 L'energia è cumulativa e monotòna
+
+Il connettore conserva `max(memorizzato, riportato)`.
+
+**Perché**: un contatore che si azzera per un glitch del firmware non deve sottrarre energia già erogata — che è denaro. Il costo di questa scelta è che una lettura anomala verso l'alto resta: accettato, perché sovrastimare una volta è un errore correggibile a mano, mentre perdere energia già fatturata è un errore che non si vede.
+
+### 4.8 La revoca vince, anche a sessione avviata
+
+**Perché**: lo dice il contratto (claim.md §5.4), ed è la conseguenza logica del fatto che l'autorità sui claim è il coordinatore. È il percorso più raro del sistema e quello che conviene di più avere giusto: la sessione viene chiusa, l'energia già erogata è comunque scritta e fatturata, il conducente riceve il motivo. Una revoca che riguarda un claim mai posseduto viene ignorata, così un messaggio in ritardo da un leader precedente non libera il connettore di qualcun altro.
+
+### 4.9 Se la scrittura su MySQL fallisce, il connettore si libera lo stesso
+
+**Perché**: l'auto ha già caricato. Perdere la riga è un problema di fatturazione, perdere il connettore è un problema di servizio: si registra l'errore e si prosegue. È anche il motivo per cui la scrittura avviene a fine sessione e non durante — il database non sta sul percorso critico dell'erogazione.
+
+---
+
+## 5. Comunicazione fra nodi
 
 ### 4.1 Erlang distribuito nativo fra stazione e coordinatore, non un broker
 
@@ -82,20 +132,32 @@ Questa è anche la risposta a P1: le richieste concorrenti sullo stesso connetto
 
 Il valore (2000 ms, `CLAIM_CALL_TIMEOUT_MS`) è la parte assunta del sistema sincrono: come dice DESIGN-NOTES §6, sbagliare il timeout costa un failover inutile, non una doppia prenotazione — la correttezza la garantisce il quorum, non il timer.
 
-### 4.4 `vs_claim_client` come unico processo che parla col coordinatore
+### 4.4 Chiamate remote delegate a un processo effimero, mai eseguite nel `gen_server`
+
+Il tick di `vs_ping` (e in M1 quello di `vs_claim_client`) fa `spawn` di un processo che esegue la chiamata remota e rimanda l'esito al server come messaggio `{ping_result, _}`. Il server aggiorna i contatori quando l'esito arriva.
+
+**Perché**: un `gen_server` è un processo solo e serve una richiesta alla volta. Finché è dentro `handle_info` non può eseguire `handle_call`. Se due nodi si interrogano a vicenda sullo stesso tick, ciascuno resta bloccato in attesa di una risposta che l'altro non può dare — e il timeout non è una via d'uscita, perché entrambi riarmano insieme e restano in fase. È un **deadlock stabile**, non una perdita transitoria.
+
+Non è teoria: in M0 le due stazioni ci sono cadute davvero. Con `docker compose up --build` i container partivano a qualche decina di millisecondi di distanza e i `pong` funzionavano; dopo un `docker compose restart` ripartivano nello stesso istante e il deadlock scattava dal primo tick. La diagnosi che lo ha inchiodato: un nodo terzo avviato dentro lo stesso container faceva `pong` senza problemi — quindi rete, EPMD, cookie e handshake erano sani, e l'unica cosa rotta era la reciprocità fra i due `vs_ping`.
+
+*Perché non basta sfasare gli intervalli con del jitter?* Perché rende il deadlock raro invece che impossibile, e un guasto raro in un sistema distribuito è peggio di uno sistematico: si presenta alla demo e non si riproduce. La delega toglie la condizione, non la probabilità.
+
+La conseguenza vera è su M1: se `vs_claim_client` bloccasse sul coordinatore, un coordinatore lento congelerebbe tutta la stazione, sessioni di ricarica comprese — l'opposto della regola "niente coordinatore, ma le sessioni continuano" di §4.3.
+
+### 4.5 `vs_claim_client` come unico processo che parla col coordinatore
 
 **Perché**: i rinnovi vanno raggruppati (un solo messaggio `renew` per stazione ogni 10 s, non uno per connettore) e il nodo leader corrente è uno stato solo, aggiornato in un posto solo quando arriva un `{not_serving, Leader}`. Se ogni connettore parlasse per conto proprio, ogni connettore dovrebbe scoprire il nuovo leader da sé, moltiplicando i messaggi durante un failover — cioè proprio quando la rete è già in difficoltà.
 
 ---
 
-## 5. Verifica
+## 6. Verifica
 
-### 5.1 Logica pura separata dai processi, testata con EUnit
+### 6.1 Logica pura separata dai processi, testata con EUnit
 
 Il riparto della potenza e le decisioni di stato sono funzioni pure chiamate dai `gen_server`/`gen_statem`, non logica dentro i callback.
 
 **Perché**: una funzione pura si testa con una tabella di casi e senza avviare nulla. Testare l'algoritmo di riparto attraverso i messaggi di un processo richiederebbe di orchestrare processi per verificare una divisione.
 
-### 5.2 Il probe M0 (`vs_ping`) ha la forma del client dei claim
+### 6.2 Il probe M0 (`vs_ping`) ha la forma del client dei claim
 
 **Perché**: non è codice usa e getta. Verifica esattamente ciò che rischia di rompersi nel deploy (nomi, cookie, DNS) usando lo stesso schema che userà `vs_claim_client`: gen_server, call remota con timeout, tick con `erlang:send_after/3`, errore trattato come valore. Quando arriva M1, il modulo vero è una riscrittura di qualcosa di già visto funzionare.
