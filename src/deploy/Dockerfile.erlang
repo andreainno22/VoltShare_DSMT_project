@@ -1,0 +1,27 @@
+# One image for every Erlang node: station and coordinator differ only by
+# the application they start and by their environment. Build context is
+# `src/`, so both `erlang/` and `deploy/` are visible.
+
+FROM erlang:26-alpine AS build
+
+WORKDIR /build
+COPY erlang/rebar.config ./
+COPY erlang/apps ./apps
+RUN rebar3 compile
+
+FROM erlang:26-alpine
+
+RUN apk add --no-cache bash
+WORKDIR /app
+COPY --from=build /build/_build/default/lib /app/lib
+COPY deploy/start-node.sh /app/start-node.sh
+RUN chmod +x /app/start-node.sh
+
+# Short names (-sname) are enough: on a compose network every container
+# resolves the others by service name. Long names (-name) would demand a
+# FQDN and buy nothing here.
+ENV ERLANG_COOKIE=voltshare \
+    NODE_SNAME=vs \
+    ERL_APP=vs_station
+
+ENTRYPOINT ["/app/start-node.sh"]

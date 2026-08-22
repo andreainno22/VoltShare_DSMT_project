@@ -1,0 +1,132 @@
+# VoltShare — deployment
+#
+#   docker compose up --build          from src/deploy/
+#   docker compose logs -f station1    watch the M0 ping
+#
+# M0 runs MySQL and two station nodes that ping each other: that is the
+# "two Erlang containers exchanging a message" check, and it exercises the
+# three things that usually break — node names, cookie, DNS between
+# containers. The coordinators and the back office are declared below and
+# commented out; B enables them as vs_coord and the Tomcat image appear.
+
+name: voltshare
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    hostname: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: voltshare
+      MYSQL_DATABASE: voltshare
+      MYSQL_USER: voltshare
+      MYSQL_PASSWORD: voltshare
+    # schema.sql lives in contracts/ because it is a shared contract; it is
+    # mounted here rather than copied, so there is only one copy to change.
+    volumes:
+      - ../contracts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pvoltshare"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [voltshare]
+
+  station1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.erlang
+    container_name: station1
+    hostname: station1
+    environment:
+      NODE_SNAME: vs
+      ERL_APP: vs_station
+      ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
+      STATION_ID: 1
+      # M0 only: probe the other station. In M1 this is replaced by
+      # COORD_NODES and the real claim client.
+      PING_TARGET: vs@station2
+      PING_INTERVAL_MS: 3000
+      # M1+
+      COORD_NODES: vs@coord1,vs@coord2,vs@coord3
+      MYSQL_HOST: mysql
+      LEASE_SECONDS: ${LEASE_SECONDS:-900}
+      VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me}
+    ports:
+      - "9101:8080"   # driver WebSocket  (M1)
+      - "9201:8081"   # charge point      (M2)
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks: [voltshare]
+
+  station2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.erlang
+    container_name: station2
+    hostname: station2
+    environment:
+      NODE_SNAME: vs
+      ERL_APP: vs_station
+      ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
+      STATION_ID: 2
+      PING_TARGET: vs@station1
+      PING_INTERVAL_MS: 3000
+      COORD_NODES: vs@coord1,vs@coord2,vs@coord3
+      MYSQL_HOST: mysql
+      LEASE_SECONDS: ${LEASE_SECONDS:-900}
+      VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me}
+    ports:
+      - "9102:8080"
+      - "9202:8081"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks: [voltshare]
+
+  # ---------------------------------------------------------------- B
+  # Enable when apps/vs_coord exists. Same image, different ERL_APP.
+  #
+  # coord1: &coord
+  #   build:
+  #     context: ..
+  #     dockerfile: deploy/Dockerfile.erlang
+  #   container_name: coord1
+  #   hostname: coord1
+  #   environment:
+  #     NODE_SNAME: vs
+  #     ERL_APP: vs_coord
+  #     ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
+  #     COORD_NODES: vs@coord1,vs@coord2,vs@coord3
+  #     COORD_ID: 1                # bully priority: highest id wins
+  #   networks: [voltshare]
+  #
+  # coord2:
+  #   <<: *coord
+  #   container_name: coord2
+  #   hostname: coord2
+  #   environment: { NODE_SNAME: vs, ERL_APP: vs_coord, COORD_ID: 2,
+  #                  ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare},
+  #                  COORD_NODES: vs@coord1,vs@coord2,vs@coord3 }
+  #
+  # coord3: ... same with COORD_ID: 3
+  #
+  # backoffice:
+  #   build: { context: .., dockerfile: deploy/Dockerfile.backoffice }
+  #   container_name: backoffice
+  #   hostname: backoffice
+  #   environment:
+  #     ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
+  #     VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me}
+  #     MYSQL_HOST: mysql
+  #   ports: ["8080:8080"]
+  #   depends_on: [mysql, coord1]
+  #   networks: [voltshare]
+
+networks:
+  voltshare:
+    driver: bridge
