@@ -2,14 +2,14 @@
 # the application they start and by their environment. Build context is
 # `src/`, so both `erlang/` and `deploy/` are visible.
 
-FROM erlang:26-alpine AS build
+FROM erlang:29-alpine AS build
 
 WORKDIR /build
 COPY erlang/rebar.config ./
 COPY erlang/apps ./apps
 RUN rebar3 compile
 
-FROM erlang:26-alpine
+FROM erlang:29-alpine
 
 RUN apk add --no-cache bash
 WORKDIR /app

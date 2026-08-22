@@ -401,15 +401,28 @@ session_from(Info, ClaimId) ->
 %% retried into a queue nobody drains.
 release(#data{hold = undefined, session = undefined}, _Reason) ->
     ok;
-release(#data{claim_mod = Mod, hold = Hold, session = S}, Reason) ->
+release(#data{claim_mod = Mod, conn_id = ConnId, hold = Hold, session = S}, Reason) ->
     ClaimId = case {Hold, S} of
                   {#hold{claim_id = C}, _} -> C;
                   {_, #session{claim_id = C}} -> C;
                   _ -> undefined
               end,
     case ClaimId of
-        undefined -> ok;   %% walk-in: there was never a claim
-        _         -> catch Mod:release(ClaimId, Reason), ok
+        undefined ->
+            ok;   %% walk-in: there was never a claim
+        _ ->
+            %% `try', not the old `catch Expr': that form is deprecated from
+            %% OTP 29 and, with warnings_as_errors, stops the build. It also
+            %% swallowed the reason, while the contract above says a failed
+            %% release is *logged* and forgotten.
+            try Mod:release(ClaimId, Reason) of
+                _ -> ok
+            catch
+                Class:Why ->
+                    logger:warning("connector ~p release of claim ~s failed: ~p:~p",
+                                   [ConnId, ClaimId, Class, Why]),
+                    ok
+            end
     end.
 
 notify(#data{notify_to = undefined}, _Event) -> ok;

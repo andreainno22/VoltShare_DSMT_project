@@ -22,6 +22,18 @@ Stadio 1 con la toolchain rebar3, stadio 2 con solo i `.beam` compilati.
 
 **Perché**: l'immagine finale non contiene i sorgenti né il compilatore. È l'abitudine corretta e costa due righe; in più rende evidente che il nodo esegue codice compilato, non uno script.
 
+## 3.1 Versione di OTP fissata, e fissata *uguale* a quella di sviluppo
+
+`Dockerfile.erlang` usa `erlang:29-alpine`, non `erlang:latest`, e la stessa major è quella installata sulle macchine di sviluppo.
+
+**Perché fissarla**: un tag mobile cambia sotto i piedi. Una rebuild il giorno della consegna, con una major nuova nel frattempo, sposta il debug dal progetto alla toolchain nel momento peggiore.
+
+**Perché allinearla allo sviluppo**: `rebar.config` ha `warnings_as_errors`, quindi ogni warning nuovo introdotto da un compilatore più recente è un build che fallisce. Con versioni diverse fra macchina e container il fallimento è *asimmetrico* — compila di là e non di qua — e sembra un problema di Docker quando è un problema di codice.
+
+È successo davvero: il progetto era partito su OTP 26 nell'immagine mentre la macchina aveva OTP 29. Allineando l'immagine a 29 è emerso subito che `vs_connector` usava la forma `catch Expr`, deprecata da OTP 29. Il disallineamento non aveva creato il difetto, l'aveva solo nascosto: `warnings_as_errors` ha fatto il suo mestiere appena le due versioni hanno smesso di divergere.
+
+*Perché non allineare al contrario, riportando lo sviluppo a 26?* Perché avrebbe congelato il progetto su una versione del 2023 per non toccare una riga di codice deprecato — e la riga andava riscritta comunque.
+
 ## 4. `start-node.sh` invece di una release OTP (`relx`)
 
 **Perché**: una release è la forma giusta per la produzione (VM inclusa, hot upgrade, `bin/app start`), ma introduce `vm.args`, `sys.config` e i profili di rilascio in un momento in cui il rischio da abbattere è un altro: far parlare due nodi. Uno script che invoca `erl` con `-sname`, `-setcookie` e `-pa` rende visibile in tre righe *esattamente* come il nodo viene battezzato — che è il punto in cui le cose si rompono davvero.
