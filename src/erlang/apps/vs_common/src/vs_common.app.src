@@ -1,0 +1,9 @@
+{application, vs_common,
+ [{description, "VoltShare — helpers shared by station and coordinator"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, []},
+  {licenses, ["MIT"]}
+ ]}.

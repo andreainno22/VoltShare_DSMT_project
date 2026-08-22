@@ -1,0 +1,10 @@
+{application, vs_station,
+ [{description, "VoltShare — station controller (part A)"},
+  {vsn, "0.1.0"},
+  {registered, [vs_station_sup, vs_ping]},
+  {mod, {vs_station_app, []}},
+  {applications, [kernel, stdlib, vs_common]},
+  {env, []},
+  {modules, []},
+  {licenses, ["MIT"]}
+ ]}.
