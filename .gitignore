@@ -1,3 +1,13 @@
 /*
 !/.gitignore
+!/.gitattributes
 !/src/
+
+# build artefacts inside the versioned tree
+src/erlang/_build/
+src/erlang/rebar.lock
+src/backoffice/target/
+src/emulator/node_modules/
+*.beam
+*.dump
+.env

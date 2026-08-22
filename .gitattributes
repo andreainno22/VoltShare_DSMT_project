@@ -1,0 +1,15 @@
+# Line endings. Windows checkouts are free to use CRLF for text, but a few
+# file types must stay LF or they break where they are consumed:
+#   *.sh          copied into a Linux container — a CRLF shebang line fails
+#   Dockerfile*   same
+#   *.erl *.sql   read by tools that are stricter than they should be
+* text=auto
+
+*.sh        text eol=lf
+Dockerfile* text eol=lf
+*.erl       text eol=lf
+*.app.src   text eol=lf
+*.config    text eol=lf
+*.sql       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
