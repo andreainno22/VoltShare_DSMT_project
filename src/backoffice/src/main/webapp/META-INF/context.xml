@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Pooled JDBC DataSource, looked up as java:comp/env/jdbc/VoltShareDS (see dao/Db.java).
+
+  The pool is sized for the traffic this application actually has: page loads and the
+  occasional billing update. Gameplay traffic does not come through here at all — it goes
+  straight to the Erlang stations over WebSocket — which is why a small pool is enough.
+-->
+<Context>
+    <Resource name="jdbc/VoltShareDS"
+              auth="Container"
+              type="javax.sql.DataSource"
+              factory="org.apache.tomcat.jdbc.pool.DataSourceFactory"
+              driverClassName="com.mysql.cj.jdbc.Driver"
+              url="jdbc:mysql://${DB_HOST}:${DB_PORT}/${DB_NAME}?useSSL=false&amp;allowPublicKeyRetrieval=true&amp;serverTimezone=UTC"
+              username="${DB_USER}"
+              password="${DB_PASSWORD}"
+
+              maxActive="20"
+              minIdle="4"
+              maxIdle="10"
+              maxWait="8000"
+
+              testOnBorrow="true"
+              validationQuery="SELECT 1"
+              validationInterval="30000"
+
+              removeAbandonedOnBorrow="true"
+              removeAbandonedTimeout="60"
+              minEvictableIdleTimeMillis="300000"/>
+</Context>

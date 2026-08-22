@@ -13,7 +13,7 @@ Owners: **B** signs (`util.JwtUtil`), **A** verifies (`vs_driver_ws`).
 | | |
 |---|---|
 | Algorithm | **HS256** (HMAC-SHA256), symmetric |
-| Secret | environment variable `VOLTSHARE_JWT_SECRET`, identical on Tomcat and on every station |
+| Secret | environment variable `VOLTSHARE_JWT_SECRET`, identical on Tomcat and on every station. **At least 32 characters**: HS256 requires 256 bits of key material, and the Java library refuses to sign with less |
 | Lifetime | 60 minutes |
 | Library, Java | `io.jsonwebtoken:jjwt` |
 | Library, Erlang | `jose` |
@@ -76,7 +76,7 @@ The station **never** calls the back office to validate a token, not even on fai
 
 ## 4. Development fixtures
 
-B produces `contracts/sample-tokens.md` in M0: three tokens signed with the development secret `dev-secret-change-me`, together with their decoded payloads —
+B produces `contracts/sample-tokens.md` in M0: three tokens signed with the development secret `dev-secret-change-me-0123456789ab` (32 characters, see above), together with their decoded payloads —
 
 - one valid, user 12 / vehicle 88;
 - one expired;

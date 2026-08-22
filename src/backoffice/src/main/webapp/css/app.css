@@ -1,0 +1,117 @@
+/* VoltShare — deliberately plain. The project is judged on coordination, not on styling. */
+
+:root {
+    --bg: #f4f6f8;
+    --surface: #ffffff;
+    --ink: #131a22;
+    --ink-2: #55626e;
+    --ink-3: #78848f;
+    --line: #c8d2da;
+    --copper: #a85a28;
+    --good: #1f6f63;
+    --warn: #8a5a00;
+    --mono: ui-monospace, Consolas, Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+.topbar {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding: 14px 28px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+}
+
+.brand { font-weight: 700; font-size: 18px; color: var(--copper); text-decoration: none; }
+.topbar nav { display: flex; gap: 18px; }
+.topbar nav a { color: var(--ink-2); text-decoration: none; padding-bottom: 2px; }
+.topbar nav a.on { color: var(--ink); border-bottom: 2px solid var(--copper); }
+.topbar .who { margin-left: auto; display: flex; gap: 14px; align-items: center; font-size: 14px; }
+.topbar .who a { color: var(--ink-3); }
+
+main { max-width: 1000px; margin: 32px auto; padding: 0 24px; }
+
+footer {
+    max-width: 1000px;
+    margin: 48px auto 32px;
+    padding: 0 24px;
+    color: var(--ink-3);
+    font-size: 13px;
+}
+
+h1 { font-size: 28px; letter-spacing: -.02em; margin: 0 0 18px; }
+
+.head-row { display: flex; align-items: baseline; gap: 16px; margin-bottom: 18px; }
+.head-row h1 { margin: 0; }
+
+.card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 26px;
+}
+.card.narrow { max-width: 460px; }
+
+form { display: flex; flex-direction: column; gap: 14px; margin-top: 18px; }
+label { display: flex; flex-direction: column; gap: 5px; font-size: 14px; color: var(--ink-2); }
+input {
+    padding: 9px 11px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-size: 15px;
+    background: #fff;
+    color: var(--ink);
+}
+input:focus { outline: 2px solid var(--copper); outline-offset: 1px; }
+
+fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+legend { font-size: 13px; color: var(--ink-3); padding: 0 6px; }
+
+button, .btn {
+    display: inline-block;
+    padding: 9px 16px;
+    border: 1px solid var(--copper);
+    border-radius: 6px;
+    background: var(--copper);
+    color: #fff;
+    font-size: 15px;
+    text-decoration: none;
+    cursor: pointer;
+}
+.btn { padding: 6px 12px; font-size: 14px; }
+button:hover, .btn:hover { filter: brightness(1.08); }
+
+table.grid { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+table.grid th, table.grid td { padding: 11px 14px; text-align: left; border-bottom: 1px solid #e6ebef; }
+table.grid th { font-size: 12px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-3); background: #eef2f5; }
+table.grid tbody tr:last-child td { border-bottom: none; }
+table.grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.grid tr.busy td { color: var(--ink-2); }
+
+.good { color: var(--good); font-weight: 600; }
+.none { color: var(--ink-3); }
+.muted { color: var(--ink-3); font-size: 14px; }
+.mono { font-family: var(--mono); font-size: 12px; }
+
+.error {
+    background: #fdecec;
+    border-left: 3px solid #b3261e;
+    color: #7c1d17;
+    padding: 10px 14px;
+    border-radius: 0 6px 6px 0;
+    font-size: 14px;
+}
+
+.badge { font-size: 12px; padding: 3px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--ink-2); }
+.badge.warn { background: #fff5e0; border-color: #e2c68a; color: var(--warn); }
+
+.connectors { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
