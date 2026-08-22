@@ -114,17 +114,20 @@ Deployment is one process per node; nodes are separate containers and are demons
 
 | Node | Technology | Responsibility |
 |---|---|---|
-| **Web client** | Vue SPA served by nginx | User interface; REST to the back office, WebSocket to the stations |
-| **Back office** | Java / Tomcat + MySQL | Registration, authentication (JWT), station directory, session history, billing |
+| **Back office and web front end** | Java / Tomcat (servlets + JSP) + MySQL | Registration, authentication, station directory, session history, billing; renders every page server-side and hands the browser a JWT for the station WebSocket |
 | **Coordinator ×3** | Erlang/OTP | Cluster map, node monitoring, network-wide reservation claims. One leader serves, two stand by; election and quorum per §9. Feeds the back office with live station state |
 | **Station controller 1..N** | Erlang/OTP + Cowboy | One process per connector (`gen_statem`), a station manager arbitrating connectors and allocating power, WebSocket endpoints for drivers and for charging points |
+
+The browser is not a node of the system: pages are rendered by the back office and the browser holds no application state of its own, apart from the two live views (§7) which are driven entirely by their WebSocket. The delivered deployment is therefore **seven nodes**: three coordinators, two station controllers, Tomcat, MySQL.
+
+**Why server-side rendering.** The pages that list stations, sessions and notifications are read-mostly and non-interactive; rendering them in a servlet costs less code than shipping a client-side application to draw them, and it keeps the project on the basic Java web technologies the course recommends. Real time is kept where it is actually needed — the driver WebSocket — instead of spreading across the whole front end.
 
 This split mirrors a real deployment. Dynamic load management is normally performed by a **site controller physically located at the station**, because it must react quickly and must keep working when the connection to the operator's cloud is down; registry and back office are central services. Our station node is that site controller, which is why §4 requires a station to keep serving plugged-in vehicles while isolated.
 
 Protocols:
 
-- **REST/JSON** - driver client ↔ back office, for stateless operations.
-- **WebSocket** - driver client ↔ station, for reservations, session commands and live state push.
+- **HTTP** - browser ↔ back office: form POSTs and server-rendered pages (servlet → forward → JSP), with the login session in `HttpSession`.
+- **WebSocket** - browser ↔ station, for reservations, session commands and live state push. The browser authenticates with a JWT minted by the back office and verified locally by the station.
 - **WebSocket/JSON** - charging point ↔ station, for status reports, meter readings and power-limit commands. Message set modelled on OCPP (§7).
 - **Distributed Erlang** - station ↔ coordinator: node monitoring and coordination.
 - **JInterface** - back office ↔ coordinator: Java participates in the Erlang cluster as a hidden node to receive live station state.
