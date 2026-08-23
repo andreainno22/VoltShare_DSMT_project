@@ -18,6 +18,11 @@ import java.io.IOException;
  * <p>Login state lives in the {@code HttpSession}, managed by Tomcat. The JWT held alongside
  * it is a different thing: it is not what authenticates these pages, it is what the browser
  * hands to an Erlang station when it opens a WebSocket (contracts/jwt.md).
+ *
+ * <p>The filter lists servlet paths, not pages, and that is enough because the pages it
+ * protects live under {@code WEB-INF/views/}: the container refuses to serve those directly,
+ * so there is no second way in that would bypass this check. Only {@code login.jsp} and
+ * {@code register.jsp} sit in the public part of the webapp, which is where they belong.
  */
 @WebFilter(urlPatterns = {"/stations", "/station", "/session", "/profile", "/history", "/notifications"})
 public class AuthFilter implements Filter {

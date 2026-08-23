@@ -2,14 +2,18 @@
 # the application they start and by their environment. Build context is
 # `src/`, so both `erlang/` and `deploy/` are visible.
 
-FROM erlang:26-alpine AS build
+# The tag must stay aligned with the OTP installed on the developers' machines
+# (29.0.5) and with rebar.config's minimum_otp_vsn: same major, same bytecode,
+# one distribution protocol.
+
+FROM erlang:29.0.5-alpine AS build
 
 WORKDIR /build
 COPY erlang/rebar.config ./
 COPY erlang/apps ./apps
 RUN rebar3 compile
 
-FROM erlang:26-alpine
+FROM erlang:29.0.5-alpine
 
 RUN apk add --no-cache bash
 WORKDIR /app

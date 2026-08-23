@@ -43,8 +43,9 @@ public class UserDao {
                         userId = keys.getInt(1);
                     }
                 } catch (SQLException e) {
+                    // The rollback is left to the outer catch: doing it here too
+                    // would roll back an already rolled-back transaction.
                     if (isDuplicateKey(e)) {
-                        c.rollback();
                         throw new DuplicateUsernameException(username);
                     }
                     throw e;

@@ -1,5 +1,14 @@
 # VoltShare — Erlang side
 
+**Requires Erlang/OTP 29.** `rebar.config` declares it with `minimum_otp_vsn`, the
+container image is pinned to `erlang:29.0.5-alpine`, and the Java side of the bridge
+uses the JInterface that ships with the same release. Both developers build on 29 so
+that the bytecode, the distribution protocol and the bridge all agree.
+
+One thing OTP 29 changed that this code had to follow: the expression form
+`catch Expr` is deprecated, and with `warnings_as_errors` it stops the build — write
+`try ... catch ... end` in full.
+
 Umbrella project holding both Erlang applications.
 
 ```

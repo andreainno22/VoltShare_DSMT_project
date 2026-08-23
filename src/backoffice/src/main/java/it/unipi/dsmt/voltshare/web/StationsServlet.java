@@ -30,6 +30,6 @@ public class StationsServlet extends HttpServlet {
         req.setAttribute("stations", directory.all());
         req.setAttribute("stale", directory.isStale());
         req.setAttribute("clusterUp", ErlangBridge.getInstance().isConnected());
-        req.getRequestDispatcher("/stations.jsp").forward(req, res);
+        req.getRequestDispatcher("/WEB-INF/views/stations.jsp").forward(req, res);
     }
 }

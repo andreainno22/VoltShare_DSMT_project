@@ -36,12 +36,27 @@ Motivazione da mettere nel documento: sono le *basic Java web technologies* che 
 
 | Strumento | Stato | Chi |
 |---|---|---|
-| Erlang/OTP 26+ e rebar3 | **mancante** | **entrambi** — ora scrivono Erlang tutti e due |
+| **Erlang/OTP 29** e rebar3 | installato su A | **entrambi** — ora scrivono Erlang tutti e due |
 | Docker Desktop | **mancante** | entrambi |
 | JDK 17, Maven | presente | — |
 | Node.js 24 | presente | A (emulatore) |
 
-Erlang su Windows: installer da erlang.org, poi `rebar3` come escript nel PATH.
+**La versione di OTP è 29 e non è negoziabile fra i due sviluppatori**: `rebar.config`
+la dichiara con `minimum_otp_vsn` e `deploy/Dockerfile.erlang` usa `erlang:29.0.5-alpine`.
+Una macchina con una major diversa produce bytecode che il container non carica.
+
+Erlang su Windows: `winget install --id Erlang.ErlangOTP --exact --version 29.0.5`,
+poi `C:\Program Files\Erlang OTP\bin` nel PATH. rebar3 è separato — è un escript, si
+scarica da rebar3.org e su Windows `rebar3 local install` non funziona: si mette il
+file in una cartella del PATH con accanto un `rebar3.cmd` che invoca
+`escript.exe "%~dp0rebar3" %*`.
+
+Due conseguenze della 29 già affrontate, da conoscere prima di scrivere codice:
+
+- **`catch Expr` è deprecato** e `warnings_as_errors` lo trasforma in errore: va scritto
+  `try ... catch ... end` per esteso.
+- **JInterface dev'essere quella della 29** (1.16). Quella pubblicata su Maven Central è
+  la 1.6.1 del 2011 e non riesce a connettersi: vedi `backoffice/libs/README.md`.
 
 ---
 
@@ -411,6 +426,7 @@ Regola: **chi implementa il server di un contratto scrive anche un client di pro
 
 | Rischio | Mitigazione |
 |---|---|
+| Le due macchine finiscono con OTP diverse | `minimum_otp_vsn` in `rebar.config` e tag fisso nel Dockerfile: la build fallisce subito invece di sbagliare in esecuzione |
 | Erlang e OTP da imparare mentre si costruisce, ora per entrambi | M1 volutamente minimale; la complessità arriva in M3 quando il linguaggio è familiare. Il lab 03 è già un `gen_server` funzionante da cui partire |
 | JInterface fragile (nomi nodo, cookie, DNS fra container) | Provato in M0 prima di ogni altra cosa |
 | Il contratto claim cambia a metà | È l'unico vero confine: si tocca solo con PR condivisa, e mai a metà milestone |

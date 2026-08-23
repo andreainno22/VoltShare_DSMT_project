@@ -54,7 +54,7 @@ services:
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
-      VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me}
+      VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
     ports:
       - "9101:8080"   # driver WebSocket  (M1)
       - "9201:8081"   # charge point      (M2)
@@ -79,7 +79,7 @@ services:
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
-      VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me}
+      VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
     ports:
       - "9102:8080"
       - "9202:8081"
@@ -121,7 +121,7 @@ services:
   #   hostname: backoffice
   #   environment:
   #     ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
-  #     VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me}
+  #     VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
   #     MYSQL_HOST: mysql
   #   ports: ["8080:8080"]
   #   depends_on: [mysql, coord1]

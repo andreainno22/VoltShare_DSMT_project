@@ -43,13 +43,13 @@ public class StationPageServlet extends HttpServlet {
             // Unknown to the directory: either it never existed, or its node is down and the
             // coordinator has dropped it. Both are "not available right now" to the driver.
             req.setAttribute("stationId", id);
-            req.getRequestDispatcher("/station-unavailable.jsp").forward(req, res);
+            req.getRequestDispatcher("/WEB-INF/views/station-unavailable.jsp").forward(req, res);
             return;
         }
 
         refreshTokenIfNeeded(req);
         req.setAttribute("station", station.get());
-        req.getRequestDispatcher("/station.jsp").forward(req, res);
+        req.getRequestDispatcher("/WEB-INF/views/station.jsp").forward(req, res);
     }
 
     /**

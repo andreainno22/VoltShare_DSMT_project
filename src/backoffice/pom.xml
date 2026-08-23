@@ -17,6 +17,27 @@
     <failOnMissingWebXml>false</failOnMissingWebXml>
   </properties>
 
+  <!--
+    JInterface is not published on Maven Central in any version a modern OTP
+    will talk to, so the jar is checked in under libs/, laid out as a Maven
+    repository. `mvn package` then works out of the box for both developers and
+    inside the Docker build, with no install:install-file step to remember.
+    See libs/README.md for where the jar comes from.
+  -->
+  <repositories>
+    <repository>
+      <id>voltshare-local</id>
+      <name>Project-local jars (JInterface)</name>
+      <url>file:///${project.basedir}/libs</url>
+      <releases>
+        <enabled>true</enabled>
+        <updatePolicy>never</updatePolicy>
+        <checksumPolicy>ignore</checksumPolicy>
+      </releases>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+
   <dependencies>
     <!-- Servlet / JSP / JSTL — Tomcat 10.1, Jakarta EE 10 -->
     <dependency>
@@ -75,11 +96,19 @@
       <version>0.4</version>
     </dependency>
 
-    <!-- JInterface: the back office joins the Erlang cluster as a hidden node -->
+    <!--
+      JInterface: the back office joins the Erlang cluster as a hidden node.
+
+      Version 1.16, the one shipped with OTP 29, served from the project-local
+      repository declared below. The `org.erlang.otp:jinterface:1.6.1` published
+      on Maven Central is from 2011 and CANNOT connect to an OTP 29 node: the
+      handshake gets no answer (verified — see PROGRESS.md §7). Do not swap it
+      back for the convenience of a Central coordinate.
+    -->
     <dependency>
-      <groupId>org.erlang.otp</groupId>
+      <groupId>com.ericsson.otp</groupId>
       <artifactId>jinterface</artifactId>
-      <version>1.6.1</version>
+      <version>1.16</version>
     </dependency>
 
     <!-- Tests -->

@@ -74,12 +74,17 @@ The station renews **all** its claims every **10 seconds**, in one message. Rene
 
 ```erlang
 %% request
-{renew, StationId :: station_id(), Claims :: [{claim_id(), vehicle_id(), conn_id()}]}
+{renew, StationId :: station_id(),
+        Claims :: [{claim_id(), vehicle_id(), conn_id(), GrantedAt :: epoch_ms()}]}
 
 %% reply
 {renewed, Ok :: [claim_id()], Revoked :: [claim_id()], NewExpiresAt :: epoch_ms()}
 {not_serving, LeaderNode}
 ```
+
+`GrantedAt` travels with every renewal, not only with the first: it is what lets a leader that
+never granted a claim decide who wins when two stations claim the same vehicle. Without it the
+"oldest wins" rule below would have nothing to compare.
 
 A claim in `Revoked` is **no longer valid**. The station must, for each revoked claim: cancel the reservation or stop the session, free the connector, and notify the driver with the reason `claim_revoked`. This is not an error path to be logged and ignored — it is how the system converges after a conflict.
 
@@ -162,7 +167,7 @@ station1                                     coord2 (leader)
    |<--------------------------------------------|
    |  connector 3: free → held, lease 15 min     |
    |                                             |
-   |  {renew, 1, [{<<"c-4f2a">>, 88, 3}]}        |   every 10 s
+   |  {renew, 1, [{<<"c-4f2a">>, 88, 3, 1755...}]}  |  every 10 s
    |-------------------------------------------->|
    |  {renewed, [<<"c-4f2a">>], [], 1755...}     |
    |<--------------------------------------------|
@@ -180,7 +185,7 @@ station1                        coord2 (dies)        coord3 (elected)
    |-------------------------------->                      |
    |  (timeout 2000 ms)                                    |
    |  try coord3                                           |
-   |  {renew, 1, [{<<"c-4f2a">>, 88, 3}]}                  |
+   |  {renew, 1, [{<<"c-4f2a">>, 88, 3, 1755...}]}         |
    |------------------------------------------------------>|  unknown claim,
    |                                                       |  accepted with its GrantedAt
    |  {renewed, [<<"c-4f2a">>], [], ...}                   |

@@ -64,9 +64,18 @@ public class LoginServlet extends HttpServlet {
         session.setMaxInactiveInterval(60 * 60);
     }
 
+    /**
+     * Only a path within this application is accepted, so that a crafted {@code next}
+     * cannot bounce the user to another site after login. Backslashes are rejected too:
+     * some browsers normalise {@code /\evil.com} into {@code //evil.com}, which would
+     * slip past a check that only looks for a double slash.
+     */
     private String next(HttpServletRequest req) {
         String next = req.getParameter("next");
-        if (next != null && next.startsWith("/") && !next.startsWith("//")) {
+        if (next != null
+                && next.startsWith("/")
+                && !next.startsWith("//")
+                && next.indexOf('\\') < 0) {
             return req.getContextPath() + next;
         }
         return req.getContextPath() + "/stations";

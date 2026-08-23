@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  JInterface 1.16, the version shipped with Erlang/OTP 29. It is not published
+  on Maven Central; see libs/README.md for where the jar comes from and how to
+  rebuild it. Apache License 2.0, like the rest of OTP.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.ericsson.otp</groupId>
+  <artifactId>jinterface</artifactId>
+  <version>1.16</version>
+  <packaging>jar</packaging>
+  <name>JInterface</name>
+  <description>Java bindings for the Erlang distribution protocol, from Erlang/OTP 29.0.5</description>
+</project>

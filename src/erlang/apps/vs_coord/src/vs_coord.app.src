@@ -1,0 +1,11 @@
+{application, vs_coord,
+ [{description, "VoltShare coordinator: reservation claims and the cluster map"},
+  {vsn, "0.1.0"},
+  {registered, [vs_coord_sup, vs_coord_srv, vs_coord_bo]},
+  {mod, {vs_coord_app, []}},
+  {applications, [kernel, stdlib, crypto, vs_common]},
+  {env, []},
+  {modules, []},
+  {licenses, ["MIT"]},
+  {links, []}
+ ]}.
