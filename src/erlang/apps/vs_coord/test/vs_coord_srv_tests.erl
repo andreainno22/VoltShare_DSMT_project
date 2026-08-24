@@ -75,19 +75,55 @@ claims_test_() ->
         fun own_claim_is_renewed/1,
         fun unknown_claim_is_adopted/1,
         fun renew_without_granted_at_is_accepted/1,
+        fun adopted_claim_carries_its_user/1,
+        fun granted_at_comes_from_the_coordinator/1,
         fun oldest_claim_wins_a_conflict/1
     ]).
+
+%% The grant carries the timestamp the coordinator recorded, so that the station
+%% never has to invent one. Everything about "oldest wins" rests on this: if the
+%% two sides produced their own, a conflict would be settled by clock drift.
+granted_at_comes_from_the_coordinator(_) ->
+    fun() ->
+        Before = vs_time:now_ms(),
+        {ok, _, _ClaimId, GrantedAt, ExpiresAt} =
+            vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        After = vs_time:now_ms(),
+
+        ?assert(GrantedAt >= Before andalso GrantedAt =< After,
+                "granted_at must be this coordinator's own clock reading"),
+        ?assert(ExpiresAt > GrantedAt),
+
+        [#{granted_at := Stored}] = vs_coord_srv:claims(),
+        ?assertEqual(Stored, GrantedAt, "what is returned is what is stored")
+    end.
+
+%% Five-field renewal (contract of 24/08). Adopting a claim from a previous
+%% leader now brings its user along, so a suspension applies to it immediately
+%% instead of waiting for the who_do_you_hold of M3.
+adopted_claim_carries_its_user(_) ->
+    fun() ->
+        Ghost = <<"c-from-the-previous-leader">>,
+        GrantedAt = vs_time:now_ms() - 60000,
+
+        {renewed, [Ghost], [], _} =
+            vs_coord_srv:renew(?STATION_1, [{Ghost, ?VEHICLE, 3, ?USER, GrantedAt}]),
+
+        [#{user_id := UserId, granted_at := Kept}] = vs_coord_srv:claims(),
+        ?assertEqual(?USER, UserId, "the adopted claim must know whose it is"),
+        ?assertEqual(GrantedAt, Kept, "and must keep the original ordering")
+    end.
 
 free_vehicle_is_granted(_) ->
     fun() ->
         Reply = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
-        ?assertMatch({ok, <<"r-1">>, _ClaimId, _ExpiresAt}, Reply),
+        ?assertMatch({ok, <<"r-1">>, _ClaimId, _GrantedAt, _ExpiresAt}, Reply),
         ?assertEqual(1, length(vs_coord_srv:claims()))
     end.
 
 second_station_is_refused(_) ->
     fun() ->
-        {ok, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
         Reply = vs_coord_srv:claim(<<"r-2">>, ?VEHICLE, ?USER, ?STATION_2, 7),
         %% This single assertion is the invariant the whole project exists for.
         ?assertEqual({error, <<"r-2">>, already_held}, Reply),
@@ -96,10 +132,10 @@ second_station_is_refused(_) ->
 
 released_vehicle_can_be_claimed_again(_) ->
     fun() ->
-        {ok, _, ClaimId, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, ClaimId, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
         vs_coord_srv:release(ClaimId, completed),
         _ = vs_coord_srv:mode(),   %% let the cast land
-        ?assertMatch({ok, <<"r-2">>, _, _},
+        ?assertMatch({ok, <<"r-2">>, _, _, _},
                      vs_coord_srv:claim(<<"r-2">>, ?VEHICLE, ?USER, ?STATION_2, 7))
     end.
 
@@ -124,9 +160,9 @@ expired_claim_no_longer_blocks(_) ->
     fun() ->
         %% grace is already 0 from setup/0; only the lease can be changed here
         os:putenv("LEASE_SECONDS", "0"),
-        {ok, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
         timer:sleep(5),
-        ?assertMatch({ok, <<"r-2">>, _, _},
+        ?assertMatch({ok, <<"r-2">>, _, _, _},
                      vs_coord_srv:claim(<<"r-2">>, ?VEHICLE, ?USER, ?STATION_2, 7))
     end.
 
@@ -137,11 +173,11 @@ expired_claim_no_longer_blocks(_) ->
 late_release_does_not_erase_the_new_claim(_) ->
     fun() ->
         os:putenv("LEASE_SECONDS", "0"),
-        {ok, _, StaleClaimId, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, StaleClaimId, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
         timer:sleep(5),
 
         os:putenv("LEASE_SECONDS", "900"),
-        {ok, _, FreshClaimId, _} = vs_coord_srv:claim(<<"r-2">>, ?VEHICLE, ?USER, ?STATION_2, 7),
+        {ok, _, FreshClaimId, _, _} = vs_coord_srv:claim(<<"r-2">>, ?VEHICLE, ?USER, ?STATION_2, 7),
 
         vs_coord_srv:release(StaleClaimId, expired),
         _ = vs_coord_srv:mode(),   %% let the cast land
@@ -156,7 +192,7 @@ late_release_does_not_erase_the_new_claim(_) ->
 
 own_claim_is_renewed(_) ->
     fun() ->
-        {ok, _, ClaimId, FirstExpiry} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, ClaimId, _GrantedAt, FirstExpiry} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
         [#{granted_at := GrantedAt}] = vs_coord_srv:claims(),
         timer:sleep(5),
         {renewed, Ok, Revoked, NewExpiry} =
@@ -187,7 +223,7 @@ unknown_claim_is_adopted(_) ->
 %% every claim, on a message that arrives every ten seconds.
 renew_without_granted_at_is_accepted(_) ->
     fun() ->
-        {ok, _, ClaimId, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, ClaimId, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
 
         {renewed, Ok, Revoked, _} =
             vs_coord_srv:renew(?STATION_1, [{ClaimId, ?VEHICLE, 3}]),
@@ -257,13 +293,13 @@ stats_update_the_counters(_) ->
 
 a_dead_node_takes_its_claims_with_it(_) ->
     fun() ->
-        {ok, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
         whereis(vs_coord_srv) ! {nodedown, 'vs@station1'},
         _ = vs_coord_srv:mode(),
 
         ?assertEqual(1, length(vs_coord_srv:stations()), "the dead station is dropped"),
         ?assertEqual([], vs_coord_srv:claims(), "and so are the claims it held"),
-        ?assertMatch({ok, <<"r-2">>, _, _},
+        ?assertMatch({ok, <<"r-2">>, _, _, _},
                      vs_coord_srv:claim(<<"r-2">>, ?VEHICLE, ?USER, ?STATION_2, 7),
                      "the driver is free to reserve elsewhere")
     end.

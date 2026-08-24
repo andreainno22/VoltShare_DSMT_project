@@ -206,7 +206,12 @@ do_claim(ReqId, VehicleId, UserId, StationId, ConnId, State) ->
                            conn_id    = ConnId,
                            granted_at = Now,
                            expires_at = Now + (Lease + State#state.grace_s) * 1000},
-            {{ok, ReqId, Claim#claim.claim_id, Claim#claim.expires_at}, store(Claim, State)};
+            %% GrantedAt travels back with the grant (contract PR of 24/08): the
+            %% station stores it and echoes it in every renew, so that ordering
+            %% is decided by one clock — this one — instead of comparing
+            %% timestamps produced by machines that were never synchronised.
+            {{ok, ReqId, Claim#claim.claim_id, Claim#claim.granted_at, Claim#claim.expires_at},
+             store(Claim, State)};
         {error, Reason} ->
             {{error, ReqId, Reason}, State}
     end.
@@ -273,17 +278,22 @@ warn_if_legacy(StationId, Claims) ->
                           "claims are resolved with the coordinator's clock", [StationId])
     end.
 
-%% Three-field form: the station has not been updated to carry granted_at yet
-%% (contracts/claim.md §3.2). Accepted rather than refused — a function_clause
-%% here would take the whole coordinator down on a routine renewal, losing every
-%% claim it holds, which is a far worse failure than a timestamp we have to
-%% guess. The coordinator's own clock is the fallback: it makes an adopted claim
-%% look brand new, so it loses conflicts against claims we already know, which
-%% is the conservative direction.
+%% Current form, five fields (contract PR of 24/08): `UserId' lets a leader that
+%% adopts a claim enforce suspensions straight away, without waiting for the
+%% who_do_you_hold of M3, and `GrantedAt' is the one this coordinator issued.
+%%
+%% The two shorter forms below are tolerated rather than refused. A
+%% function_clause here would take the whole coordinator down on a routine
+%% renewal — every ten seconds, losing every claim it holds — which is a far
+%% worse failure than a missing field we can substitute. They cost three lines
+%% and remove an entire class of integration accident.
 renew_one({ClaimId, VehicleId, ConnId}, StationId, NewExpiry, Acc) ->
-    renew_one({ClaimId, VehicleId, ConnId, vs_time:now_ms()}, StationId, NewExpiry, Acc);
+    renew_one({ClaimId, VehicleId, ConnId, 0, vs_time:now_ms()}, StationId, NewExpiry, Acc);
 
-renew_one({ClaimId, VehicleId, ConnId, GrantedAt}, StationId, NewExpiry, {Ok, Revoked, State}) ->
+renew_one({ClaimId, VehicleId, ConnId, GrantedAt}, StationId, NewExpiry, Acc) ->
+    renew_one({ClaimId, VehicleId, ConnId, 0, GrantedAt}, StationId, NewExpiry, Acc);
+
+renew_one({ClaimId, VehicleId, ConnId, UserId, GrantedAt}, StationId, NewExpiry, {Ok, Revoked, State}) ->
     case maps:find(VehicleId, State#state.claims) of
         {ok, #claim{claim_id = ClaimId} = Existing} ->
             %% Ours, still valid: push the expiry forward.
@@ -298,7 +308,7 @@ renew_one({ClaimId, VehicleId, ConnId, GrantedAt}, StationId, NewExpiry, {Ok, Re
             State1 = erase_claim(Other, State),
             Adopted = #claim{claim_id   = ClaimId,
                              vehicle_id = VehicleId,
-                             user_id    = Other#claim.user_id,
+                             user_id    = pick_user(UserId, Other#claim.user_id),
                              station_id = StationId,
                              conn_id    = ConnId,
                              granted_at = GrantedAt,
@@ -310,13 +320,15 @@ renew_one({ClaimId, VehicleId, ConnId, GrantedAt}, StationId, NewExpiry, {Ok, Re
             {Ok, [ClaimId | Revoked], State};
 
         error ->
-            %% Unknown claim for a free vehicle. This is the failover case: the
-            %% previous leader granted it and we never saw it. Adopt it with the
-            %% station's own granted_at, or the "oldest wins" rule would compare
-            %% against a timestamp we invented.
+            %% Unknown claim for a free vehicle: the failover case. The previous
+            %% leader granted it and we never saw it, so we adopt it with the
+            %% granted_at the station reports — inventing one here would make the
+            %% claim look brand new and lose every "oldest wins" comparison.
+            %% UserId comes with it too, which is what lets suspensions apply to
+            %% an adopted claim immediately instead of from M3 onwards.
             Adopted = #claim{claim_id   = ClaimId,
                              vehicle_id = VehicleId,
-                             user_id    = 0,       %% unknown until the station tells us
+                             user_id    = UserId,
                              station_id = StationId,
                              conn_id    = ConnId,
                              granted_at = GrantedAt,
@@ -469,6 +481,11 @@ store(Claim = #claim{vehicle_id = VehicleId, claim_id = ClaimId}, State) ->
 erase_claim(#claim{vehicle_id = VehicleId, claim_id = ClaimId}, State) ->
     State#state{claims = maps:remove(VehicleId, State#state.claims),
                 by_id  = maps:remove(ClaimId, State#state.by_id)}.
+
+%% A renewal in one of the tolerated short forms carries no user: keep whatever
+%% the coordinator already knew rather than overwriting it with a placeholder.
+pick_user(0, Known)     -> Known;
+pick_user(UserId, _)    -> UserId.
 
 %% encode_hex/1 rather than /2: uppercase is fine for an identifier that only
 %% has to be readable in a log, and the default costs one argument less.

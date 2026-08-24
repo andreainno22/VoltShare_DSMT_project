@@ -35,7 +35,12 @@ public class StationView {
         this.wsUrl = wsUrl;
     }
 
-    /** Connectors neither free, held nor charging: out of service or faulted. */
+    /**
+     * Connectors that are in none of the three counted states: offline, restarting or
+     * faulted. The station deliberately leaves them out of free/held/charging, so the
+     * three do not have to add up to the total — and a connector in {@code closing} is
+     * reported as charging, since its session is still finishing.
+     */
     public int getUnavailable() {
         return Math.max(0, total - free - held - charging);
     }

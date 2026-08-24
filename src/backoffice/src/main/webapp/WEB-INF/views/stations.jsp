@@ -35,6 +35,7 @@
                     <th>Free</th>
                     <th>Held</th>
                     <th>Charging</th>
+                    <th>Out of service</th>
                     <th>Site power</th>
                     <th>Tariff</th>
                     <th></th>
@@ -50,6 +51,18 @@
                         <td class="num ${s.free gt 0 ? 'good' : 'none'}">${s.free}</td>
                         <td class="num">${s.held}</td>
                         <td class="num">${s.charging}</td>
+                        <%--
+                          Free + held + charging can add up to less than the total: a connector
+                          that is offline or faulted counts in none of them (station_stats
+                          convention). Showing the difference keeps the row honest — otherwise
+                          a broken connector would simply vanish from the page.
+                        --%>
+                        <td class="num ${s.unavailable gt 0 ? 'none' : ''}">
+                            <c:choose>
+                                <c:when test="${s.unavailable gt 0}">${s.unavailable}</c:when>
+                                <c:otherwise>&mdash;</c:otherwise>
+                            </c:choose>
+                        </td>
                         <td class="num">${s.sitePowerKw} kW</td>
                         <td class="num">€ ${s.tariffEuroKwh}/kWh</td>
                         <td>

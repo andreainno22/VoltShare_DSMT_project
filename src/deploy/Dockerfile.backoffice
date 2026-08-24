@@ -1,0 +1,66 @@
+# The back office: Tomcat serving the JSP application, and at the same time a
+# hidden node of the Erlang cluster (contracts/erlang-java.md).
+#
+# Build context is `src/`, like Dockerfile.erlang, so that both `backoffice/`
+# and `deploy/` are visible.
+
+# ---------------------------------------------------------------- build stage
+FROM maven:3.9-eclipse-temurin-17 AS build
+
+WORKDIR /build
+
+# pom and the project-local repository first, on their own layer: dependencies
+# are re-downloaded only when the pom actually changes, not on every edit to a
+# servlet. `libs/` holds the JInterface jar that Maven Central does not carry in
+# a version an OTP 29 node will talk to — see backoffice/libs/README.md.
+COPY backoffice/pom.xml ./
+COPY backoffice/libs ./libs
+RUN mvn -B -q dependency:go-offline
+
+COPY backoffice/src ./src
+RUN mvn -B -q clean package -DskipTests
+
+# -------------------------------------------------------------- runtime stage
+FROM tomcat:10.1-jdk17-temurin
+
+# Tomcat 10.1 is the Jakarta EE 10 line: `jakarta.*` namespaces, as the whole
+# project assumes. Tomcat 9 would fail at runtime on every servlet import.
+
+# The stock applications are of no use here and the manager is one more thing
+# reachable on port 8080.
+RUN rm -rf /usr/local/tomcat/webapps/*
+
+# Deployed as ROOT so the application answers on / with no context path. The
+# pages build their links from ${pageContext.request.contextPath}, so they work
+# either way — this only keeps the URLs short in the demo.
+COPY --from=build /build/target/voltshare.war /usr/local/tomcat/webapps/ROOT.war
+
+# META-INF/context.xml declares the JDBC pool with ${DB_HOST} and friends, and
+# Tomcat does NOT expand those by default: without this property source the
+# pool would try to connect to a host literally called "${DB_HOST}". The
+# fallback in dao/Db.java would eventually catch it, but silently and without
+# the pool — better to make the intended path work.
+RUN printf '\norg.apache.tomcat.util.digester.PROPERTY_SOURCE=org.apache.tomcat.util.digester.EnvironmentPropertySource\n' \
+    >> /usr/local/tomcat/conf/catalina.properties
+
+# Defaults mirror docker-compose.yml; the compose file overrides them all.
+# VOLTSHARE_ERLANG_COOKIE must match the Erlang nodes' cookie, and
+# JINTERFACE_NODE must carry a hostname the coordinators can resolve —
+# `localhost` here would leave the bridge unreachable from the cluster.
+ENV DB_HOST=mysql \
+    DB_PORT=3306 \
+    DB_NAME=voltshare \
+    DB_USER=voltshare \
+    DB_PASSWORD=voltshare \
+    JINTERFACE_NODE=voltshare_bo@backoffice \
+    JINTERFACE_MBOX=backoffice \
+    COORD_NODES=vs@coord1,vs@coord2,vs@coord3 \
+    VOLTSHARE_ERLANG_COOKIE=voltshare
+
+EXPOSE 8080
+
+# EPMD note: JInterface registers this node with the EPMD running inside this
+# container, and the coordinators reach it on 4369 over the compose network.
+# Nothing to publish — the port only has to be reachable between containers.
+
+CMD ["catalina.sh", "run"]

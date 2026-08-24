@@ -57,7 +57,7 @@ Sent **before** the station commits a reservation. Never the other way round (DE
         StationId :: station_id(), ConnId :: conn_id()}
 
 %% replies
-{ok, ReqId, ClaimId :: claim_id(), ExpiresAt :: epoch_ms()}
+{ok, ReqId, ClaimId :: claim_id(), GrantedAt :: epoch_ms(), ExpiresAt :: epoch_ms()}
 {error, ReqId, already_held | suspended | rebuilding | unknown_station}
 {not_serving, LeaderNode :: node() | undefined}
 ```
@@ -73,6 +73,13 @@ Sent **before** the station commits a reservation. Never the other way round (DE
 
 `ExpiresAt` is always **longer than the reservation lease** — the coordinator grants `lease + 60 s` — so a claim never expires while the reservation it protects is still alive.
 
+**`GrantedAt` is issued by the coordinator, never by the station.** The station stores it and
+echoes it back in `renew` and in `who_do_you_hold`. The reason is the ordering rule in §5: if
+each side produced its own timestamp, "oldest wins" would compare clocks belonging to machines
+that were never synchronised, and a conflict would be decided by the drift between them. With
+the value coming from one place, the ordering holds regardless — including across a failover,
+because the new leader adopts the timestamp rather than inventing one.
+
 ### 3.2 Renew
 
 The station renews **all** its claims every **10 seconds**, in one message. Renewal is what allows a new leader to learn about claims it never granted (DESIGN-NOTES §4).
@@ -80,16 +87,22 @@ The station renews **all** its claims every **10 seconds**, in one message. Rene
 ```erlang
 %% request
 {renew, StationId :: station_id(),
-        Claims :: [{claim_id(), vehicle_id(), conn_id(), GrantedAt :: epoch_ms()}]}
+        Claims :: [{claim_id(), vehicle_id(), conn_id(),
+                    UserId :: user_id(), GrantedAt :: epoch_ms()}]}
 
 %% reply
 {renewed, Ok :: [claim_id()], Revoked :: [claim_id()], NewExpiresAt :: epoch_ms()}
 {not_serving, LeaderNode}
 ```
 
-`GrantedAt` travels with every renewal, not only with the first: it is what lets a leader that
-never granted a claim decide who wins when two stations claim the same vehicle. Without it the
-"oldest wins" rule below would have nothing to compare.
+Both extra fields travel with **every** renewal, not only the first, because a renewal is how a
+leader learns about claims it never granted:
+
+- `GrantedAt` — the timestamp this claim was born with, so that "oldest wins" (§5) has something
+  to compare. Without it a newly elected leader would have to invent one, and adoption would
+  silently reset the ordering.
+- `UserId` — so that a leader adopting a claim can enforce a suspension straight away, instead
+  of holding a claim it cannot attribute until the next `who_do_you_hold`.
 
 A claim in `Revoked` is **no longer valid**. The station must, for each revoked claim: cancel the reservation or stop the session, free the connector, and notify the driver with the reason `claim_revoked`. This is not an error path to be logged and ignored — it is how the system converges after a conflict.
 
