@@ -1,0 +1,10 @@
+{application, vs_mock_coord,
+ [{description, "VoltShare — fake coordinator for M1: always grants (part A dev tool)"},
+  {vsn, "0.1.0"},
+  {registered, [vs_mock_coord_sup, vs_coord_srv]},
+  {mod, {vs_mock_coord_app, []}},
+  {applications, [kernel, stdlib, vs_common]},
+  {env, []},
+  {modules, []},
+  {licenses, ["MIT"]}
+ ]}.
