@@ -24,7 +24,9 @@ Stadio 1 con la toolchain rebar3, stadio 2 con solo i `.beam` compilati.
 
 ## 3.1 Versione di OTP fissata, e fissata *uguale* a quella di sviluppo
 
-`Dockerfile.erlang` usa `erlang:29-alpine`, non `erlang:latest`, e la stessa major è quella installata sulle macchine di sviluppo.
+`Dockerfile.erlang` usa `erlang:29.0.5` (Debian), non `erlang:latest` e nemmeno il tag mobile `erlang:29-alpine`: quest'ultimo segue le patch release, quindi due `docker build` a settimane di distanza potrebbero produrre runtime diversi senza che nessuno abbia toccato niente. Il pin alla patch rende la build riproducibile; l'aggiornamento di versione diventa un commit visibile, non un evento silenzioso.
+
+*Perché Debian e non alpine?* Non per scelta: la build ufficiale alpine/amd64 è ferma a 29.0.2, e il tag `29.0.5-alpine` pubblica solo varianti 386/arm — su un host amd64 Docker ripiega **in silenzio** sulla 386, e i container finiscono a girare un Erlang a 32 bit. Scoperto da un `WARN InvalidBaseImagePlatform` durante un build: l'unico sintomo di un runtime diverso da quello di sviluppo. L'immagine Debian è l'unica che dà insieme la versione esatta pinnata e l'architettura nativa; il costo è qualche centinaio di MB di immagine, irrilevante qui. Nota di metodo per la relazione: il tag di un'immagine promette la versione del software, non l'architettura — le due cose vanno verificate separatamente (`docker image inspect --format '{{.Architecture}}'`).
 
 **Perché fissarla**: un tag mobile cambia sotto i piedi. Una rebuild il giorno della consegna, con una major nuova nel frattempo, sposta il debug dal progetto alla toolchain nel momento peggiore.
 

@@ -5,17 +5,20 @@
 # The tag must stay aligned with the OTP installed on the developers' machines
 # (29.0.5) and with rebar.config's minimum_otp_vsn: same major, same bytecode,
 # one distribution protocol.
-
-FROM erlang:29.0.5-alpine AS build
+#
+# Debian, not alpine: the official alpine/amd64 build lags behind (stuck at
+# 29.0.2 — the 29.0.5-alpine tag only ships 386/arm variants, and Docker
+# silently picks the 32-bit one on amd64 hosts). The Debian image is the one
+# that gives BOTH the exact pinned version and the native architecture.
+FROM erlang:29.0.5 AS build
 
 WORKDIR /build
 COPY erlang/rebar.config ./
 COPY erlang/apps ./apps
 RUN rebar3 compile
 
-FROM erlang:29.0.5-alpine
+FROM erlang:29.0.5
 
-RUN apk add --no-cache bash
 WORKDIR /app
 COPY --from=build /build/_build/default/lib /app/lib
 COPY deploy/start-node.sh /app/start-node.sh
