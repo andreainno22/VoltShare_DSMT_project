@@ -13,7 +13,10 @@
 FROM erlang:29.0.5 AS build
 
 WORKDIR /build
-COPY erlang/rebar.config ./
+# The lock travels with the config: without it the build inside the image
+# re-resolves the dependency versions and can ship a different cowboy
+# than the one tested on the developers' machines.
+COPY erlang/rebar.config erlang/rebar.lock ./
 COPY erlang/apps ./apps
 RUN rebar3 compile
 
