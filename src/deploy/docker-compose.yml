@@ -3,11 +3,11 @@
 #   docker compose up --build          from src/deploy/
 #   docker compose logs -f station1    watch the M0 ping
 #
-# M0 runs MySQL and two station nodes that ping each other: that is the
-# "two Erlang containers exchanging a message" check, and it exercises the
-# three things that usually break — node names, cookie, DNS between
-# containers. The coordinators and the back office are declared below and
-# commented out; B enables them as vs_coord and the Tomcat image appear.
+# M0 ran MySQL and two station nodes pinging each other. M1 adds coord1,
+# running the mock coordinator (vs_mock_coord) so that part A works end
+# to end before vs_coord exists. The real coordinators and the back
+# office are declared below and commented out; B enables them as
+# vs_coord and the Tomcat image appear, replacing the mock coord1.
 
 name: voltshare
 
@@ -54,7 +54,15 @@ services:
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
+      # ≥32 bytes: jjwt refuses shorter HS256 keys (B's requirement, kept)
       VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
+      # Must mirror the seed rows of contracts/schema.sql for this station:
+      # connector ids are globally unique (station 1 owns 1..4).
+      SITE_POWER_KW: 350
+      CONNECTORS: "1:150,2:150,3:150,4:50"
+      STATION_NAME: "Pisa Centro"
+      WS_URL: "ws://localhost:9101/ws/driver"
+      TARIFF_CENTS_KWH: 45
     ports:
       - "9101:8080"   # driver WebSocket  (M1)
       - "9201:8081"   # charge point      (M2)
@@ -80,12 +88,36 @@ services:
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
       VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
+      # Station 2 owns connectors 5..7 in the seed.
+      SITE_POWER_KW: 180
+      CONNECTORS: "5:150,6:50,7:50"
+      STATION_NAME: "Livorno Port"
+      WS_URL: "ws://localhost:9102/ws/driver"
+      TARIFF_CENTS_KWH: 42
     ports:
       - "9102:8080"
       - "9202:8081"
     depends_on:
       mysql:
         condition: service_healthy
+    networks: [voltshare]
+
+  # ---------------------------------------------------------------- M1 (A)
+  # Fake coordinator: always grants (apps/vs_mock_coord). It answers on
+  # the contract's registered name, so the stations cannot tell the
+  # difference. B replaces THIS service with the real coord1 — same
+  # hostname, same node name, nothing else in this file changes.
+  coord1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.erlang
+    container_name: coord1
+    hostname: coord1
+    environment:
+      NODE_SNAME: vs
+      ERL_APP: vs_mock_coord
+      ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
+      LEASE_SECONDS: ${LEASE_SECONDS:-900}
     networks: [voltshare]
 
   # ---------------------------------------------------------------- B

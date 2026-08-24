@@ -148,6 +148,12 @@ init(Opts) ->
                  claim_mod  = maps:get(claim_mod, Opts, vs_claim_null),
                  db_mod     = maps:get(db_mod, Opts, vs_station_db),
                  notify_to  = maps:get(notify_to, Opts, undefined)},
+    %% Announce to whoever tracks connectors (vs_station_mgr). This runs
+    %% at first boot AND at every supervisor restart, which is how the
+    %% manager's registry heals after a crash without polling anyone. It
+    %% is a message, never a call: the manager may be blocked in its own
+    %% handle_continue starting this very process (scelte §4.4).
+    notify(Data, {connector_up, self()}),
     {ok, free, Data}.
 
 terminate(_Reason, State, #data{conn_id = ConnId}) ->
@@ -158,6 +164,13 @@ terminate(_Reason, State, #data{conn_id = ConnId}) ->
 %%% free
 %%%===================================================================
 
+%% Initial entry: gen_statem calls the enter callback with Old =:= New
+%% for the start state, and `free' is reachable from `free' in no other
+%% way. Nothing observable changed, so nothing is announced — otherwise
+%% every station boot (or manager readoption) would spray subscribers
+%% with pushes describing a change that never happened.
+free(enter, free, Data) ->
+    {keep_state, Data#data{hold = undefined, session = undefined}};
 free(enter, _Old, Data) ->
     notify(Data, {state_changed, free}),
     {keep_state, Data#data{hold = undefined, session = undefined}};
@@ -426,6 +439,16 @@ release(#data{claim_mod = Mod, conn_id = ConnId, hold = Hold, session = S}, Reas
     end.
 
 notify(#data{notify_to = undefined}, _Event) -> ok;
+%% A registered name may be momentarily unregistered while the manager
+%% restarts; `Atom ! Msg' would then badarg and crash the connector — a
+%% cascade that would turn a manager hiccup into a station outage. The
+%% manager re-adopts the connectors on its way back up, so skipping the
+%% notification here is safe.
+notify(#data{notify_to = To, conn_id = ConnId}, Event) when is_atom(To) ->
+    case whereis(To) of
+        undefined -> ok;
+        Pid       -> Pid ! {connector_event, ConnId, Event}, ok
+    end;
 notify(#data{notify_to = To, conn_id = ConnId}, Event) ->
     To ! {connector_event, ConnId, Event},
     ok.

@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 23 agosto 2026 — Erlang/OTP 29 installato, lato Erlang compilato e test verdi, JInterface sostituita.
+**Ultimo aggiornamento:** 24 agosto 2026 — M1 lato A su `main` (manager di stazione, connettori, claim client, mock del coordinatore); contratto claim evoluto di comune accordo (`GrantedAt` emesso dal coordinatore, rinnovo a cinque campi); immagine Erlang pinnata a 29.0.5 Debian.
 
 ---
 
@@ -12,7 +12,7 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 | Milestone | A (stazione, emulatore, viste live) | B (coordinatore, back office, pagine) |
 |---|---|---|
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
-| **M1** percorso base | ⬜ non iniziata | 🟡 back office e coordinatore scritti, **da compilare e integrare** |
+| **M1** percorso base | 🟡 stazione pronta e su main (manager, connettori, claim client, mock del coordinatore — 48 test); mancano `vs_driver_ws` e `station.jsp` | 🟡 coordinatore e back office scritti e testati (22 test); da adeguare il renew a 5 campi, provare il ponte JInterface e il deploy su Tomcat |
 | **M2** sessione e potenza | ⬜ | ⬜ |
 | **M3** tolleranza ai guasti | ⬜ | ⬜ |
 | **M4** regole di dominio | ⬜ | ⬜ |
@@ -32,8 +32,12 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | Suite EUnit completa, con la parte A | ✅ verificato il 24/08 — **44 test, 0 fallimenti**: è arrivato `a/m1-station-core` (station manager, `vs_claim_client`, `vs_mock_coord`) |
 | Erlang: compilazione in generale | ✅ verificato — `rebar3 compile` pulito sulle tre applicazioni |
 | JInterface: connessione Java → nodo Erlang | ✅ verificato **fuori dal progetto** — `OtpNode.ping` risponde `PONG` verso un nodo OTP 29 locale |
-| Docker compose | ❌ **mai eseguito** — Docker Desktop non è installato |
+| Docker compose (macchina B) | ❌ **mai eseguito** — Docker Desktop non è installato |
 | Ponte JInterface fra Java ed Erlang | ❌ **mai provato nel progetto** — la libreria ora è quella giusta, ma `vs_coord_bo` ↔ `ErlangBridge` non si sono mai parlati |
+| `vs_station` M1 (connettori, manager, claim client): test EUnit | ✅ verificato — **48 test, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 7 manager + 10 client + 9 vs_common) |
+| `vs_claim_client` ↔ `vs_mock_coord` sul contratto vero | ✅ verificato nei test — claim, eco del `GrantedAt` nel renew, release, revoca end-to-end, `station_stats` |
+| Docker compose (macchina A) | ✅ **eseguito** — 7 container su, coord1 (mock) riceve `station_up` da entrambe le stazioni (4 e 3 connettori) |
+| Compose sull'immagine Debian 29.0.5 | 🟡 build verde; il giro completo era stato fatto con l'immagine 386, da ripetere dopo il merge |
 
 **Prerequisiti ancora da installare:** solo Docker Desktop. Erlang/OTP 29 (erts 17.0.5) + rebar3 3.27, JDK 17 e Maven 3.9.9 ci sono e funzionano.
 
@@ -64,9 +68,16 @@ Progetto umbrella con due applicazioni più una libreria condivisa.
 ```
 apps/vs_common/     vs_env.erl (configurazione da ambiente), vs_time.erl
                     + test EUnit per entrambi
-apps/vs_station/    vs_station_app, vs_station_sup, vs_ping
+apps/vs_station/    vs_station_app, vs_station_sup, vs_ping,
+                    vs_connector (gen_statem), vs_connector_sup,
+                    vs_station_mgr, vs_claim_client, vs_station_db,
+                    vs_claim_null
+                    + test EUnit  ← 39 (connettore, manager, client)
 apps/vs_coord/      vs_coord_app, vs_coord_sup, vs_coord_srv, vs_coord_bo
-                    + test EUnit sui claim  ← 21 test, verdi su OTP 29
+                    + test EUnit sui claim  ← 22 test, verdi su OTP 29
+apps/vs_mock_coord/ coordinatore finto di M1 (A): si registra col nome
+                    vero vs_coord_srv, concede sempre — riferimento
+                    eseguibile del contratto e banco dei test del client
 ```
 
 ### Cosa è emerso alla prima compilazione
@@ -104,6 +115,19 @@ Scelte prese scrivendolo:
 `rebar.config` **non ha dipendenze esterne**: la compilazione di M0 funziona offline e in pochi secondi, così il test di rete non fallisce mai per motivi estranei alla distribuzione. Cowboy, jsx, jose e mysql sono elencati come commento e arrivano con M1.
 
 `vs_ping` è la prova di connettività di M0, ed è scritto apposta con la stessa forma che avrà `vs_claim_client`: un `gen_server` che possiede il collegamento verso un nodo remoto, lo chiama con timeout esplicito e ripianifica un tick con `erlang:send_after/3`. Anche la gestione degli errori è quella definitiva — un nodo remoto morto viene registrato nel log e la vita continua, mai un'eccezione che propaga.
+
+### `vs_station` — stazione di M1, passi 1 e 2 (A, 24 agosto)
+
+| Modulo | Ruolo |
+|---|---|
+| `vs_connector` | `gen_statem`, un processo per presa: `free → held → charging → closing`, lease con `state_timeout`, walk-in senza claim, revoca autoritativa anche a sessione avviata |
+| `vs_connector_sup` | `simple_one_for_one`, `restart => transient`: chi crasha riparte in `free`, lo stato sicuro |
+| `vs_station_mgr` | registry ETS dei connettori, stato aggregato per il push `state`, sottoscrittori (call e cast), budget di potenza come valore (il riparto è M2); se a riavviarsi è lui, **adotta** i connettori vivi invece di riavviarli |
+| `vs_claim_client` | l'unico processo che parla col coordinatore: discovery del leader (contratto §4), renew ogni 10 s in un worker effimero, tabella dei claim, `who_do_you_hold` risposto dalla memoria, `station_up` + `station_stats` (event-driven, dedup) |
+
+Due regole strutturali, entrambe figlie del deadlock dei ping di M0: il claim client **non si blocca mai su una chiamata remota** (acquire gira nel processo del connettore, che giustamente aspetta; i renew in un worker effimero) e **non fa mai call sincrone verso manager o connettori** (letture ETS dirty, cast) — nel grafo delle chiamate sincrone della stazione non esistono cicli. Le motivazioni complete, per l'orale, sono in `erlang/scelte_di_progetto.md` §7–8.
+
+`vs_mock_coord` parla il contratto vero, trasporto incluso (`claim`/`renew` come call, `release`/`station_up`/`station_stats` come cast — riferimento anche per B), ed è ispezionabile per i test: `history/0`, `set_reply/1` per i rifiuti, `set_renew/1` per la revoca end-to-end. La sostituzione col `vs_coord` vero è un cambio di `ERL_APP` nel compose.
 
 ---
 
@@ -145,7 +169,9 @@ Applicazione web Java su Tomcat 10.1, modello MVC del lab 08: servlet come contr
 
 ## 5. Deploy — `src/deploy/`
 
-`docker-compose.yml` con MySQL e due nodi stazione che si scambiano il ping di M0. Coordinatori e back office sono già dichiarati ma commentati: si abilitano quando `vs_coord` e l'immagine Tomcat esistono.
+`docker-compose.yml` con MySQL, due nodi stazione e **coord1 che esegue il mock** (`ERL_APP: vs_mock_coord`); B lo sostituirà col `vs_coord` vero a parità di hostname e nome nodo. Le stazioni ricevono da env `CONNECTORS`, `SITE_POWER_KW`, `STATION_NAME`, `WS_URL`, `TARIFF_CENTS_KWH`, allineate al seed di `schema.sql`. Coordinatori veri e back office restano dichiarati e commentati.
+
+L'immagine base è `erlang:29.0.5` **Debian**, non alpine: la build alpine/amd64 ufficiale è ferma a 29.0.2 e il tag `29.0.5-alpine` pubblica solo varianti 386/arm — Docker ripiegava **in silenzio** sul 32 bit, scoperto da un `WARN InvalidBaseImagePlatform`. Il tag di un'immagine promette la versione, non l'architettura (dettagli in `deploy/scelte_di_progetto.md`).
 
 Lo `schema.sql` è **montato** da `contracts/`, non copiato: una sola copia da modificare.
 
@@ -162,13 +188,13 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
-rebar3 compile                         # tre applicazioni, nessun warning
-rebar3 eunit                           # 21 test, verdi
+rebar3 compile                         # quattro applicazioni, nessun warning
+rebar3 eunit                           # 70 test (48 stazione+common, 22 coordinatore)
 
-# tutto insieme (quando ci sarà Docker)
+# tutto insieme (verificato su macchina A il 24/08)
 cd src/deploy
-docker compose up --build
-docker compose logs -f station1
+docker compose up --build -d
+docker compose logs -f coord1          # station_up delle due stazioni ogni 30 s
 ```
 
 Su Windows `rebar3` è l'escript più un `rebar3.cmd` accanto che invoca
@@ -201,6 +227,8 @@ Il jar corretto è la **1.16**, quella della OTP 29, compilata dai sorgenti uffi
 **Il token non passa dal JavaScript.** La servlet lo mette in sessione, la JSP lo stampa nel markup, il codice del WebSocket lo legge da lì. Niente `sessionStorage`, niente refresh token: la sessione di login la gestisce Tomcat.
 
 **⚠️ Modifica a un contratto condiviso — `GrantedAt` nel messaggio `renew`.** `claim.md` prescriveva che un nuovo leader adotti un claim sconosciuto «con il `GrantedAt` che la stazione riporta», ma quel campo nel messaggio non c'era: la regola «vince il più vecchio» non aveva niente da confrontare. La tupla è diventata `{ClaimId, VehicleId, ConnId, GrantedAt}`. **Da comunicare ad A prima che implementi `vs_claim_client`.**
+
+→ **Chiuso il 24/08 con accordo A+B**, in forma più ampia: `GrantedAt` lo emette **sempre il coordinatore** — `acquire` risponde `{ok, ReqId, ClaimId, GrantedAt, ExpiresAt}` e la stazione lo ripete senza mai inventare timestamp propri, così "oldest wins" è deciso da un solo orologio anche dopo un failover. Il rinnovo è a **cinque campi** `{ClaimId, VehicleId, ConnId, UserId, GrantedAt}`: lo `UserId` chiude anche il punto dei claim adottati. Lato A client, mock e test sono adeguati; lato B restano il matcher del `renew` e la **PR formale su `claim.md`** (la apre B, A reviewer).
 
 ---
 
@@ -272,17 +300,20 @@ Controllo di `Dockerfile.erlang` e, a cascata, del compose e dei contratti. Il t
 - `Db` non è mai stato provato contro un MySQL vero.
 - Il back office non è mai stato deployato su Tomcat: `context.xml` e `web.xml` sono scritti ma non verificati.
 - La lista stazioni si aggiorna con `<meta http-equiv="refresh">` a 15 secondi: scelta deliberata, da dichiarare nella relazione.
-- **`user_id = 0` nei claim adottati.** Un leader che adotta un claim concesso dal predecessore non conosce l'utente, perché il rinnovo non lo porta. Innocuo in M1 — serve solo alle sospensioni, che sono M4 — ma va chiuso prima di allora: o si aggiunge `user_id` al rinnovo, o lo si recupera con `who_do_you_hold`.
+- ~~`user_id = 0` nei claim adottati~~ **chiuso il 24/08**: il rinnovo a cinque campi porta `UserId` (vedi §7).
+- **Il matcher del `renew` in `vs_coord_srv` va portato alla 5-tupla — bloccante per l'integrazione**: oggi accetta le forme a 3 e 4 campi, e la 5-tupla che la stazione ora invia produrrebbe `function_clause`, cioè il coordinatore che muore a ogni rinnovo.
+- **PR formale su `claim.md`** (`GrantedAt` in `acquire`, rinnovo a cinque campi): la apre B con A come reviewer. È la regolarizzazione di modifiche già concordate e implementate da entrambi.
 - Il coordinatore di M1 è **sempre leader** e non ha quorum: `mode` esiste già nello stato ma vale sempre `serving`. Elezione e maggioranza sono M3.
 
 ---
 
 ## 9. Prossimo passo
 
-La M1-B è scritta per intero e ora **compila e passa i test**. Quello che manca è la verifica di ciò che sta *fra* i componenti, e richiede l'unico prerequisito rimasto.
+La M1-B è scritta e testata; la M1-A ha stazione, claim client e mock **su `main`, verificati contro il contratto vero**. Quello che manca è la verifica di ciò che sta *fra* i componenti, più l'ultimo blocco di A.
 
-1. ~~Installare Erlang/OTP + rebar3~~ ✅ fatto: OTP 29.0.5, `compile` pulito, 21 test verdi.
-2. **Installare Docker Desktop**, poi la prova del ponte JInterface descritta in fondo a `contracts/erlang-java.md`: un coordinatore che invia `{leader, node()}` alla mailbox `backoffice` e un Tomcat che lo registra nel log. Resta il rischio numero uno, ma è più piccolo di ieri: la libreria è quella giusta e una `OtpNode` Java ha già raggiunto un nodo OTP 29 su questa macchina. Quello che non è mai stato provato è il DNS e i nomi dei nodi **fra container**.
-3. **Deploy del `war` su Tomcat 10.1** con MySQL popolato da `contracts/schema.sql`, e primo giro completo: registrazione, login, lista stazioni alimentata dal coordinatore.
+1. ~~Installare Erlang/OTP + rebar3~~ ✅ · ~~far girare il cluster nel compose~~ ✅ su macchina A: due stazioni + coord1 (mock), `station_up` e rinnovi in transito.
+2. **B — prima di tutto**: matcher del `renew` a cinque campi e PR su `claim.md`. Poi la prova del ponte JInterface di `contracts/erlang-java.md` (il compose ora esiste: su macchina A gira già) e il deploy del `war` su Tomcat 10.1 con MySQL dal seed.
+3. **A**: passo 3 di M1 — dipendenze `cowboy`/`jsx`/`jose`, `vs_driver_ws` (join/JWT contro i sample token, dedup `request_id`, push `state`), poi `station.jsp` + `js/`.
+4. **Integrazione M1**: si sostituisce coord1 col `vs_coord` vero (stesso hostname, stesso nome nodo) e si prenota dal browser, end-to-end.
 
 Solo dopo ha senso passare a M2. Aggiungere altro codice non verificato sopra codice non verificato è il modo più veloce per trovarsi con un debito difficile da districare.

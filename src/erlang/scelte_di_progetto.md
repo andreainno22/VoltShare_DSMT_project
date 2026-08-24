@@ -161,3 +161,105 @@ Il riparto della potenza e le decisioni di stato sono funzioni pure chiamate dai
 ### 6.2 Il probe M0 (`vs_ping`) ha la forma del client dei claim
 
 **Perché**: non è codice usa e getta. Verifica esattamente ciò che rischia di rompersi nel deploy (nomi, cookie, DNS) usando lo stesso schema che userà `vs_claim_client`: gen_server, call remota con timeout, tick con `erlang:send_after/3`, errore trattato come valore. Quando arriva M1, il modulo vero è una riscrittura di qualcosa di già visto funzionare.
+
+---
+
+## 7. Il manager di stazione (`vs_station_mgr`) — M1
+
+### 7.1 Registry in ETS di proprietà del manager; la registrazione è un messaggio, mai una call
+
+Il connettore si annuncia con un evento `{connector_up, Pid}` emesso dal proprio `init`, che il manager riceve come messaggio.
+
+**Perché**: il manager avvia i connettori in modo sincrono dentro `handle_continue`; se l'`init` del figlio facesse una `gen_server:call` verso il manager mentre questo aspetta il ritorno di `start_child`, i due si aspetterebbero a vicenda — la stessa forma del deadlock dei ping documentato in §4.4, solo spostata al boot. Un messaggio non aspetta nessuno.
+
+*Perché non `global` o gproc?* Una dipendenza (o un registry cluster-wide) per tenere una mappa locale `conn_id → pid` di quattro elementi: sproporzionato. ETS con owner il manager basta, e la tabella muore con lui — coerente con l'adozione di §7.3.
+
+### 7.2 Al boot i pid vengono dal valore di ritorno di `start_child`; l'evento serve ai riavvii
+
+**Perché**: registrare solo tramite l'evento renderebbe il boot non deterministico — una `station_state()` arrivata prima dei messaggi vedrebbe connettori `offline` mai esistiti. Il ritorno di `start_child` è sincrono e riempie il registry prima che `handle_continue` finisca; l'evento, idempotente, copre il caso che il ritorno non può coprire: il pid nuovo di un connettore riavviato dal supervisore dopo un crash.
+
+### 7.3 Un manager che riparte adotta i connettori vivi, non li riavvia
+
+In `handle_continue` il manager interroga `vs_connector_sup:which_children` e adotta i processi esistenti; avvia solo i mancanti.
+
+**Perché**: la radice è `one_for_one`, quindi un crash del manager non tocca i connettori — ed è giusto così: le sessioni di ricarica devono sopravvivere a un guasto di contorno (autonomia della stazione, SCOPE §4). Ma allora, ripartendo, il manager troverebbe connettori già avviati: riavviarli alla cieca ne creerebbe due per presa.
+
+*Perché non `rest_for_one`?* Ordinando manager prima dei connettori, un suo crash li riavvierebbe tutti: un guasto del contorno diventerebbe un'interruzione dell'erogazione — l'esatto contrario del requisito.
+
+### 7.4 Un connettore morto appare `offline`, non sparisce
+
+Tra il crash e il riavvio da parte del supervisore, la riga del registry perde il pid ma resta nello stato aggregato con `state => offline`.
+
+**Perché**: il connettore esiste fisicamente; toglierlo dalla lista mentirebbe al conducente che ha la pagina aperta. La finestra è di millisecondi, ma il caso in cui il riavvio fallisce del tutto (intensity esaurita) la rende visibile — ed è informazione vera.
+
+### 7.5 Configurazione dei connettori da `CONNECTORS`, allineata al seed
+
+`CONNECTORS="1:150,2:150,3:150,4:50"`, dichiarata per stazione nel compose accanto al seed di `schema.sql` che rispecchia.
+
+**Perché**: in M1 la stazione deve avviarsi senza MySQL — il database entra in M2 e non sta sul percorso critico dell'avvio. Gli id sono globali e fissati dal seed; la corrispondenza è un commento nel compose, un posto solo da tenere allineato.
+
+*Perché non leggere `connectors` dal DB al boot?* Aggiungerebbe la dipendenza `mysql` una milestone in anticipo e metterebbe il database sul percorso di avvio della stazione: un DB giù terrebbe a terra anche le colonnine, che per SCOPE §4 devono funzionare da sole. Da rivalutare in M2, quando il pool esisterà comunque.
+
+Un'entry malformata viene saltata con un warning, mai un boot fallito — stessa regola di §2.2.
+
+### 7.6 Il push ai sottoscrittori è lo stato completo, ricalcolato a ogni evento
+
+**Perché**: è P6 — il server è l'unica fonte di verità e pubblica stato completo, i client non calcolano nulla. Niente diff: con N≤4 connettori il costo è irrilevante e l'assenza di logica incrementale elimina un'intera classe di bug (client che perde un delta e diverge). Il budget di potenza viaggia nello stesso stato come valore (`site_power_kw`); il riparto arriva in M2 come da piano.
+
+Il push parte però **solo da un cambiamento osservabile**: l'ingresso iniziale in `free` (in `gen_statem` l'enter dello stato di partenza ha `Old =:= New`, ed è l'unico modo di entrare in `free` da `free`) non emette `state_changed`, e il `connector_up` duplicato del boot non fa broadcast. Non è pulizia estetica: `handle_continue` gira dopo che `start_link` è già tornato, quindi una sottoscrizione può accodarsi *prima* degli annunci di boot e riceverebbe raffiche di push per cambiamenti mai avvenuti. Scoperto da un test EUnit che falliva o passava a seconda dello scheduling — la definizione operativa di race.
+
+---
+
+## 8. Il client dei claim (`vs_claim_client`) e il coordinatore finto — M1
+
+### 8.1 La chiamata remota di `acquire` gira nel processo del connettore, non nel client
+
+Il client non esegue mai una chiamata remota nel proprio loop: `acquire` fa il giro dei coordinatori dentro il processo del connettore che prenota, i rinnovi vivono in un worker effimero che riporta l'esito come messaggio (lo schema di `vs_ping`, §4.4), e i cast fire-and-forget partono da uno `spawn`, perché perfino l'auto-connect verso un nodo morto può bloccare chi invia.
+
+**Perché**: il connettore che prenota DEVE aspettare — reserve è sincrona per contratto, non ha altro da fare. Il client invece no: se si bloccasse 2 s × 3 nodi su una claim, un coordinatore lento congelerebbe i rinnovi di tutta la stazione — e un rinnovo mancato a catena diventa revoca, cioè l'opposto di "niente coordinatore, ma le sessioni continuano". Il costo è che lo stato di routing (leader corrente) va letto e aggiornato con piccole call/cast locali dal processo chiamante; accettato, sono microsecondi.
+
+### 8.2 Il client non fa mai call sincrone verso il resto della stazione
+
+Verso il manager legge le ETS con `lookup_pid/connector_specs` (letture "dirty" dichiarate tali); verso i connettori solo cast (`revoke`).
+
+**Perché**: esistono già le catene di call connettore→client (acquire) e manager→connettore (snapshot). Una call client→manager chiuderebbe un anello di tre gen_server che, con il timing giusto, si aspettano a vicenda fino al timeout — la versione a tre del deadlock dei ping di M0 (§4.4). La regola che ne esce è semplice da difendere all'orale: *nel grafo delle chiamate sincrone fra i processi della stazione non devono esistere cicli*; le frecce che chiuderebbero un ciclo diventano messaggi o letture ETS.
+
+### 8.3 La tabella dei claim vive nel client; `GrantedAt` lo emette il coordinatore
+
+**Perché nel client**: acquire e release ci passano già, il batch di renew (§3.2 del contratto: un messaggio per stazione, non uno per connettore) e la risposta a `who_do_you_hold` (§3.4, "immediatamente, dalla memoria") ne hanno bisogno lì. Il connettore resta proprietario della *prenotazione*, il client dei *claim* — due oggetti diversi per il contratto stesso.
+
+**Perché GrantedAt del coordinatore** (evoluzione del 24/08, PR condivisa): la prima versione usava l'ora locale della stazione alla ricezione del grant, perché il contratto non trasportava un timestamp. B ha controproposto — e abbiamo accettato — che lo emetta sempre il coordinatore: `acquire` risponde `{ok, ReqId, ClaimId, GrantedAt, ExpiresAt}` e la stazione lo *ripete* in renew e `who_do_you_hold` senza mai inventare timestamp propri. Il motivo è da esame: oldest-wins (§5.5) confronta claim di **stazioni diverse**, e con timestamp locali l'esito dipenderebbe dallo skew fra macchine su cui non c'è alcuna garanzia (niente clock globale). Con un solo orologio emittente l'ordinamento sopravvive anche al failover. Nella stessa PR il renew è passato a cinque campi `{ClaimId, VehicleId, ConnId, UserId, GrantedAt}`: lo `UserId` costa zero (il client lo ha già in tabella) e permette a un leader che adotta un claim di applicare le sospensioni subito, senza aspettare la `who_do_you_hold` di M3 — il contratto si tocca una volta sola.
+
+### 8.4 Un renew senza risposta non è una revoca
+
+Se nessun coordinatore risponde, i claim restano e si ritenta al tick dopo; revoca solo la lista `Revoked` esplicita.
+
+**Perché**: lo dice il contratto — la revoca è autoritativa (§5.4) proprio perché è *esplicita*; i fallimenti di discovery "non fermano mai ciò che è già in corso" (§4) e il backstop è la scadenza (§5.6): il lease locale libera il connettore e l'expiry lato coordinatore libera il veicolo, senza bisogno di indovinare dal silenzio. Interpretare il silenzio come revoca trasformerebbe ogni hiccup di rete in prenotazioni cancellate.
+
+### 8.5 Il mock è un'app OTP nell'umbrella, registrata col nome vero
+
+`apps/vs_mock_coord`, gen_server registrato `vs_coord_srv`, deployato con `ERL_APP: vs_mock_coord` sul servizio `coord1`.
+
+**Perché**: il client non deve poter distinguere il finto dal vero — stessa registrazione, stesso trasporto, stesse tuple — così la sostituzione di fine M1 è un cambio di servizio nel compose e zero righe di Erlang. Farne un'app significa che `start-node.sh` lo avvia senza modifiche. In più il mock registra tutto ciò che riceve (`history/0`) e sa rifiutare a comando (`set_reply/1`, `set_renew/1`): è sia il riferimento eseguibile del contratto per B — trasporto incluso: `claim`/`renew` come call, `release`/`station_up`/`station_stats` come cast — sia il banco di prova con cui EUnit esercita il client fino alla revoca end-to-end.
+
+*Perché non trenta righe dentro `vs_station`?* Perché deve girare su un **nodo** separato (è la distribuzione ciò che si sta provando), e un'app dedicata con `ERL_APP` è il modo che il deploy già conosce.
+
+### 8.6 `CLAIM_MOD` come leva di configurazione
+
+Il manager passa ai connettori `claim_mod = vs_claim_client` di default; `CLAIM_MOD=vs_claim_null` degrada allo stub rumoroso.
+
+**Perché**: la stazione resta giocabile dalla shell senza coordinatore (il why di `vs_claim_null`, §4.4) senza ricompilare, e il default di produzione è quello coordinato — l'errore pericoloso (null in produzione) richiede un atto esplicito e si vede comunque nel log a ogni concessione.
+
+### 8.7 `station_stats` derivate dai push del manager, inviate solo al cambiamento
+
+Il client si abbona al manager **via cast** (regola di §8.2: mai call sincrone verso la stazione); il manager risponde a una sottoscrizione via cast inviando subito lo stato corrente — un cast non può combinare iscrizione e lettura, quindi il primo push fa da lettura. Da ogni push il client deriva `{free, held, charging}` e manda `{station_stats, ...}` al coordinatore **solo se i conteggi sono cambiati**.
+
+**Perché event-driven e non a timer**: la lobby del back office mostra questi numeri; con un timer sarebbero vecchi fino al prossimo tick, con l'invio al cambiamento sono aggiornati quando cambia la realtà e silenziosi quando non cambia nulla — coerente con il principio P6 usato ovunque. La deduplica evita che ogni push del manager (che riparte a ogni evento) diventi traffico verso il coordinatore.
+
+**Convenzioni di conteggio**: `closing` conta come `charging` (una sessione sta ancora finendo lì); `offline` non conta in niente — non è libero e non è utilizzabile — quindi i tre numeri possono sommare meno del totale dei connettori, ed è informazione vera, non un bug.
+
+### 7.7 `notify` verso un nome non registrato non crasha il connettore
+
+`vs_connector` fa `whereis` prima di inviare a un atom.
+
+**Perché**: mentre il manager riavvia, il suo nome è momentaneamente non registrato e `Atom ! Msg` solleverebbe `badarg` — nel mezzo di una transizione di stato del connettore. Tutti i connettori notificano gli stessi eventi negli stessi momenti: crasherebbero insieme, esaurendo `intensity` e spegnendo il nodo. Un guasto del solo manager diventerebbe un'interruzione totale. La notifica persa è innocua: il manager, riadottando i connettori (§7.3), ricostruisce lo stato con una `snapshot`.
