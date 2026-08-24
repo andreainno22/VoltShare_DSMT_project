@@ -118,13 +118,25 @@ services:
   # backoffice:
   #   build: { context: .., dockerfile: deploy/Dockerfile.backoffice }
   #   container_name: backoffice
-  #   hostname: backoffice
+  #   hostname: backoffice          # must match JINTERFACE_NODE below
   #   environment:
-  #     ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
+  #     # JInterface. Without these two the bridge would fall back to its
+  #     # defaults and announce itself as voltshare_bo@localhost, which no
+  #     # coordinator can reach — the node name has to carry the hostname the
+  #     # others resolve. See contracts/erlang-java.md §1.
+  #     JINTERFACE_NODE: voltshare_bo@backoffice
+  #     JINTERFACE_MBOX: backoffice
+  #     COORD_NODES: vs@coord1,vs@coord2,vs@coord3
+  #     VOLTSHARE_ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
   #     VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
-  #     MYSQL_HOST: mysql
+  #     DB_HOST: mysql
+  #     DB_PORT: "3306"
+  #     DB_NAME: voltshare
+  #     DB_USER: voltshare
+  #     DB_PASSWORD: voltshare
   #   ports: ["8080:8080"]
-  #   depends_on: [mysql, coord1]
+  #   depends_on:
+  #     mysql: { condition: service_healthy }
   #   networks: [voltshare]
 
 networks:

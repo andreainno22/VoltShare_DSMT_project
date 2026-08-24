@@ -13,8 +13,13 @@ Owners: **A** implements the caller (`vs_claim_client`), **B** implements the se
 Every station node knows the coordinator cluster from configuration:
 
 ```
-COORD_NODES=coord1@coord1,coord2@coord2,coord3@coord3
+COORD_NODES=vs@coord1,vs@coord2,vs@coord3
 ```
+
+**Every node in the cluster uses the same short name, `vs`** — it is the hostname that tells
+them apart, and on a compose network each service already resolves the others by service name
+(`deploy/docker-compose.yml` sets `NODE_SNAME: vs` everywhere). Short names throughout: mixing
+`-sname` and `-name` in one cluster is the classic way to get nodes that cannot see each other.
 
 Only one coordinator serves at a time. The station does not need to know which: it addresses the last known leader, and any coordinator that is not serving replies with a redirect (§4).
 
@@ -114,6 +119,12 @@ Sent by a newly elected leader to every known station. The station replies with 
 
 The station answers **immediately** from memory, without touching the database. `GrantedAt` is the timestamp the coordinator returned when the claim was first acquired; the station stores it for exactly this purpose.
 
+Transport, unlike the messages above: this one is a **plain message** to the registered name
+`vs_claim_client` on the station node, and the answer is a plain message back to `From` — not a
+`gen_server:call`. The rebuilding leader is talking to several stations at once and must not
+block on any of them; a station that never answers simply does not contribute to the rebuild,
+and the collection timeout closes the round.
+
 ### 3.5 Station announcement
 
 Sent by the station on start-up and every 30 s, so the coordinator can keep the cluster map and feed the back office.
@@ -199,7 +210,7 @@ station1                        coord2 (dies)        coord3 (elected)
 
 | Variable | Default | Used by |
 |---|---|---|
-| `COORD_NODES` | `coord1@coord1,coord2@coord2,coord3@coord3` | station |
+| `COORD_NODES` | `vs@coord1,vs@coord2,vs@coord3` | station |
 | `CLAIM_CALL_TIMEOUT_MS` | `2000` | station |
 | `CLAIM_RENEW_INTERVAL_MS` | `10000` | station |
 | `CLAIM_GRACE_SECONDS` | `60` | coordinator — added to the lease when granting |

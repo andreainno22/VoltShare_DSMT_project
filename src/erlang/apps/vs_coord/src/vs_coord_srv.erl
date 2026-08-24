@@ -255,12 +255,33 @@ is_suspended(UserId, State) ->
 do_renew(StationId, Claims, State) ->
     Lease = vs_env:get_int("LEASE_SECONDS", 900),
     NewExpiry = vs_time:now_ms() + (Lease + State#state.grace_s) * 1000,
+    warn_if_legacy(StationId, Claims),
     {Ok, Revoked, State1} =
         lists:foldl(
           fun(Entry, Acc) -> renew_one(Entry, StationId, NewExpiry, Acc) end,
           {[], [], State},
           Claims),
     {{renewed, lists:reverse(Ok), lists:reverse(Revoked), NewExpiry}, State1}.
+
+%% Once per renewal rather than once per claim: a station on the old form sends
+%% one every 10 seconds, and a line per claim would drown the log.
+warn_if_legacy(StationId, Claims) ->
+    case lists:any(fun(E) -> tuple_size(E) =:= 3 end, Claims) of
+        false -> ok;
+        true  ->
+            logger:notice("station ~p renews without granted_at: conflicts on those "
+                          "claims are resolved with the coordinator's clock", [StationId])
+    end.
+
+%% Three-field form: the station has not been updated to carry granted_at yet
+%% (contracts/claim.md §3.2). Accepted rather than refused — a function_clause
+%% here would take the whole coordinator down on a routine renewal, losing every
+%% claim it holds, which is a far worse failure than a timestamp we have to
+%% guess. The coordinator's own clock is the fallback: it makes an adopted claim
+%% look brand new, so it loses conflicts against claims we already know, which
+%% is the conservative direction.
+renew_one({ClaimId, VehicleId, ConnId}, StationId, NewExpiry, Acc) ->
+    renew_one({ClaimId, VehicleId, ConnId, vs_time:now_ms()}, StationId, NewExpiry, Acc);
 
 renew_one({ClaimId, VehicleId, ConnId, GrantedAt}, StationId, NewExpiry, {Ok, Revoked, State}) ->
     case maps:find(VehicleId, State#state.claims) of

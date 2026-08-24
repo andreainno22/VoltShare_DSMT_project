@@ -1,0 +1,29 @@
+# The build context is src/, so everything here is sent to the Docker daemon on
+# every build. Without this file that means ~22 MB, of which 21 are the Java war
+# and its unpacked classes — none of which any image needs.
+
+# Java build output
+backoffice/target/
+
+# Erlang build output: the image compiles from source in its own stage, and
+# .beam files built on the host would shadow it
+erlang/_build/
+**/.rebar3/
+**/*.beam
+
+# Node
+emulator/node_modules/
+
+# Documents: they belong in the repository, not in an image
+*.md
+docs/
+contracts/*.md
+# schema.sql is the exception — the compose file mounts it into MySQL
+!contracts/schema.sql
+
+# Editors and OS noise
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+.DS_Store

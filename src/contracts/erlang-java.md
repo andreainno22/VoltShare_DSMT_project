@@ -20,7 +20,11 @@ reads from memory, so a browser refresh never reaches Erlang.
 | Mailbox | registered as **`backoffice`**, overridable with `JINTERFACE_MBOX` |
 | Erlang process | `gen_server` registered as **`vs_coord_srv`** on each coordinator node |
 | Cookie | `VOLTSHARE_ERLANG_COOKIE`, the same on every node of the cluster |
-| Coordinators | `COORD_NODES`, comma-separated; Java addresses the first entry until told otherwise |
+| Coordinators | `COORD_NODES=vs@coord1,vs@coord2,vs@coord3`; Java addresses the first entry until told otherwise |
+
+Note the Erlang node names: every node in the cluster uses the short name **`vs`** and is told
+apart by its hostname (`deploy/docker-compose.yml`). The Java node is the one exception — it is
+`voltshare_bo`, so that it is recognisable in a log and never mistaken for a cluster member.
 | Library | **JInterface 1.16**, the one shipped with OTP 29, from `backoffice/libs/` |
 
 **On the library version.** The `org.erlang.otp:jinterface` artifact on Maven Central is

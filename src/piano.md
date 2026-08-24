@@ -136,6 +136,8 @@ Tutto il resto è interno a una persona sola: il WebSocket driver e il canale co
 
 Il contratto più importante del sistema: è il meccanismo che garantisce P2. Messaggi Erlang fra nodi, il coordinatore è un `gen_server` registrato come `vs_coord_srv`.
 
+> Riepilogo, non fonte: **fa fede `contracts/claim.md`**, che è il documento congelato.
+
 ```erlang
 %% richiesta di claim, prima che la stazione confermi la prenotazione
 {claim, ReqId, VehicleId, UserId, StationId, ConnId}
@@ -144,8 +146,8 @@ Il contratto più importante del sistema: è il meccanismo che garantisce P2. Me
    | {not_serving, LeaderNode}          %% la stazione ritenta sul leader indicato
 
 %% rinnovo periodico, ogni 10 s, per tutti i claim della stazione
-{renew, StationId, [ClaimId]}
-   → {renewed, [ClaimId], [RevokedClaimId]}
+{renew, StationId, [{ClaimId, VehicleId, ConnId, GrantedAt}]}
+   → {renewed, [ClaimId], [RevokedClaimId], NewExpiresAt}
 
 %% rilascio: cancellazione, lease scaduto, sessione conclusa
 {release, ClaimId, Reason :: cancelled | expired | completed}

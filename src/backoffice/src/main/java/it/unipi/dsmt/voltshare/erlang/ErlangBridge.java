@@ -95,7 +95,10 @@ public final class ErlangBridge {
 
     private void runLoop() {
         String nodeName = Env.get("JINTERFACE_NODE", "voltshare_bo@localhost");
-        String cookie = Env.get("VOLTSHARE_ERLANG_COOKIE", "voltshare-dev-cookie");
+        // The default must match the Erlang side's, or a developer running both
+        // outside Docker gets a handshake that fails with no useful message:
+        // rebar.config sets {setcookie, voltshare} and Dockerfile.erlang the same.
+        String cookie = Env.get("VOLTSHARE_ERLANG_COOKIE", "voltshare");
         String mboxName = Env.get("JINTERFACE_MBOX", "backoffice");
 
         while (started.get() && !Thread.currentThread().isInterrupted()) {
@@ -236,7 +239,9 @@ public final class ErlangBridge {
     }
 
     private String firstCoordinator() {
-        String nodes = Env.get("COORD_NODES", "coord1@localhost");
+        // Same form as everywhere else in the cluster: short name `vs`, hostname
+        // tells the nodes apart (contracts/erlang-java.md §1).
+        String nodes = Env.get("COORD_NODES", "vs@coord1");
         return nodes.split(",")[0].trim();
     }
 

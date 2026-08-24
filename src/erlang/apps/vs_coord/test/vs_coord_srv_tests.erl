@@ -74,6 +74,7 @@ claims_test_() ->
         fun late_release_does_not_erase_the_new_claim/1,
         fun own_claim_is_renewed/1,
         fun unknown_claim_is_adopted/1,
+        fun renew_without_granted_at_is_accepted/1,
         fun oldest_claim_wins_a_conflict/1
     ]).
 
@@ -178,6 +179,28 @@ unknown_claim_is_adopted(_) ->
         ?assertEqual({error, <<"r-x">>, already_held},
                      vs_coord_srv:claim(<<"r-x">>, ?VEHICLE, ?USER, ?STATION_2, 7),
                      "an adopted claim must protect the vehicle like any other")
+    end.
+
+%% Interoperability with a station that still sends the three-field form. It must
+%% keep working: refusing would be bad, crashing on function_clause — which is what
+%% happened before this clause existed — would take the coordinator down and lose
+%% every claim, on a message that arrives every ten seconds.
+renew_without_granted_at_is_accepted(_) ->
+    fun() ->
+        {ok, _, ClaimId, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+
+        {renewed, Ok, Revoked, _} =
+            vs_coord_srv:renew(?STATION_1, [{ClaimId, ?VEHICLE, 3}]),
+
+        ?assertEqual([ClaimId], Ok),
+        ?assertEqual([], Revoked),
+        ?assertEqual(1, length(vs_coord_srv:claims())),
+
+        %% and an unknown one in the old form is adopted, not dropped
+        Ghost = <<"c-legacy">>,
+        {renewed, [Ghost], [], _} =
+            vs_coord_srv:renew(?STATION_2, [{Ghost, 99, 7}]),
+        ?assertEqual(2, length(vs_coord_srv:claims()))
     end.
 
 %% Two stations claiming the same vehicle after a failover. Deterministic rule,

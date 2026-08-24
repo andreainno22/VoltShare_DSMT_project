@@ -11,13 +11,22 @@ FROM erlang:29.0.5-alpine AS build
 WORKDIR /build
 COPY erlang/rebar.config ./
 COPY erlang/apps ./apps
-RUN rebar3 compile
+
+# `cp -rL` dereferences, and that matters: on Linux rebar3 links the umbrella
+# applications into _build instead of copying them. A plain `COPY --from` would
+# carry those links into an image where /build does not exist, leaving `-pa
+# /app/lib/*/ebin` pointing at nothing and the node dying on boot with a
+# "no such file or directory" for the .app. Dereferencing here costs nothing
+# and makes the result independent of how rebar3 lays out _build.
+RUN rebar3 compile \
+    && mkdir -p /out \
+    && cp -rL _build/default/lib /out/lib
 
 FROM erlang:29.0.5-alpine
 
 RUN apk add --no-cache bash
 WORKDIR /app
-COPY --from=build /build/_build/default/lib /app/lib
+COPY --from=build /out/lib /app/lib
 COPY deploy/start-node.sh /app/start-node.sh
 RUN chmod +x /app/start-node.sh
 
