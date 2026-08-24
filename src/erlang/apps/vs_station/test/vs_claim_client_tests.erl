@@ -223,3 +223,66 @@ revocation_travels_from_coordinator_to_connector_test() ->
         %% the client dropped the claim too: nothing left to renew
         ?assertEqual({1, []}, holds())
     end).
+
+%%%===================================================================
+%%% the reachability flag the driver channel shows (ws-driver.md §5.1)
+%%%===================================================================
+
+%% Before the client has booted there is no table, and the answer is
+%% `true'. Optimistic on purpose: nothing has been tried, so nothing has
+%% failed, and refusing reservations would be a failure this station
+%% invented rather than one it measured.
+coordinator_reachable_is_optimistic_before_the_client_boots_test() ->
+    ok = wait_until(fun() -> ets:info(vs_claim_reach) =:= undefined end),
+    ?assert(vs_claim_client:coordinator_reachable()).
+
+%% The declared semantics, end to end: "the last renew round found a
+%% coordinator". Not a ping — the outcome of work the station actually
+%% did. The coordinator is killed under a live claim, the next renew
+%% round comes back empty-handed, and the flag drops; when it returns,
+%% so does the flag. §7.6: the station degrades, it does not stop.
+coordinator_reachable_follows_the_renew_outcome_test() ->
+    {ok, Mock}   = vs_mock_coord:start_link(),
+    {ok, Client} = vs_claim_client:start_link(client_opts()),
+    try
+        ?assert(vs_claim_client:coordinator_reachable()),
+        %% a claim, so that the renew tick has something to renew
+        {ok, _ClaimId, _} = acquire(),
+        stop([Mock]),
+        wait_gone([vs_coord_srv]),
+        ok = wait_until(fun() -> not vs_claim_client:coordinator_reachable() end),
+        %% ... and the claim was kept through it: a failed renew is not a
+        %% revocation (claim.md §5.4), which is exactly why the flag had
+        %% to be published separately from the claim table
+        {1, [_TheClaim]} = holds(),
+        {ok, Mock2} = vs_mock_coord:start_link(),
+        try
+            ok = wait_until(fun() -> vs_claim_client:coordinator_reachable() end)
+        after
+            stop([Mock2]),
+            wait_gone([vs_coord_srv])
+        end
+    after
+        stop([Client]),
+        wait_gone([vs_claim_client]),
+        flush()
+    end.
+
+%% The named table is created in init/1, and these fixtures start a
+%% client several times in one VM. Teardown waits for the registered
+%% *name*, which a dying process gives up at a slightly different moment
+%% from its ETS tables — so `ets:new' can meet a leftover. This is that
+%% sequence, on purpose.
+the_reachability_table_survives_a_client_restart_test() ->
+    {ok, First} = vs_claim_client:start_link(client_opts()),
+    stop([First]),
+    wait_gone([vs_claim_client]),
+    {ok, Second} = vs_claim_client:start_link(client_opts()),
+    try
+        ?assert(vs_claim_client:coordinator_reachable())
+    after
+        stop([Second]),
+        wait_gone([vs_claim_client]),
+        flush()
+    end.
+

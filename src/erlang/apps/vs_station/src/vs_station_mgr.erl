@@ -48,7 +48,12 @@
 -define(DEFAULT_CONNECTORS, "1:150,2:150,3:150,4:50").
 
 -record(state, {station_id    :: pos_integer(),
+                name          :: binary(),
                 site_power_kw :: pos_integer(),
+                %% Carried, never applied: the station reports the tariff
+                %% so the page can show it, and the back office is the one
+                %% that turns kWh into money (schema.sql, ownership rules).
+                tariff_cents_kwh :: non_neg_integer(),
                 child_opts    :: map(),
                 monitors = #{} :: #{reference() =>
                                         {connector, pos_integer()} | {subscriber, pid()}},
@@ -121,6 +126,17 @@ connector_specs() ->
 init(Opts) ->
     StationId = maps:get(station_id, Opts, vs_env:get_int("STATION_ID", 1)),
     SiteKw    = maps:get(site_power_kw, Opts, vs_env:get_int("SITE_POWER_KW", 350)),
+    %% Same variables vs_claim_client reads for its station_up
+    %% announcement, with the same defaults. Duplicated *reading*, not
+    %% duplicated *computation*: one environment, one value, so the two
+    %% cannot disagree. Having one process ask the other would couple two
+    %% gen_servers the design deliberately keeps apart.
+    Name      = maps:get(name, Opts,
+                         list_to_binary(
+                           vs_env:get_str("STATION_NAME",
+                                          "station-" ++ integer_to_list(StationId)))),
+    Tariff    = maps:get(tariff_cents_kwh, Opts,
+                         vs_env:get_int("TARIFF_CENTS_KWH", 45)),
     Specs     = maps:get(connectors, Opts, connectors_from_env()),
     ets:new(?TAB, [named_table, set, protected]),
     lists:foreach(fun({Id, RatedKw}) ->
@@ -134,9 +150,11 @@ init(Opts) ->
                     false -> ChildOpts0#{claim_mod =>
                                              vs_env:get_atom("CLAIM_MOD", vs_claim_client)}
                 end,
-    {ok, #state{station_id    = StationId,
-                site_power_kw = SiteKw,
-                child_opts    = ChildOpts},
+    {ok, #state{station_id       = StationId,
+                name             = Name,
+                site_power_kw    = SiteKw,
+                tariff_cents_kwh = Tariff,
+                child_opts       = ChildOpts},
      {continue, start_connectors}}.
 
 handle_continue(start_connectors, State0) ->
@@ -313,11 +331,28 @@ demonitor_connector(ConnId, Mons) ->
                         true
                 end, Mons).
 
-build_state(#state{station_id = StationId, site_power_kw = SiteKw}) ->
+%% The payload of the `state' push of ws-driver.md §5.1, minus the two
+%% fields that are not the manager's to know: `coordinator_reachable'
+%% belongs to the claim client, and `held_by_me'/`mine' depend on which
+%% driver is looking. Both are added by vs_driver_proto:wire_state/3.
+build_state(#state{station_id = StationId, name = Name, site_power_kw = SiteKw,
+                   tariff_cents_kwh = Tariff}) ->
     Connectors = [connector_entry(Row) || Row <- lists:keysort(1, ets:tab2list(?TAB))],
-    #{station_id    => StationId,
-      site_power_kw => SiteKw,
-      connectors    => Connectors}.
+    #{station_id       => StationId,
+      name             => Name,
+      site_power_kw    => SiteKw,
+      %% What the site is handing out right now. Until M2 it is the sum
+      %% of what the connectors report drawing, not the result of an
+      %% allocation: there is nothing allocating yet, and a number the
+      %% meters agree with is better than a number nobody computed.
+      allocated_kw     => allocated_kw(Connectors),
+      tariff_cents_kwh => Tariff,
+      connectors       => Connectors}.
+
+%% An `offline' entry carries three keys only, so the default is not
+%% decoration: a connector whose process is gone draws nothing.
+allocated_kw(Connectors) ->
+    lists:sum([maps:get(power_kw, C, 0) || C <- Connectors]).
 
 connector_entry({ConnId, RatedKw, undefined}) ->
     #{connector_id => ConnId, rated_kw => RatedKw, state => offline};

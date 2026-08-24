@@ -42,12 +42,15 @@
 
 %% claim_mod interface — called from the connector's process
 -export([acquire/4, release/2]).
+%% dirty read — for the driver WebSocket processes (see below)
+-export([coordinator_reachable/0]).
 %% lifecycle
 -export([start_link/0, start_link/1]).
 %% gen_server
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, handle_continue/2]).
 
 -define(SRV, vs_coord_srv).          %% remote name, fixed by the contract
+-define(REACH, vs_claim_reach).      %% one row: {coordinator_reachable, boolean()}
 
 -record(claim, {vehicle_id :: pos_integer(),
                 user_id    :: pos_integer(),
@@ -92,6 +95,36 @@ release(ClaimId, Reason) ->
     gen_server:call(?MODULE, {release, ClaimId, Reason}).
 
 %%%===================================================================
+%%% the reachability flag
+%%%===================================================================
+
+%% @doc Whether the **last renew round found a coordinator**. That is the
+%% declared meaning, and it is narrower than "the cluster is healthy": it
+%% is not a ping, it is the outcome of work this station actually did.
+%%
+%% Read straight out of the ETS, the same way vs_station_mgr:lookup_pid/1
+%% is read and for the same reason: the driver WebSocket processes are
+%% leaves, and answering them with a synchronous call would put this
+%% gen_server on the critical path of every state push — while this
+%% process, by structural rule, calls nobody inside the station either.
+%% A dirty read of one boolean cannot be wrong in a way that matters:
+%% the worst case is a value one renew tick old.
+%%
+%% `true' when the table does not exist yet, i.e. before the client has
+%% booted. Optimistic on purpose: until something has actually failed,
+%% reservations are worth attempting, and `acquire' is what really
+%% decides. Refusing them for a coordinator nobody has tried to reach
+%% would be a failure this station invented.
+-spec coordinator_reachable() -> boolean().
+coordinator_reachable() ->
+    try ets:lookup(?REACH, coordinator_reachable) of
+        [{coordinator_reachable, Reachable}] -> Reachable;
+        _Empty                               -> true
+    catch
+        error:badarg -> true       %% the claim client is not up yet
+    end.
+
+%%%===================================================================
 %%% lifecycle
 %%%===================================================================
 
@@ -116,6 +149,7 @@ init(Opts) ->
                      vs_env:get_nodes("COORD_NODES",
                                       ['coord1@coord1', 'coord2@coord2', 'coord3@coord3'])),
     Info = maps:get(station_info, Opts, station_info_from_env(StationId)),
+    init_reach_table(),
     {ok, #state{station_id  = StationId,
                 nodes       = Nodes,
                 leader      = hd(Nodes),            %% §4: first entry until told better
@@ -204,7 +238,11 @@ handle_info(renew_tick, State = #state{claims = Claims}) ->
 
 handle_info({renew_result, error}, State) ->
     %% No coordinator answered. NOT a revocation (§5.4): claims are kept,
-    %% the next tick retries, expiry is the backstop (§5.6).
+    %% the next tick retries, expiry is the backstop (§5.6). What it *is*,
+    %% is the one moment the station knows for certain that no coordinator
+    %% is reachable — so it is where the flag the driver channel shows is
+    %% written (ws-driver.md §5.1, §7.6: degrade, do not stop).
+    set_reachable(false),
     logger:warning("claim client: renew failed on every coordinator, "
                    "keeping ~p claim(s) until the next tick",
                    [map_size(State#state.claims)]),
@@ -212,6 +250,7 @@ handle_info({renew_result, error}, State) ->
 
 handle_info({renew_result, {ok, Node, {renewed, Ok, Revoked, NewExpiresAt}}},
             State = #state{claims = Claims0}) ->
+    set_reachable(true),
     Claims1 = lists:foldl(
                 fun(ClaimId, Acc) ->
                         case Acc of
@@ -224,7 +263,13 @@ handle_info({renew_result, {ok, Node, {renewed, Ok, Revoked, NewExpiresAt}}},
     Claims2 = lists:foldl(fun revoke/2, Claims1, Revoked),
     {noreply, State#state{leader = Node, claims = Claims2}};
 
+%% A coordinator answered, just not with something we understand. The
+%% claims are left alone, but a node did reply: reachability is about
+%% whether anybody is there, not about whether the reply made sense.
+%% (The design note listed two write sites; the module has three renew
+%% outcomes, and this is the third.)
 handle_info({renew_result, {ok, Node, Other}}, State) ->
+    set_reachable(true),
     logger:warning("claim client: unexpected renew reply from ~p: ~p", [Node, Other]),
     {noreply, State#state{leader = Node}};
 
@@ -379,6 +424,37 @@ station_up_msg(#state{station_id = StationId, info = Info}) ->
      maps:get(name, Info), maps:get(ws_url, Info),
      maps:get(site_power_kw, Info), maps:get(tariff_cents_kwh, Info),
      vs_station_mgr:connector_specs()}.
+
+%% Public: the readers are other processes. Owned by this one, so it
+%% dies with it and `coordinator_reachable/0' falls back to `true' — the
+%% same optimistic direction as a client that has not booted yet.
+%%
+%% The recreation dance is not paranoia: three EUnit fixtures start a
+%% client in the same VM, and their teardown waits for the registered
+%% *name* to disappear, which a dying process gives up at a slightly
+%% different moment from its ETS tables. Without this, whichever test ran
+%% second would fail in `init/1' with a badarg nobody would connect to
+%% the table. (vs_station_mgr_tests waits for `ets:info/1' as well — the
+%% two fixtures are not symmetrical, and this is the side that has to
+%% cope.)
+init_reach_table() ->
+    try ets:new(?REACH, [named_table, set, public, {read_concurrency, true}])
+    catch
+        error:badarg ->
+            %% A public table can be deleted by a process that does not own
+            %% it, which is exactly what makes the leftover recoverable.
+            %% `try', never the old `catch Expr': OTP 29 deprecates that
+            %% form and warnings_as_errors turns it into a build failure
+            %% (the same note vs_connector:release/2 carries).
+            try ets:delete(?REACH) catch error:badarg -> ok end,
+            ets:new(?REACH, [named_table, set, public, {read_concurrency, true}])
+    end,
+    set_reachable(true).
+
+set_reachable(Reachable) ->
+    try ets:insert(?REACH, {coordinator_reachable, Reachable})
+    catch error:badarg -> false      %% shutting down; nobody left to tell
+    end.
 
 station_info_from_env(StationId) ->
     #{name             => list_to_binary(

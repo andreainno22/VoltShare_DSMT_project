@@ -4,7 +4,11 @@
   {registered, [vs_station_sup, vs_ping, vs_connector_sup, vs_station_mgr,
                 vs_claim_client]},
   {mod, {vs_station_app, []}},
-  {applications, [kernel, stdlib, vs_common]},
+  %% cowboy/jsx/jose are listed so that application:ensure_all_started
+  %% (start-node.sh) boots them: the driver listener starts in
+  %% vs_station_app and would otherwise call into a stopped library.
+  %% ranch and cowlib arrive as cowboy's own dependencies.
+  {applications, [kernel, stdlib, vs_common, cowboy, jsx, jose]},
   {env, []},
   {modules, []},
   {licenses, ["MIT"]}

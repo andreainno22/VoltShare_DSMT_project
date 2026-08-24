@@ -182,3 +182,65 @@ crashed_connector_is_restarted_and_readopted_test() ->
         %% grants nothing
         ?assertEqual(free, maps:get(state, connector_in(vs_station_mgr:station_state(), 1)))
     end).
+
+%%%===================================================================
+%%% what the aggregate state learned to say for the driver channel
+%%%===================================================================
+
+%% ws-driver.md §5.1 wants more than the manager used to produce. These
+%% three fields are additions: nothing that was already in the map
+%% changed name or disappeared, which is what keeps vs_claim_client's
+%% count_stats/1 and every assertion above green.
+state_carries_the_fields_the_driver_channel_needs_test() ->
+    with_station(fun() ->
+        State = vs_station_mgr:station_state(),
+        %% still there, unchanged
+        ?assertEqual(1, maps:get(station_id, State)),
+        ?assertEqual(350, maps:get(site_power_kw, State)),
+        ?assertEqual(2, length(maps:get(connectors, State))),
+        %% new
+        ?assert(is_binary(maps:get(name, State))),
+        ?assert(is_integer(maps:get(tariff_cents_kwh, State))),
+        %% nothing is charging, so nothing is allocated
+        ?assertEqual(0.0, maps:get(allocated_kw, State))
+    end).
+
+%% `name' and `tariff_cents_kwh' come from the same two variables
+%% vs_claim_client reads for its station_up announcement. Reading the
+%% environment in two places is duplication of *reading*, not of
+%% *computation*: the value cannot diverge, and the alternative would
+%% couple two processes the design keeps apart.
+name_and_tariff_come_from_the_environment_test() ->
+    os:putenv("STATION_NAME", "Pisa Centro"),
+    os:putenv("TARIFF_CENTS_KWH", "42"),
+    try
+        with_station(fun() ->
+            State = vs_station_mgr:station_state(),
+            ?assertEqual(<<"Pisa Centro">>, maps:get(name, State)),
+            ?assertEqual(42, maps:get(tariff_cents_kwh, State))
+        end)
+    after
+        os:unsetenv("STATION_NAME"),
+        os:unsetenv("TARIFF_CENTS_KWH")
+    end.
+
+%% Until the allocation algorithm of M2, `allocated_kw' is the sum of
+%% what the connectors report drawing — a number the meters agree with,
+%% rather than one nobody computed.
+allocated_kw_is_the_sum_of_what_the_connectors_draw_test() ->
+    with_station(fun() ->
+        {ok, Pid1} = vs_station_mgr:connector_pid(1),
+        {ok, Pid2} = vs_station_mgr:connector_pid(2),
+        {ok, _} = vs_connector:reserve(Pid1, ?USER, ?VEHICLE),
+        ok = vs_connector:plugged(Pid1, #{user_id => ?USER, vehicle_id => ?VEHICLE}),
+        vs_connector:meter(Pid1, #{power_kw => 120.5, energy_kwh => 3.0}),
+        %% a walk-in on the other connector counts exactly the same
+        ok = vs_connector:plugged(Pid2, #{user_id => 77, vehicle_id => 5}),
+        vs_connector:meter(Pid2, #{power_kw => 40.0, energy_kwh => 1.0}),
+        wait_until(fun() ->
+                           120.5 + 40.0 =:= maps:get(allocated_kw,
+                                                     vs_station_mgr:station_state())
+                   end),
+        ?assertEqual(160.5, maps:get(allocated_kw, vs_station_mgr:station_state()))
+    end).
+

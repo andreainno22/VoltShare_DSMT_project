@@ -12,7 +12,7 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 | Milestone | A (stazione, emulatore, viste live) | B (coordinatore, back office, pagine) |
 |---|---|---|
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
-| **M1** percorso base | 🟡 stazione pronta e su main (manager, connettori, claim client, mock del coordinatore — 48 test); mancano `vs_driver_ws` e `station.jsp` | 🟡 coordinatore e back office scritti e testati (22 test); da adeguare il renew a 5 campi, provare il ponte JInterface e il deploy su Tomcat |
+| **M1** percorso base | 🟡 stazione **e canale driver** pronti (manager, connettori, claim client, mock del coordinatore, `vs_jwt` + `vs_driver_proto` + `vs_driver_ws` — **96 test lato A**); manca `station.jsp` (passo 4) | 🟡 coordinatore e back office scritti e testati (22 test); da adeguare il renew a 5 campi, provare il ponte JInterface e il deploy su Tomcat |
 | **M2** sessione e potenza | ⬜ | ⬜ |
 | **M3** tolleranza ai guasti | ⬜ | ⬜ |
 | **M4** regole di dominio | ⬜ | ⬜ |
@@ -35,6 +35,8 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | Docker compose (macchina B) | ❌ **mai eseguito** — Docker Desktop non è installato |
 | Ponte JInterface fra Java ed Erlang | ❌ **mai provato nel progetto** — la libreria ora è quella giusta, ma `vs_coord_bo` ↔ `ErlangBridge` non si sono mai parlati |
 | `vs_station` M1 (connettori, manager, claim client): test EUnit | ✅ verificato — **48 test, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 7 manager + 10 client + 9 vs_common) |
+| `vs_station` M1 passo 3 (canale driver): test EUnit | ✅ verificato — **96 test lato A, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 10 manager + 13 client + 11 `vs_jwt` + 31 `vs_driver_proto` + 9 vs_common). Totale su `main` con quelli di B: **109** |
+| Canale driver contro il contratto (`ws-driver.md`) | ✅ verificato nei test — handshake coi tre token di `sample-tokens.md`, at-most-once dimostrato contando le chiamate al connettore, tabella dei rifiuti §4.1/§6, traduzione `offline` → `out_of_service`, `coordinator_reachable` end-to-end |
 | `vs_claim_client` ↔ `vs_mock_coord` sul contratto vero | ✅ verificato nei test — claim, eco del `GrantedAt` nel renew, release, revoca end-to-end, `station_stats` |
 | Docker compose (macchina A) | ✅ **eseguito** — 7 container su, coord1 (mock) riceve `station_up` da entrambe le stazioni (4 e 3 connettori) |
 | Compose sull'immagine Debian 29.0.5 | 🟡 build verde; il giro completo era stato fatto con l'immagine 386, da ripetere dopo il merge |
@@ -189,7 +191,12 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
 rebar3 compile                         # quattro applicazioni, nessun warning
-rebar3 eunit                           # 70 test (48 stazione+common, 22 coordinatore)
+rebar3 eunit                           # 109 test (96 stazione+common lato A, 13 coordinatore)
+#
+# Nota di misura (24/08, macchina A): `rebar3 eunit --app vs_coord` conta **13**
+# test, non i 22 riportati sopra per M1-B — il file ha due generatori con 13
+# funzioni in tutto e 0 fallimenti. Nessun test è rotto: è solo un conteggio da
+# riallineare, e lo verifichi B sul proprio lato.
 
 # tutto insieme (verificato su macchina A il 24/08)
 cd src/deploy

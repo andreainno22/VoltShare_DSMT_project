@@ -97,6 +97,8 @@ Refusals — the mapping from the coordinator's answer to what the driver sees:
 
 The last row is the deliberate one: with no coordinator the station refuses **new reservations** and keeps everything already running (claim.md §4). Availability is sacrificed exactly where safety demands it and nowhere else.
 
+> **M1 note.** The first two rows are indistinguishable at the station's own boundary: `vs_connector:refusal()` uses one atom, `already_held`, both for "this connector is not free" and for the coordinator's "that vehicle is committed elsewhere". M1 therefore answers `ALREADY_HELD` in both cases. Telling them apart needs a new refusal atom in the connector state machine, which is deferred rather than forgotten.
+
 ### 4.2 `cancel_reservation`
 
 ```jsonc
@@ -132,6 +134,8 @@ The waiting list is per **station**, not per connector: a driver waiting for "a 
 When a connector frees up, the head of the list receives a `notification` of kind `waitlist_offer` carrying `connector_id` and `offer_expires_at`. The offer is accepted by sending a normal `reserve` for that connector before the deadline; ignoring it passes the offer to the next in line. A `reserve` for a connector under offer to somebody else is `NOT_YOUR_TURN`.
 
 The offer is a lease like every other hold in this system: the same mechanism that stops a no-show from freezing a connector stops an absent waiter from freezing the queue.
+
+> **Not implemented in M1.** The waiting list needs a per-station queue that no process owns yet. Until it exists, `join_waitlist` and `leave_waitlist` fall into the unknown-action branch and are answered `BAD_REQUEST`, and `waitlist` in the `state` payload is the constant of §5.1's note. The station says "I do not know how to do that" rather than pretending to queue somebody it will never call back. Arrives with the power allocation work.
 
 ---
 
@@ -175,6 +179,11 @@ Why the whole snapshot rather than a delta: a client that applies deltas has sta
 
 `coordinator_reachable: false` is a hint for the interface, not an error: reservations are refused while it is false, but charging carries on and the page should say so.
 
+> **M1 notes.**
+> * `waitlist` is the constant `{"length": 0, "my_position": null}` — a declared key, never a missing one, so the page renders the same shape it always will. See §4.4.
+> * `suspended` is not producible yet: it means an active session starved below `MIN_CHARGE_KW`, and nothing allocates power until M2. The other five names are all reachable today, `out_of_service` being what the station reports for a connector whose process is not answering.
+> * `coordinator_reachable` means precisely **"the last renew round found a coordinator"** — the outcome of work the station actually did, not a ping. It is `true` before the first renew tick: until something has been tried, nothing has failed, and `reserve` is what really decides.
+
 ### 5.2 `session` — live progress
 
 Sent every `SESSION_TICK_MS` to the owner of a running session, on every meter reading that changes the picture, and once more when it ends.
@@ -199,6 +208,8 @@ Sent every `SESSION_TICK_MS` to the owner of a running session, on every meter r
 `phase` is `charging` \| `suspended` \| `complete` \| `overstay` \| `closed`. `eta_seconds` is an estimate derived from the current allocation and the vehicle's charging curve; it is advisory and may jump when another car arrives and the allocation is recomputed — that jump is the visible proof of P5 and should not be smoothed away.
 
 Money never appears here. Cost is computed by the back office after the session row is written (schema.sql, ownership rules): the station knows energy and time, not tariffs applied to an account.
+
+> **Not implemented in M1.** This frame carries meter readings, which reach the station over the charge point channel (ws-chargepoint.md) — and that channel arrives with M2. Until then the driver channel sends `state` only, and a running session is visible there through the connector's `state` and `power_kw`. No `session` frame is emitted, rather than one filled with zeroes.
 
 ### 5.3 `notification`
 
@@ -312,7 +323,8 @@ No operator action, no cooperation from the client: the connector frees itself b
 |---|---|---|
 | `DRIVER_WS_PORT` | `8080` | listener port inside the container |
 | `JOIN_TIMEOUT_MS` | `5000` | time allowed for the first `join` |
-| `STATE_TICK_MS` | `5000` | periodic `state` push, on top of event-driven ones |
+| `STATE_TICK_MS` | `5000` | periodic `state` push, on top of event-driven ones. The station sends a WebSocket `ping` with it: the browser's automatic `pong` is what keeps `WS_IDLE_TIMEOUT_MS` from closing a page that has joined and is only watching |
+| `WS_IDLE_TIMEOUT_MS` | `60000` | time with **no frame received** before the station hangs up. Only inbound data counts, so this is what detects a peer that vanished without a FIN; it must stay comfortably above `STATE_TICK_MS` |
 | `SESSION_TICK_MS` | `5000` | periodic `session` push to the owner |
 | `REQUEST_CACHE_SIZE` | `64` | request ids remembered per connection |
 | `REQUEST_CACHE_TTL_MS` | `60000` | how long a cached reply stays replayable |

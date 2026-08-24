@@ -263,3 +263,100 @@ Il client si abbona al manager **via cast** (regola di §8.2: mai call sincrone 
 `vs_connector` fa `whereis` prima di inviare a un atom.
 
 **Perché**: mentre il manager riavvia, il suo nome è momentaneamente non registrato e `Atom ! Msg` solleverebbe `badarg` — nel mezzo di una transizione di stato del connettore. Tutti i connettori notificano gli stessi eventi negli stessi momenti: crasherebbero insieme, esaurendo `intensity` e spegnendo il nodo. Un guasto del solo manager diventerebbe un'interruzione totale. La notifica persa è innocua: il manager, riadottando i connettori (§7.3), ricostruisce lo stato con una `snapshot`.
+
+---
+
+## 9. Il canale driver (`vs_driver_ws`) — M1
+
+### 9.1 Tre moduli invece di uno
+
+`vs_jwt` (verifica del token), `vs_driver_proto` (il protocollo di `ws-driver.md`), `vs_driver_ws` (le sole callback di cowboy).
+
+**Perché**: un handler cowboy non si esercita in EUnit senza tirare su un listener *e* un client WebSocket — cioè `gun`, una quarta dipendenza portata per i soli test. Separando, ogni regola del contratto diventa una chiamata di funzione su una mappa: i 31 test del protocollo non aprono un socket, non avviano il manager e non toccano un coordinatore. In `vs_driver_ws` resta codice senza rami da decidere.
+
+È la stessa mossa già fatta nel connettore con `claim_mod`/`db_mod` (§4.3): `conn_mod`, `mgr_mod` e `claim_mod` stanno nella mappa di sessione con i default di produzione, e i test li sostituiscono con `vs_driver_stub`. Ed è ciò che tiene la proprietà — verificata, non assunta — che **`rebar3 eunit` non apra la porta 8080**: nessuna fixture avvia l'applicazione.
+
+*Scartata:* un handler unico con le funzioni pure esportate. Meno file, ma i test avrebbero costruito a mano lo stato interno di un processo di cowboy, cioè avrebbero dipeso dalla forma di cowboy invece che dal contratto.
+
+### 9.2 Firma → `iss` → `exp`, e nessun controllo su `iat`
+
+L'ordine di `jwt.md` §3 è vincolante, e non per eleganza. Nei fixture di `sample-tokens.md` il token "firma errata" ha `exp` = 2026-08-22: **è anche scaduto**. Verificando la scadenza per prima, una falsificazione risponderebbe `4408` e il test più importante del lotto — quello che dimostra che non si può impersonare un altro driver — passerebbe per il motivo sbagliato, e comincerebbe ad accettare falsificazioni il giorno in cui qualcuno rigenerasse il fixture con una scadenza più in là. Un test dedicato (`the_forged_fixture_really_is_expired_too`) fissa la premessa, così se un domani i fixture cambiano è quel test a rompersi, non la sicurezza in silenzio.
+
+Simmetricamente, `iat` e `nbf` **non** si controllano: il token valido ha `iat` = 2027-12-31, emesso nel futuro rispetto all'orologio della demo, e un verificatore che lo guardasse rifiuterebbe l'unico token che deve funzionare. `jwt.md` §3 elenca tre controlli e tre soltanto.
+
+`jose_jwt:verify/2` valida **solo la firma** — la trappola con cui `sample-tokens.md` si chiude. `iss` ed `exp` sono claim ordinari e si controllano a mano: un token che verifica non è un token da accettare. Misurato sul posto, `jose` risponde `{false, _, _}` anche a `alg: none` e a un header `RS256` contro la nostra chiave simmetrica (due test lo fissano), mentre su un token illeggibile **solleva un'eccezione** invece di restituire un valore: da qui il `try` in `vs_jwt:signature/2`, che è contratto della funzione e non imbottitura difensiva.
+
+### 9.3 La cache dei `request_id`: at-most-once per connessione
+
+Lista `[{RequestId, FramesDiRisposta, InseritoAMs}]` nella mappa di sessione, `REQUEST_CACHE_SIZE` (64) voci, `REQUEST_CACHE_TTL_MS` (60000), consultata **prima** di eseguire qualunque cosa.
+
+**Perché**: §7.2 esiste perché un WebSocket può perdere un frame in silenzio, quindi il client *deve* poter ritentare; e un `reserve` ritentato che prenotasse due volte sarebbe peggio del frame perso. La prova non può stare nelle risposte — una risposta dalla cache e una appena calcolata sono identiche per definizione — quindi il test conta le chiamate ricevute dal connettore finto: due `reserve` con lo stesso `request_id`, **una** chiamata al connettore.
+
+Dettagli scelti e fissati da un test: un *hit* non rinfresca il TTL (misura l'età della risposta, non la frequenza dei tentativi); le voci scadute si eliminano quando la cache viene toccata, non con un timer, perché una connessione ferma non ha lavoro da fare; oltre `REQUEST_CACHE_SIZE` esce la più vecchia; le chiusure non si mettono in cache, perché la connessione che possiede la cache sta per sparire. Lo `state` che segue l'`ack` di `join` **non** fa parte della risposta memorizzata: è uno snapshot, e ripeterlo un minuto dopo significherebbe rimandare al browser una fotografia vecchia.
+
+### 9.4 Ogni chiamata al connettore dentro `try … catch exit:_`
+
+Catena misurata sul codice, non ricordata: `vs_connector:reserve/3` è una `gen_statem:call/2` col timeout implicito di **5000 ms**, e dentro `vs_claim_client:acquire/4` gira un giro di discovery di al massimo 3 nodi × `CLAIM_CALL_TIMEOUT_MS` (2000) più un tentativo dopo `unknown_station` — **circa 8 s**. Senza il `catch`, il chiamante esce, il processo WebSocket muore con lui e il browser vede una disconnessione al posto della risposta a una domanda che aveva fatto.
+
+La risposta è `NO_CLAIM`, che è la riga che §4.1 riserva a "unreachable, timeout, no leader". Il connettore può completare la prenotazione **dopo** che la risposta è partita: il push `state` successivo la mostrerà e il client la accetterà senza discutere, perché §7.1 dice che la verità è del server. Meglio un "riprova" smentito da uno stato, che un socket che cade.
+
+*Scartata:* allargare il timeout della call. Vorrebbe una `vs_connector:reserve/4` e un numero scelto a occhio più grande di una somma che cambierà quando cambieranno i coordinatori; il `try/catch` è corretto per qualunque valore. Un test lo esercita facendo sollevare allo stub esattamente l'`exit({timeout, ...})` che `gen_statem` solleverebbe.
+
+### 9.5 `offline` → `out_of_service`
+
+Il manager inventa lo stato `offline` quando nessun processo risponde per un connettore (§7.4); l'enum di `ws-driver.md` §5.1 ammette `free | held | charging | closing | suspended | out_of_service` e non lo contiene.
+
+**Perché la traduzione e non un nome nuovo nel contratto**: `out_of_service` è *precisamente* ciò che `offline` significa per chi guarda la pagina — c'è, non si può usare — e il contratto descrive quello che il driver vede, non come la stazione ci sia arrivata. La voce `offline` arriva per giunta con **tre chiavi soltanto** (niente `held_by`, `expires_at`, `power_kw`), quindi ogni lettura in `wire_state/3` ha un default: è la stessa riga di codice che regge i due casi, ed è il caso che un test copre per primo.
+
+`suspended` resta non producibile fino all'allocazione di potenza di M2, ed è dichiarato nel contratto invece che taciuto.
+
+### 9.6 `coordinator_reachable`: una ETS pubblica scritta dal claim client
+
+`vs_claim_reach`, una riga sola, scritta nei punti in cui l'esito di un giro di renew è già noto e letta sporca da `vs_claim_client:coordinator_reachable/0`.
+
+**Perché così**: è esattamente il pattern già argomentato per `vs_station_mgr:lookup_pid/1` (§7.1) — lettura sporca invece di una call sincrona, per non mettere il claim client sul percorso critico di ogni push di stato e per non chiudere cicli fra gen_server. Il claim client, per regola strutturale (§8.2), non chiama nessuno dentro la stazione; farsi chiamare da un processo foglia sarebbe lecito, ma la ETS costa meno ed è coerente col resto.
+
+**Semantica dichiarata**: *"l'ultimo giro di renew ha trovato un coordinatore"*, non *"il nodo risponde al ping"*. Prima del primo tick il valore è `true`, e lo è anche quando la tabella non esiste: ottimistico per scelta, perché finché nulla è stato tentato nulla è fallito, e chi decide davvero è `acquire`. Rifiutare prenotazioni per un coordinatore che nessuno ha ancora provato a raggiungere sarebbe un guasto inventato dalla stazione.
+
+I punti di scrittura sono **tre**, non due: `{renew_result, error}` scrive `false`; sia `{renew_result, {ok, _, {renewed, ...}}}` sia `{renew_result, {ok, _, Altro}}` scrivono `true` — un coordinatore che risponde una cosa incomprensibile è comunque un coordinatore che c'è, e la raggiungibilità riguarda se qualcuno è vivo, non se la risposta avesse senso.
+
+**Nota sulle fixture**: la tabella è `named_table` e creata in `init/1`, mentre tre fixture di EUnit avviano un client nella stessa VM e il loro teardown aspetta che sparisca il *nome registrato* — che un processo morente rilascia in un momento leggermente diverso dalle proprie tabelle ETS (`vs_station_mgr_tests` aspetta anche `ets:info/1`, `vs_claim_client_tests` no: le due fixture non sono simmetriche). `init_reach_table/0` assorbe il residuo distruggendo e ricreando; la tabella è `public` proprio perché così può cancellarla anche chi non la possiede. Un test riproduce la sequenza di proposito.
+
+*Scartata:* rimandare a M3 lasciando il campo a `true`. La pagina mentirebbe proprio nello scenario che P4/P8 devono mostrare alla commissione.
+*Scartata:* `net_adm:ping` sul leader dal WebSocket. Misura la raggiungibilità del *nodo*, non del *servizio*, e aggiunge una call sincrona verso il claim client per sapere chi sia il leader.
+
+### 9.7 Il listener parte in `vs_station_app`, non sotto `vs_station_sup`
+
+`cowboy:start_clear/3` consegna il listener all'albero di **ranch**. Dichiararlo anche fra i figli di `vs_station_sup` darebbe un supervisore che nomina un figlio che non supervisiona: un diagramma che mente, ed è la prima cosa che si chiede all'orale. Si avvia in `start/2` dopo `vs_station_sup:start_link/0` — l'ordine conta, così un browser che si collega nello stesso millisecondo del boot trova già un manager a cui abbonarsi — e si chiude con `cowboy:stop_listener/1` in `stop/1`.
+
+Conseguenza accettata: un listener che muore lo rialza ranch, non noi. È il verso giusto: ranch sa come ricostruire un pool di acceptor, noi no.
+
+Se la porta è occupata il nodo **non** si rifiuta di partire: `logger:error` e avanti. Una stazione con la porta presa deve comunque continuare a caricare le auto già attaccate — è §7.6 del contratto, la stazione degrada e non si ferma — e far fallire il boot porterebbe giù i connettori insieme alla pagina web.
+
+Prima di chiudere il listener, `stop/1` manda un `station_shutdown` a ogni connessione viva (`ranch:procs/2`), che diventa la chiusura `1001` di §3: la pagina sa di dover tornare col backoff invece di mostrare un errore.
+
+### 9.8 Il tick di stato rilegge, e porta con sé un `ping`
+
+Due cose che sembrano ridondanti e non lo sono.
+
+**Il tick rilegge dal manager** invece di ripetere l'ultimo snapshot ricevuto: le letture del contatore arrivano al connettore come `cast` che cambiano `power_kw` **senza** produrre un evento (`vs_connector`, ramo `charging`/`meter`), quindi un canale guidato dai soli eventi mostrerebbe una sessione viva a potenza congelata. È precisamente il buco che `STATE_TICK_MS` esiste per tappare.
+
+**Il tick porta un `ping`** perché cowboy chiude un WebSocket dopo `idle_timeout` (60 s di default) **senza dati ricevuti**, e non conta ciò che il server manda: una pagina che ha fatto `join` e sta solo guardando verrebbe scollegata ogni minuto, e il backoff di §7.5 trasformerebbe una stazione sana in un ciclo di riconnessioni. Il browser risponde `pong` da solo, e quel frame in entrata rimette a zero il timer. `idle_timeout => infinity` avrebbe curato il sintomo buttando via la medicina: col ping, un peer che se n'è andato davvero smette di rispondere e il timeout fa il suo mestiere.
+
+### 9.9 Cosa non c'è in M1, e perché è scritto nel contratto
+
+`join_waitlist`/`leave_waitlist` (§4.4) vogliono una coda per stazione che non esiste in nessun processo, e il frame `session` (§5.2) vuole le letture del contatore che arrivano col canale colonnina in M2. Le due azioni cadono nel ramo "azione sconosciuta" e rispondono `BAD_REQUEST`; `waitlist` è la costante `{length: 0, my_position: null}` — una chiave dichiarata, mai una chiave mancante, così la pagina rende sempre la stessa forma.
+
+Il canale driver è **di proprietà di A** (intestazione di `ws-driver.md`): la limitazione si dichiara nel contratto stesso, senza PR. Va dichiarata e non taciuta — un contratto che descrive azioni che il server non implementa è peggio di un contratto che dice quando arriveranno. Un test (`the_waiting_list_is_out_of_m1`) fissa il perimetro: chi implementerà la coda troverà quel test a dirgli di tornare a cancellarlo.
+
+**Limite noto e dichiarato**: `ws-driver.md` §4.1 distingue "il connettore non è libero" (`ALREADY_HELD`) da "il tuo veicolo ha già una prenotazione altrove" (`NO_CLAIM`), ma il tipo `vs_connector:refusal()` usa l'atomo `already_held` per **entrambi** — il connettore occupato e il rifiuto `already_held` che arriva dal coordinatore attraverso `map_refusal/1`. Al confine col driver le due righe sono indistinguibili, e M1 risponde `ALREADY_HELD` in tutti e due i casi. Separarle vuole un atomo nuovo in `vs_connector`, cioè toccare la macchina a stati: rimandato, non dimenticato.
+
+### 9.10 Le dipendenze, il lock e `warnings_as_errors`
+
+Prime dipendenze esterne del progetto: `cowboy 2.18.0`, `jsx 3.1.0`, `jose 1.11.12` — le più recenti su hex, verificate con `rebar3 pkgs` invece che copiate da una nota di progetto, e compilate davvero su OTP 29.0.5.
+
+`warnings_as_errors` di primo livello **si propaga alle dipendenze**: `jose` usa ancora la forma `catch Expr` che OTP 29 ha deprecato, e il build moriva su un warning in sorgente altrui. Rimedio: `{overrides, [{del, [{erl_opts, [warnings_as_errors]}]}]}`, che abbassa la severità **solo** per le deps. Sul nostro codice resta: è una regola per ciò che scriviamo noi, non per ciò che scaricano gli altri.
+
+`rebar.lock` si committa (la riga in `.gitignore` è stata tolta) e il `Dockerfile.erlang` lo copia accanto a `rebar.config`: senza, due macchine e il container possono risolvere versioni diverse — esattamente la classe di problema per cui esisteva il pin di OTP 29.0.5. `vs_station.app.src` elenca le tre app fra le `applications`, altrimenti `application:ensure_all_started(vs_station)` le lascia ferme e il listener parte su una libreria non avviata.
+
+Misurato per inciso: su OTP 29 `jose` sceglie da solo `jose_json_otp`, cioè il modulo `json` della OTP, **non** `jsx`. Nessuna conseguenza — `jsx` resta il codec del nostro filo, `jose` usa quello che preferisce per i suoi — ma va scritto perché la nota di progetto assumeva il contrario.
