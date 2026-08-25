@@ -115,9 +115,17 @@ services:
     hostname: coord1
     environment:
       NODE_SNAME: vs
-      ERL_APP: vs_mock_coord
+      # The real coordinator, as of 25/08: vs_coord serves the claim contract
+      # and pushes the station list to the back office. To go back to A's mock
+      # — for instance to test the station side in isolation — set this to
+      # vs_mock_coord and drop the JINTERFACE_* lines; nothing else changes.
+      ERL_APP: vs_coord
       ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
+      CLAIM_GRACE_SECONDS: ${CLAIM_GRACE_SECONDS:-60}
+      # Where to push stations_update: must match the back office's node name.
+      JINTERFACE_NODE: voltshare_bo@backoffice
+      JINTERFACE_MBOX: backoffice
     networks: [voltshare]
 
   # ---------------------------------------------------------------- B
@@ -147,29 +155,40 @@ services:
   #
   # coord3: ... same with COORD_ID: 3
   #
-  # backoffice:
-  #   build: { context: .., dockerfile: deploy/Dockerfile.backoffice }
-  #   container_name: backoffice
-  #   hostname: backoffice          # must match JINTERFACE_NODE below
-  #   environment:
-  #     # JInterface. Without these two the bridge would fall back to its
-  #     # defaults and announce itself as voltshare_bo@localhost, which no
-  #     # coordinator can reach — the node name has to carry the hostname the
-  #     # others resolve. See contracts/erlang-java.md §1.
-  #     JINTERFACE_NODE: voltshare_bo@backoffice
-  #     JINTERFACE_MBOX: backoffice
-  #     COORD_NODES: vs@coord1,vs@coord2,vs@coord3
-  #     VOLTSHARE_ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
-  #     VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
-  #     DB_HOST: mysql
-  #     DB_PORT: "3306"
-  #     DB_NAME: voltshare
-  #     DB_USER: voltshare
-  #     DB_PASSWORD: voltshare
-  #   ports: ["8080:8080"]
-  #   depends_on:
-  #     mysql: { condition: service_healthy }
-  #   networks: [voltshare]
+  backoffice:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backoffice
+    container_name: backoffice
+    hostname: backoffice          # must match JINTERFACE_NODE below
+    environment:
+      # JInterface. Without these the bridge falls back to its defaults and
+      # announces itself as voltshare_bo@localhost, which no coordinator can
+      # reach — the node name has to carry the hostname the others resolve.
+      # See contracts/erlang-java.md §1.
+      JINTERFACE_NODE: voltshare_bo@backoffice
+      JINTERFACE_MBOX: backoffice
+      COORD_NODES: vs@coord1,vs@coord2,vs@coord3
+      VOLTSHARE_ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
+      VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
+      # Billing (M2). The sweep is what actually prices sessions; the
+      # session_closed event only makes it run sooner, so shortening the
+      # interval is how the demo shows a cost appear without waiting.
+      OVERSTAY_CENTS_MIN: ${OVERSTAY_CENTS_MIN:-50}
+      BILLING_SWEEP_SECONDS: ${BILLING_SWEEP_SECONDS:-60}
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: voltshare
+      DB_USER: voltshare
+      DB_PASSWORD: voltshare
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      coord1:
+        condition: service_started
+    networks: [voltshare]
 
 networks:
   voltshare:

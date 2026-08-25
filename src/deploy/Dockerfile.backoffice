@@ -30,6 +30,23 @@ FROM tomcat:10.1-jdk17-temurin
 # reachable on port 8080.
 RUN rm -rf /usr/local/tomcat/webapps/*
 
+# EPMD, and only EPMD.
+#
+# JInterface does not merely connect to the cluster: it *publishes* this node's
+# name on the port mapper running on its own host, and a container with just
+# Tomcat has none. Without it the bridge loops on
+#   "Nameserver not responding on backoffice when publishing voltshare_bo".
+# It never showed up in local testing because a developer machine already has an
+# EPMD running, started by the first Erlang node.
+#
+# erlang-base is the smallest package that carries the binary. Its OTP version
+# does not have to match the cluster's: EPMD is a name-to-port registry and its
+# protocol is stable across releases — no Erlang code from this package is ever
+# executed here.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends erlang-base \
+    && rm -rf /var/lib/apt/lists/*
+
 # Deployed as ROOT so the application answers on / with no context path. The
 # pages build their links from ${pageContext.request.contextPath}, so they work
 # either way — this only keeps the URLs short in the demo.
@@ -63,4 +80,7 @@ EXPOSE 8080
 # container, and the coordinators reach it on 4369 over the compose network.
 # Nothing to publish — the port only has to be reachable between containers.
 
-CMD ["catalina.sh", "run"]
+# EPMD first, in the background, then Tomcat in the foreground as PID 1's child
+# so that `docker stop` still reaches it. `-daemon` returns as soon as the port
+# mapper is listening, so the bridge finds it on its first attempt.
+CMD ["sh", "-c", "epmd -daemon && exec catalina.sh run"]
