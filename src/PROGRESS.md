@@ -828,5 +828,19 @@ Il deploy dichiarato in `SCOPE.md` §6 — **sette nodi**: tre coordinatori, due
 MySQL — da oggi è **esattamente quello che gira**, sette container nel compose. Fino a ieri erano
 cinque, con un solo coordinatore: il documento descriveva l'obiettivo, ora descrive il fatto.
 
-Resta da fare la prova che il piano chiede e che nessuno ha ancora eseguito: il deploy **su più di
-un host**. Finora tutto gira su una macchina sola, e `SCOPE.md` §6 promette il contrario.
+**Sul deploy multi-host — ridimensionato dopo una verifica.** Avevo annotato che mancava il deploy
+su più macchine, trattandolo come un buco. Controllando il `docker-compose.yml` di BlackNet — il
+progetto di riferimento valutato 30 e lode — risulta che **loro non l'hanno fatto**: singolo host,
+rete bridge di default, nomi nodo agganciati agli hostname dei container, esattamente il nostro
+schema. Il requisito del corso dice *"deployata su più **nodi**"*, non su più host, e di nodi ne
+abbiamo sette veri. "Tipicamente cloud" è un esempio, non un obbligo.
+
+Resta un motivo **solo** per volerlo, e non è il requisito: su una macchina sola non si può
+produrre una **partizione di rete vera**. Il quorum è progettato per le partizioni, non solo per i
+crash, quindi oggi la minoranza che si sospende si mostra con `docker kill` invece che staccando
+il Wi-Fi. Miglioramento della demo, non un buco — e da valutare solo se avanza tempo.
+
+Se lo si fa, la conseguenza tecnica è una sola e va saputa prima: `-sname` non basta più. I nomi
+corti funzionano solo dentro lo stesso dominio DNS, e `Dockerfile.erlang` dice *"long names would
+buy nothing here"* — vero su un host, falso su due. Servirebbe `-name` con FQDN o IP, e con esso
+cambiano `COORD_NODES` e `JINTERFACE_NODE` su tutti i nodi.
