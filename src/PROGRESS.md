@@ -479,8 +479,11 @@ Da verificare in quel momento, perché è il vero punto di contatto fra le due m
 - **Client browser del canale driver (A)**: `js/ws.js`, `js/station.js`, `station.jsp` finita. È l'unico pezzo che separa la demo di M1 dal funzionare end-to-end (§7j).
 - **JWT B→A mai verificato in transito**: da provare al primo `join` reale.
 - La lista stazioni si aggiorna con `<meta http-equiv="refresh">` a 15 secondi: scelta deliberata, da dichiarare nella relazione.
-- **PR formale su `claim.md`** (`GrantedAt` in `acquire`, rinnovo a cinque campi): regolarizza modifiche già concordate e implementate da entrambi. Il codice è allineato, resta l'atto formale.
-- Il coordinatore di M1 è **sempre leader** e non ha quorum: `mode` esiste già nello stato ma vale sempre `serving`. Elezione e maggioranza sono M3.
+- ~~Il coordinatore è sempre leader e non ha quorum~~ **chiuso il 25/08** (§7m): elezione bully, quorum di maggioranza e ricostruzione, failover provato in Docker.
+- **PR su `claim.md` per `session_closed`** stazione → coordinatore: la modifica **non è stata fatta**, apposta, per poterla proporre prima del codice invece che dopo. È la PR che sostituisce quella "retroattiva" proposta da A — vedi sotto.
+- **Le clausole legacy del `renew`** e l'inversione di copertura dei test (§7l): in attesa della risposta di A sulla variante col catch-all.
+- **Overstay: chi sottrae la tolleranza** (`nota-per-A-M2.md` §2). Da decidere prima che A implementi M4, perché l'errore sarebbe invisibile.
+- La **potenza** (M2-A) non è ancora allocata: le sessioni non esistono, quindi la fatturazione gira su righe inserite a mano. Il calcolo è verificato, il flusso completo no.
 
 ---
 
@@ -763,35 +766,67 @@ percorso dell'erogazione.
 
 ---
 
+## 7n. Il metodo dei branch, finalmente applicato — 25 agosto
+
+Le due milestone di oggi sono entrate su `main` **passando da una PR**, non da un push diretto:
+
+| PR | Contenuto | Merge |
+|---|---|---|
+| #1 `b/m2-billing` | deploy (EPMD), M2-B, documentazione | `75012f5` |
+| #2 `b/m3-failover` | M3-B: elezione, quorum, ricostruzione | `ecdd323` |
+
+Vale la pena annotarlo perchè è il punto di metodo che A aveva sollevato (§7l) e che B aveva
+violato il 24: la regola dei branch e delle PR esisteva da M0 ma non era mai stata usata.
+
+**Sulla PR "retroattiva" che A proponeva.** Non è realizzabile come la immaginava: i due diff su
+`claim.md` sono già dentro `main` (`b830682`, `f14f852`), e non si apre una PR su ciò che è già
+stato mergiato. Si potrebbe fabbricare un branch dal commit precedente, ma sarebbe una messinscena,
+e all'orale una traccia costruita a posteriori vale meno di zero.
+
+La risposta migliore è l'opposto: **la prossima modifica a `claim.md` non è ancora stata fatta.**
+Il messaggio `session_closed` stazione → coordinatore è stato deliberatamente lasciato fuori dal
+contratto proprio per poterlo proporre nel modo giusto — PR prima del codice, A come reviewer.
+Nel merito dimostra la stessa cosa, e in più è vera.
+
+---
+
 ## 9. Prossimo passo
 
-M1-B e M2-B sono chiuse e verificate (§7i, §7k). Quello che resta a B è la milestone su cui il
-progetto viene giudicato: **il coordinatore smette di essere singolo**.
+Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
+già tutto ciò su cui viene giudicato: coordinazione, tolleranza ai guasti, e la dimostrazione
+che P2 sopravvive a un failover.
 
-Oggi `vs_coord_srv` ha già `mode` nello stato, ma vale sempre `serving`: c'è un solo
-coordinatore, è sempre leader, e nessuno verifica di essere in maggioranza. M3 riempie proprio
-quel vuoto, secondo `piano.md` §6.1:
+### Per B — M4, regole di dominio
 
-1. **`vs_coord_election`** — bully: heartbeat 1 s, leader dato per morto dopo 3 battiti mancati,
-   messaggi `election` / `answer` / `leader`. Vince l'id più alto.
-2. **`vs_coord_membership`** — vista dei coordinatori vivi. Senza maggioranza (2 su 3) il nodo
-   passa a `suspended` e **rifiuta tutto**: è ciò che impedisce a due leader separati da una
-   partizione di concedere lo stesso veicolo due volte.
-3. **`vs_coord_rebuild`** — dopo la vittoria il nuovo leader interroga le stazioni con
-   `who_do_you_hold`, ricostruisce la tabella dei claim, e solo allora passa a `serving`. È qui
-   che si vede il principio già scritto in `DESIGN-NOTES`: il coordinatore è un **indice, non il
-   proprietario** dello stato, e per questo può ricostruirsi chiedendo invece di replicare un log.
-4. **`coord2` e `coord3` nel compose** — sono già scritti e commentati nel file, con `COORD_ID`
-   come priorità.
+E' la milestone più leggera delle quattro, ed è quasi tutta Java:
 
-Da A, in parallelo: rinnovo dei claim contro il nuovo leader, gestione di `{not_serving, Leader}`,
-revoca. Il contratto per farlo esiste già e la stazione lo implementa da M1.
+1. **`PenaltyService`** — N=2 no-show consecutivi sospendono per K=1 giorno. Il contatore è
+   **solo di B** (`schema.sql`): A lo segnala con `{no_show, UserId, StationId, ConnId}`, mai con
+   una UPDATE. La sospensione si propaga al coordinatore con `{user_suspended, UserId, Until}`,
+   che `vs_coord_srv` già riceve e già applica in `check_can_grant`.
+2. **Notifiche** — `notifications` e `notifications.jsp`, più `{notify, UserId, Kind, Text}` sul
+   ponte.
+3. **`profile.jsp`** — anagrafica, veicolo, stato della penalità.
 
-**La prova di accettazione** (scenario 5 della demo): si uccide il container del leader mentre
-una sessione è in corso; l'elezione avviene, il nuovo leader ricostruisce dalle stazioni, le
-prenotazioni riprendono da sole — e le sessioni di ricarica **non si fermano**, perché il
-coordinatore non è nel percorso dell'erogazione. Quest'ultimo punto è il più convincente da
-mostrare al docente e va provato esplicitamente.
+La concorrenza qui è già risolta: la sospensione è una decisione presa in un posto solo e letta
+dal coordinatore, che è lo stesso schema del claim. Non introduce un secondo oggetto conteso —
+scelta deliberata, documentata in `DESIGN-NOTES` §4b.
 
-Resta fuori M1: il client browser di A (§7j). Non blocca M3 — il failover si dimostra dai log e
-dallo stato dei nodi — ma senza quello la demo dal browser non esiste, quindi va sollecitato.
+### Quello che manca davvero, e non è di B
+
+**Il client browser del canale driver** (§7j). E' l'unico pezzo che separa la demo *dal browser*
+dal funzionare, e senza di esso lo scenario 5 si mostra dai log invece che da una pagina. Il lato
+server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il suo
+`vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
+
+**M2-A**: canale colonnina, allocazione della potenza, INSERT su `sessions`. Finché non c'è, la
+fatturazione gira su righe inserite a mano — il calcolo è verificato, il flusso completo no.
+
+### Prima di M5
+
+Il deploy dichiarato in `SCOPE.md` §6 — **sette nodi**: tre coordinatori, due stazioni, Tomcat,
+MySQL — da oggi è **esattamente quello che gira**, sette container nel compose. Fino a ieri erano
+cinque, con un solo coordinatore: il documento descriveva l'obiettivo, ora descrive il fatto.
+
+Resta da fare la prova che il piano chiede e che nessuno ha ancora eseguito: il deploy **su più di
+un host**. Finora tutto gira su una macchina sola, e `SCOPE.md` §6 promette il contrario.
