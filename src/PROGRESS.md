@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 25 agosto 2026 — M1-B e M2-B chiuse e verificate in Docker (lobby con dati veri, fatturazione e storico); suite EUnit misurata su `main`: 112 test, 0 fallimenti; risposta alla nota di integrazione di A.
+**Ultimo aggiornamento:** 25 agosto 2026 — M1-B, M2-B e **M3-B** chiuse. Tre coordinatori con elezione bully, quorum e ricostruzione: failover provato in Docker uccidendo due leader di fila. 132 test, 0 fallimenti.
 
 ---
 
@@ -14,7 +14,7 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
 | **M1** percorso base | 🟡 stazione **e canale driver** pronti (manager, connettori, claim client, mock del coordinatore, `vs_jwt` + `vs_driver_proto` + `vs_driver_ws` — **96 test lato A**); manca `station.jsp` (passo 4) | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
 | **M2** sessione e potenza | ⬜ canale colonnina, potenza, INSERT sessione, `session.jsp` | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
-| **M3** tolleranza ai guasti | ⬜ | ⬜ |
+| **M3** tolleranza ai guasti | ⬜ rinnovo contro il nuovo leader, revoca, riconnessione client | ✅ **elezione, quorum, ricostruzione** — failover provato in Docker (§7m) |
 | **M4** regole di dominio | ⬜ | ⬜ |
 | **M5** consegna | ⬜ | ⬜ |
 
@@ -36,7 +36,8 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | Ponte JInterface fra Java ed Erlang | ✅ **verificato il 25/08** — `vs_coord_bo` → `ErlangBridge` end-to-end: coordinatore vero su `vs@NINJA2218`, Java come nodo nascosto, due stazioni ricevute con tutti i campi corretti. Test `ErlangBridgeIT` |
 | `vs_station` M1 (connettori, manager, claim client): test EUnit | ✅ verificato — **48 test, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 7 manager + 10 client + 9 vs_common) |
 | `vs_station` M1 passo 3 (canale driver): test EUnit | ✅ verificato — **96 test lato A, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 10 manager + 13 client + 11 `vs_jwt` + 31 `vs_driver_proto` + 9 vs_common) |
-| **Suite completa su `main`** | ✅ **112 test, 0 fallimenti** — misurati il 25/08, non stimati: `vs_common` 9 + `vs_station` 87 + `vs_coord` 16. È il numero da citare |
+| **Suite completa su `main`** | ✅ **132 test, 0 fallimenti** — misurati il 25/08, non stimati: `vs_common` 9 + `vs_station` 87 + `vs_coord` 36 (16 claim + 11 failover + 9 quorum). È il numero da citare |
+| Failover con tre coordinatori | ✅ **eseguito il 25/08** in Docker — due leader uccisi di fila, minoranza sospesa, claim riadottato con lo stesso `granted_at` (§7m) |
 | Canale driver contro il contratto (`ws-driver.md`) | ✅ verificato nei test — handshake coi tre token di `sample-tokens.md`, at-most-once dimostrato contando le chiamate al connettore, tabella dei rifiuti §4.1/§6, traduzione `offline` → `out_of_service`, `coordinator_reachable` end-to-end |
 | `vs_claim_client` ↔ `vs_mock_coord` sul contratto vero | ✅ verificato nei test — claim, eco del `GrantedAt` nel renew, release, revoca end-to-end, `station_stats` |
 | Docker compose (macchina A) | ✅ **eseguito** — 7 container su, coord1 (mock) riceve `station_up` da entrambe le stazioni (4 e 3 connettori) |
@@ -639,7 +640,130 @@ e riscrivere i cinque test è parte del lavoro.
 
 ---
 
-## 9. Prossimo passo — M3-B, la parte che vale l'esame
+## 7m. M3-B: elezione, quorum, ricostruzione — 25 agosto
+
+Il coordinatore smette di essere singolo. Tre moduli nuovi, più le transizioni di stato in
+`vs_coord_srv`, e **coord2/coord3 accesi nel compose**.
+
+| Modulo | Domanda a cui risponde |
+|---|---|
+| `vs_coord_membership` | *chi è vivo* — heartbeat, `nodedown`, aritmetica della maggioranza |
+| `vs_coord_election` | *chi decide* — bully |
+| `vs_coord_rebuild` | *cosa era già stato concesso* — `who_do_you_hold` alle stazioni |
+
+La separazione fra i primi due è voluta: le due risposte cambiano per ragioni diverse — un nodo
+che muore cambia la liveness, un'elezione vinta cambia l'autorità — e confonderle è **esattamente
+il modo in cui un coordinatore finisce per servire mentre è isolato**.
+
+### Tre decisioni di progetto
+
+**Heartbeat *e* `monitor_nodes`, non uno dei due.** `nodedown` scatta all'istante quando una
+connessione TCP cade — il caso `docker kill`, cioè la demo. Ma un nodo che smette di rispondere
+senza chiudere il socket (partizione, VM congelata) viene notato solo dal tick della
+distribuzione, il cui `net_ticktime` di default è **60 secondi**. Sessanta secondi di un leader
+in minoranza che continua a concedere claim sono precisamente ciò che il quorum deve impedire.
+Con l'heartbeat esplicito (1 s, 3 battiti mancati) il verdetto arriva in tre secondi.
+
+**Niente `COORD_ID`.** La priorità del bully è la posizione nella lista ordinata `COORD_NODES`,
+che tutti e tre già condividono: ogni nodo calcola lo stesso ordine senza che glielo si dica. Un
+id per nodo sarebbe una cosa in più da configurare e una in più da sbagliare — due nodi con lo
+stesso id si rifiuterebbero entrambi di cedere, e un'elezione che non converge non somiglia per
+niente alla sua causa.
+
+**Essere eletti non è essere pronti.** Il vincitore passa per `rebuilding` e solo dopo serve.
+Concedere prima di sapere quali veicoli sono già impegnati romperebbe P2 proprio mentre il
+sistema si sta riprendendo da un guasto.
+
+### Perché basta chiedere, senza replicare un log
+
+È la decisione su cui poggia tutta la storia del failover: **il coordinatore è un indice, non il
+proprietario dello stato che indicizza.** La copia autorevole di "il connettore 3 è impegnato per
+il veicolo 88 fino alle 15:42" sta sulla stazione, che è anche l'unica che può agirvi. Una vista
+derivata si può ricostruire dalle sue sorgenti — quindi niente log replicato, niente consenso su
+una macchina a stati, niente persistenza: il nuovo leader chiede e le stazioni rispondono a
+memoria.
+
+Due percorsi convergono: la query esplicita è la via rapida, ma i rinnovi che arrivano ogni dieci
+secondi portano `ClaimId`, `GrantedAt` e `UserId`, e un claim sconosciuto in un rinnovo viene
+**adottato** anziché rifiutato. Il sistema convergerebbe da solo entro un intervallo di rinnovo;
+la query fa sì che il recupero duri un secondo invece di dieci.
+
+### Difetti trovati mentre lo costruivo
+
+**Un test ha trovato un caso reale.** Con zero stazioni da interrogare la ricostruzione finiva
+all'istante. Ci ho ragionato: *aver chiesto a nessuno non è come aver sentito tutti*. Un leader
+eletto mentre le stazioni sono momentaneamente disconnesse concluderebbe in un microsecondo che
+la rete non ha claim, e comincerebbe a concedere veicoli già in carica. Zero risposte è il caso
+in cui si sa meno: ora è l'unico che aspetta l'intera finestra.
+
+**M3 rompeva il ponte verso Java, in due modi.** Ogni coordinatore esegue `vs_coord_bo`, ma la
+tabella stazioni di un follower è vuota — le stazioni si annunciano solo al leader. Con il
+repubblish periodico ogni tick avrebbe sovrascritto la directory del back office con una lista
+vuota, e **la lobby avrebbe lampeggiato** fra le stazioni vere e "no station is reporting". Stesso
+problema per l'annuncio del leader: tre coordinatori che si annunciano all'avvio lasciavano il
+back office puntato sull'ultimo che aveva parlato, spesso un follower. Ora parla **solo il
+coordinatore che serve**.
+
+**`station_up` è un cast, e un cast non si può redirigere.** A differenza di claim e renew,
+un'annuncio non ha canale di risposta: la stazione continuava a mandarlo a coord1 anche quando il
+leader era coord3, e il leader non sapeva che quelle stazioni esistessero. Ora un follower
+registra l'annuncio (utile a sé stesso se verrà eletto: saprà a chi chiedere) e lo **inoltra** al
+leader, incapsulato in `forwarded` così il secondo salto non rilancia mai.
+
+**Una trappola del deploy.** Tre servizi che compilano lo stesso Dockerfile producono **tre
+immagini distinte**: `docker compose build coord1` lasciava gli altri due al codice di ieri. Il
+sintomo era ostico — il cluster si alza, elegge un leader, e poi un coordinatore risponde
+`unexpected cast` a un messaggio che per gli altri è ordinario. Risolto dando alle tre un unico
+`image: voltshare-coord:local`, così divergere è impossibile.
+
+### La prova, eseguita
+
+Scenario 5 della demo, fatto davvero:
+
+```
+coord3 leader                          → docker kill coord3
+coord1: "vs@coord3 went down"            (nodedown, istantaneo)
+coord2: eletto → rebuild: 2 stazioni interrogate, 2 risposte → serving
+prenotazione vera creata sulla stazione: veicolo 88, claim c-9569F06C…
+                                       → docker kill coord2
+coord1: "QUORUM LOST (1 of 3) — this coordinator will refuse to serve"
+        mode=suspended, claim rifiutato con {not_serving, undefined}
+                                       → coord2 riacceso
+coord2: eletto → rebuild: 2 stazioni, 1 claim → serving with 1 adopted claim
+                                       → coord3 riacceso
+coord3: riprende la corona (rango più alto), riadotta il claim
+        coord2 torna standby e svuota la tabella
+```
+
+Il dettaglio che conta: dopo tre cambi di leader il claim ha **lo stesso `claim_id` e lo stesso
+`granted_at`** dell'originale. Solo `expires_at` è avanzato, perché i rinnovi l'hanno esteso —
+che è il comportamento giusto. La stazione non ha fatto nulla di speciale, e la lobby ha
+continuato a rispondere 200 con entrambe le stazioni per tutto il tempo.
+
+**La minoranza che si sospende è il risultato più importante.** Non è un guasto gestito: è il
+sistema che rifiuta di funzionare quando non può garantire P2. Da mostrare al docente esattamente
+così, perché la tentazione naturale — l'ultimo sopravvissuto prende il comando — è proprio ciò
+che produrrebbe due leader dopo una partizione.
+
+Costo da dichiarare nella relazione: durante una partizione la minoranza rifiuta **le nuove
+prenotazioni**. Le ricariche in corso non sono toccate, perché il coordinatore non sta nel
+percorso dell'erogazione.
+
+### Test
+
+**132 test, 0 fallimenti** (erano 112). I venti nuovi coprono i due lati:
+
+- `vs_coord_failover_tests` (11) — standby redirige claim *e rinnovi*, il follower dimentica la
+  tabella, la minoranza non nomina un leader, `rebuilding` rifiuta ma **adotta ancora i rinnovi**,
+  la ricostruzione conserva i timestamp originali, il conflitto si risolve col più vecchio, una
+  risposta tardiva non resuscita un sospeso, una voce malformata non blocca tutto.
+- `vs_coord_membership_tests` (9) — un nodo solo è sempre in maggioranza, 1 di 3 no, l'avvio è
+  ottimista di proposito (altrimenti a un riavvio simultaneo tutti e tre si eleggono), e
+  **un estraneo non fa quorum**.
+
+---
+
+## 9. Prossimo passo
 
 M1-B e M2-B sono chiuse e verificate (§7i, §7k). Quello che resta a B è la milestone su cui il
 progetto viene giudicato: **il coordinatore smette di essere singolo**.

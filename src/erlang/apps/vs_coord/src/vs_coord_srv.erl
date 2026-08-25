@@ -26,7 +26,8 @@
 -export([start_link/0,
          claim/5, renew/2, release/2,
          station_up/1, station_stats/4, session_closed/1,
-         stations/0, claims/0, mode/0]).
+         stations/0, claims/0, mode/0,
+         become_leader/0, become_follower/1, suspend/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -57,7 +58,12 @@
                   charging = 0     :: non_neg_integer(),
                   last_seen        :: vs_time:epoch_ms()}).
 
--record(state, {mode      = serving :: serving | rebuilding | suspended,
+%% `standby'    — someone else is the leader (or nobody is yet): redirect.
+%% `rebuilding' — we just won and are still asking the stations what they hold.
+%% `serving'    — leader, in quorum, table rebuilt: the only state that grants.
+%% `suspended'  — out of quorum: refuse everything, leader or not (SCOPE §9).
+-record(state, {mode      = serving :: serving | rebuilding | suspended | standby,
+                leader              :: node() | undefined,
                 claims    = #{}     :: #{pos_integer() => #claim{}},
                 by_id     = #{}     :: #{binary() => pos_integer()},
                 stations  = #{}     :: #{pos_integer() => #station{}},
@@ -118,9 +124,29 @@ stations() ->
 claims() ->
     gen_server:call(?SERVER, claims).
 
--spec mode() -> serving | rebuilding | suspended.
+-spec mode() -> serving | rebuilding | suspended | standby.
 mode() ->
     gen_server:call(?SERVER, mode).
+
+%% @doc Called by vs_coord_election on victory.
+%%
+%% Winning does not mean serving: the table is empty and the claims the
+%% previous leader granted are still out there. The coordinator goes to
+%% `rebuilding', asks the stations, and only then serves — granting before
+%% that would break P2 exactly while recovering from a failure.
+-spec become_leader() -> ok.
+become_leader() ->
+    gen_server:cast(?SERVER, become_leader).
+
+%% @doc Someone else won. Stations that ask us are redirected to them.
+-spec become_follower(node()) -> ok.
+become_follower(Leader) ->
+    gen_server:cast(?SERVER, {become_follower, Leader}).
+
+%% @doc Out of quorum. Refuse everything until the majority is back.
+-spec suspend() -> ok.
+suspend() ->
+    gen_server:cast(?SERVER, suspend).
 
 %%%===================================================================
 %%% gen_server
@@ -131,8 +157,23 @@ init([]) ->
     %% claim never expires while the lease it guards is still running.
     Grace = vs_env:get_int("CLAIM_GRACE_SECONDS", 60),
     erlang:send_after(?SWEEP_INTERVAL_MS, self(), sweep),
-    logger:notice("coordinator ~p ready, serving", [node()]),
-    {ok, #state{grace_s = Grace}}.
+
+    %% Where a coordinator starts depends on whether it has peers.
+    %%
+    %% Alone — M1, the tests, a compose with coord2/coord3 still commented out
+    %% — there is nothing to elect and no partition to be on the wrong side of,
+    %% so it serves immediately. With peers it starts in `standby' and waits to
+    %% be told: assuming authority on boot is how two leaders appear after a
+    %% cluster-wide restart.
+    case vs_env:get_nodes("COORD_NODES", [node()]) -- [node()] of
+        [] ->
+            logger:notice("coordinator ~p ready, serving (single node)", [node()]),
+            {ok, #state{grace_s = Grace, mode = serving, leader = node()}};
+        Peers ->
+            logger:notice("coordinator ~p on standby, ~p peer(s), awaiting election",
+                          [node(), length(Peers)]),
+            {ok, #state{grace_s = Grace, mode = standby, leader = undefined}}
+    end.
 
 %% --- acquire --------------------------------------------------------
 
@@ -162,11 +203,29 @@ handle_call(Unknown, _From, State) ->
 handle_cast({release, ClaimId, Reason}, State) ->
     {noreply, drop_claim(ClaimId, Reason, State)};
 
-handle_cast({station_up, StationId, Node, Name, WsUrl, SitePowerKw, Tariff, Connectors}, State) ->
-    {noreply, do_station_up(StationId, Node, Name, WsUrl, SitePowerKw, Tariff, Connectors, State)};
+%% Announcements are casts, and a cast has no reply channel — so unlike a claim
+%% or a renewal they cannot be answered with `not_serving'. A station therefore
+%% keeps announcing itself to whichever coordinator it tried first, which after
+%% an election is very often not the leader, and the leader ends up not knowing
+%% that station exists at all.
+%%
+%% A follower fixes that on the station's behalf: it records the announcement
+%% (useful to itself if it is ever elected — it will know whom to ask) and
+%% passes it on to the leader it knows about. Wrapped in `forwarded' so the
+%% second hop handles it and never relays again: two coordinators that briefly
+%% disagree about who leads cannot bounce a message between them.
+handle_cast({forwarded, Msg}, State) ->
+    {noreply, apply_announcement(Msg, State)};
 
-handle_cast({station_stats, StationId, Free, Held, Charging}, State) ->
-    {noreply, do_station_stats(StationId, Free, Held, Charging, State)};
+handle_cast(Msg, State) when element(1, Msg) =:= station_up;
+                             element(1, Msg) =:= station_stats ->
+    State1 = apply_announcement(Msg, State),
+    case State1#state.leader of
+        undefined -> ok;
+        Leader when Leader =:= node() -> ok;
+        Leader -> gen_server:cast({?SERVER, Leader}, {forwarded, Msg})
+    end,
+    {noreply, State1};
 
 %% Straight through to Java. Not stored: if the back office is down the event is
 %% dropped, and that is acceptable precisely because it is not the record of the
@@ -176,6 +235,30 @@ handle_cast({station_stats, StationId, Free, Held, Charging}, State) ->
 handle_cast({session_closed, Event}, State) ->
     vs_coord_bo:session_closed(Event),
     {noreply, State};
+
+%% --- what the election tells us (M3) ---------------------------------
+
+handle_cast(become_leader, State) ->
+    logger:notice("coordinator ~p elected: rebuilding before serving", [node()]),
+    _ = vs_coord_rebuild:run(self()),
+    vs_coord_bo:announce_leader(),
+    {noreply, State#state{mode = rebuilding, leader = node()}};
+
+handle_cast({become_follower, Leader}, State) ->
+    logger:notice("coordinator ~p standing by, leader is ~p", [node(), Leader]),
+    vs_coord_bo:standing_by(),
+    %% The claim table is dropped on purpose. A follower that kept a stale copy
+    %% would answer `claims()' with reservations it no longer knows anything
+    %% about, and would carry that staleness into its own rebuild if it were
+    %% later elected. The stations hold the authoritative copy; a follower that
+    %% wins asks them again from scratch.
+    {noreply, State#state{mode = standby, leader = Leader,
+                          claims = #{}, by_id = #{}}};
+
+handle_cast(suspend, State) ->
+    vs_coord_bo:standing_by(),
+    {noreply, State#state{mode = suspended, leader = undefined,
+                          claims = #{}, by_id = #{}}};
 
 handle_cast(Unknown, State) ->
     logger:warning("coordinator: unexpected cast ~p", [Unknown]),
@@ -211,6 +294,21 @@ handle_info(sweep, State) ->
 handle_info({nodedown, Node}, State) ->
     {noreply, forget_node(Node, State)};
 
+%% The stations have answered the rebuild query (M3). Adopt what they hold and
+%% start serving.
+handle_info({rebuilt, Holds}, State = #state{mode = rebuilding}) ->
+    State1 = lists:foldl(fun adopt_station/2, State, Holds),
+    Count = maps:size(State1#state.claims),
+    logger:notice("coordinator ~p serving with ~p adopted claim(s)", [node(), Count]),
+    publish(State1),
+    {noreply, State1#state{mode = serving}};
+
+%% Late or irrelevant: we lost quorum, or were deposed, while the query was in
+%% flight. Adopting now would rebuild a table we have no right to serve from.
+handle_info({rebuilt, _Holds}, State) ->
+    logger:info("coordinator: discarding a rebuild answer, mode is ~p", [State#state.mode]),
+    {noreply, State};
+
 handle_info(Info, State) ->
     logger:debug("coordinator: ignoring ~p", [Info]),
     {noreply, State}.
@@ -241,11 +339,25 @@ do_claim(ReqId, VehicleId, UserId, StationId, ConnId, State) ->
             {{ok, ReqId, Claim#claim.claim_id, Claim#claim.granted_at, Claim#claim.expires_at},
              store(Claim, State)};
         {error, Reason} ->
-            {{error, ReqId, Reason}, State}
+            {{error, ReqId, Reason}, State};
+        {not_serving, Leader} ->
+            %% Note the shape: `not_serving' carries no ReqId, because it is
+            %% not an answer about this request — it is a routing correction
+            %% (claim.md §3.1).
+            {{not_serving, Leader}, State}
     end.
 
 check_can_grant(VehicleId, UserId, StationId, State) ->
     case State#state.mode of
+        %% Not the leader: send the station to whoever is, so it can retry
+        %% without waiting for a timeout (claim.md §4). `undefined' is a valid
+        %% answer — it means we do not know either, and the station should
+        %% work through COORD_NODES itself.
+        standby   -> {not_serving, State#state.leader};
+        %% Out of quorum we do not even name a leader: whatever we last
+        %% believed may well be on the other side of the partition, and
+        %% sending the station there would be worse than saying nothing.
+        suspended -> {not_serving, undefined};
         serving ->
             case is_suspended(UserId, State) of
                 true -> {error, suspended};
@@ -259,8 +371,10 @@ check_can_grant(VehicleId, UserId, StationId, State) ->
                             end
                     end
             end;
-        rebuilding -> {error, rebuilding};
-        suspended  -> {error, rebuilding}
+        %% We are the leader but do not yet know what the previous one had
+        %% granted. Refusing for a second is the safe direction; granting
+        %% blind is the one that breaks P2.
+        rebuilding -> {error, rebuilding}
     end.
 
 %% A claim past its expiry is treated as absent: the sweep will remove it,
@@ -284,6 +398,15 @@ is_suspended(UserId, State) ->
 %%%===================================================================
 %%% renewal — where a new leader learns about claims it never granted
 %%%===================================================================
+
+%% A renewal to a coordinator that is not serving is redirected, not answered.
+%% Renewals are also how a leader adopts claims it never granted, so answering
+%% them while in standby would build a table this node has no right to hold —
+%% and, worse, would let the station believe its claims are safe here.
+do_renew(_StationId, _Claims, State) when State#state.mode =:= standby ->
+    {{not_serving, State#state.leader}, State};
+do_renew(_StationId, _Claims, State) when State#state.mode =:= suspended ->
+    {{not_serving, undefined}, State};
 
 do_renew(StationId, Claims, State) ->
     Lease = vs_env:get_int("LEASE_SECONDS", 900),
@@ -363,6 +486,43 @@ renew_one({ClaimId, VehicleId, ConnId, UserId, GrantedAt}, StationId, NewExpiry,
                              expires_at = NewExpiry},
             {[ClaimId | Ok], Revoked, store(Adopted, State)}
     end.
+
+%% The two announcement casts, applied to our own table. Separated out so that
+%% a forwarded copy takes exactly the same path as a direct one.
+apply_announcement({station_up, StationId, Node, Name, WsUrl, SitePowerKw, Tariff, Connectors},
+                   State) ->
+    do_station_up(StationId, Node, Name, WsUrl, SitePowerKw, Tariff, Connectors, State);
+apply_announcement({station_stats, StationId, Free, Held, Charging}, State) ->
+    do_station_stats(StationId, Free, Held, Charging, State);
+apply_announcement(Other, State) ->
+    logger:warning("coordinator: unexpected announcement ~p", [Other]),
+    State.
+
+%% Adopt everything one station reports (claim.md §3.4).
+%%
+%% Reuses renew_one/4, which already knows how to adopt an unknown claim and
+%% how to settle a conflict by "oldest wins" — the two things a rebuild needs.
+%% The station's own `ExpiresAt' is passed as the new expiry, so adoption
+%% preserves the lease the driver was promised instead of silently extending
+%% it.
+%%
+%% Anything revoked here is dropped without telling the loser directly: it
+%% learns on its next renewal, within ten seconds, through the ordinary
+%% `Revoked' list. Convergence needs no extra message, and there is no push
+%% path to keep working.
+adopt_station({StationId, Holds}, State) ->
+    {_Ok, _Revoked, State1} =
+        lists:foldl(
+          fun({VehicleId, UserId, ConnId, ClaimId, GrantedAt, ExpiresAt}, Acc) ->
+                  renew_one({ClaimId, VehicleId, ConnId, UserId, GrantedAt},
+                            StationId, ExpiresAt, Acc);
+             (Malformed, Acc) ->
+                  logger:warning("rebuild: station ~p sent an unusable claim ~p",
+                                 [StationId, Malformed]),
+                  Acc
+          end,
+          {[], [], State}, Holds),
+    State1.
 
 %%%===================================================================
 %%% stations
