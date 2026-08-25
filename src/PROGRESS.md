@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 24 agosto 2026 — M1 lato A su `main` (manager di stazione, connettori, claim client, mock del coordinatore); contratto claim evoluto di comune accordo (`GrantedAt` emesso dal coordinatore, rinnovo a cinque campi); immagine Erlang pinnata a 29.0.5 Debian.
+**Ultimo aggiornamento:** 25 agosto 2026 — M1-B e M2-B chiuse e verificate in Docker (lobby con dati veri, fatturazione e storico); suite EUnit misurata su `main`: 112 test, 0 fallimenti; risposta alla nota di integrazione di A.
 
 ---
 
@@ -12,8 +12,8 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 | Milestone | A (stazione, emulatore, viste live) | B (coordinatore, back office, pagine) |
 |---|---|---|
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
-| **M1** percorso base | 🟡 stazione **e canale driver** pronti (manager, connettori, claim client, mock del coordinatore, `vs_jwt` + `vs_driver_proto` + `vs_driver_ws` — **96 test lato A**); manca `station.jsp` (passo 4) | 🟡 coordinatore e back office scritti e testati (22 test); da adeguare il renew a 5 campi, provare il ponte JInterface e il deploy su Tomcat |
-| **M2** sessione e potenza | ⬜ | ⬜ |
+| **M1** percorso base | 🟡 stazione **e canale driver** pronti (manager, connettori, claim client, mock del coordinatore, `vs_jwt` + `vs_driver_proto` + `vs_driver_ws` — **96 test lato A**); manca `station.jsp` (passo 4) | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
+| **M2** sessione e potenza | ⬜ canale colonnina, potenza, INSERT sessione, `session.jsp` | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
 | **M3** tolleranza ai guasti | ⬜ | ⬜ |
 | **M4** regole di dominio | ⬜ | ⬜ |
 | **M5** consegna | ⬜ | ⬜ |
@@ -26,16 +26,17 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 |---|---|
 | Back office: compilazione e `war` | ✅ verificato — `mvn clean package` produce `target/voltshare.war` |
 | Back office: test unitari | ✅ verificato — 4 test su `JwtUtil`, tutti verdi |
-| Back office: esecuzione su Tomcat | ❌ **mai provato** — serve Tomcat 10.1 e MySQL |
+| Back office: esecuzione su Tomcat | ✅ **verificato il 25/08** su Tomcat 10.1.34 in locale — war deployato, JSP compilate, filtro e redirect corretti, bridge Erlang avviato dentro il container. Senza MySQL: percorso d'errore verificato, lobby no |
 | `vs_coord`: compilazione | ✅ verificato su OTP 29 — un solo errore da correggere (`catch Expr` deprecato) |
-| `vs_coord`: test EUnit | ✅ verificato — 22 test, 0 fallimenti (21 + il test di regressione della code review) |
+| `vs_coord`: test EUnit | ✅ **16 test, 0 fallimenti** — misurati con `rebar3 eunit --app=vs_coord` il 25/08. Il "22" che stava qui contava le `?assert*`, non i casi: se n'è accorto A (§7l) |
 | Suite EUnit completa, con la parte A | ✅ verificato il 24/08 — **44 test, 0 fallimenti**: è arrivato `a/m1-station-core` (station manager, `vs_claim_client`, `vs_mock_coord`) |
 | Erlang: compilazione in generale | ✅ verificato — `rebar3 compile` pulito sulle tre applicazioni |
 | JInterface: connessione Java → nodo Erlang | ✅ verificato **fuori dal progetto** — `OtpNode.ping` risponde `PONG` verso un nodo OTP 29 locale |
-| Docker compose (macchina B) | ❌ **mai eseguito** — Docker Desktop non è installato |
-| Ponte JInterface fra Java ed Erlang | ❌ **mai provato nel progetto** — la libreria ora è quella giusta, ma `vs_coord_bo` ↔ `ErlangBridge` non si sono mai parlati |
+| Docker compose (macchina B) | ✅ **eseguito il 25/08** — 5 container, coordinatore vero al posto del mock, lobby con dati veri dal browser |
+| Ponte JInterface fra Java ed Erlang | ✅ **verificato il 25/08** — `vs_coord_bo` → `ErlangBridge` end-to-end: coordinatore vero su `vs@NINJA2218`, Java come nodo nascosto, due stazioni ricevute con tutti i campi corretti. Test `ErlangBridgeIT` |
 | `vs_station` M1 (connettori, manager, claim client): test EUnit | ✅ verificato — **48 test, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 7 manager + 10 client + 9 vs_common) |
-| `vs_station` M1 passo 3 (canale driver): test EUnit | ✅ verificato — **96 test lato A, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 10 manager + 13 client + 11 `vs_jwt` + 31 `vs_driver_proto` + 9 vs_common). Totale su `main` con quelli di B: **109** |
+| `vs_station` M1 passo 3 (canale driver): test EUnit | ✅ verificato — **96 test lato A, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 10 manager + 13 client + 11 `vs_jwt` + 31 `vs_driver_proto` + 9 vs_common) |
+| **Suite completa su `main`** | ✅ **112 test, 0 fallimenti** — misurati il 25/08, non stimati: `vs_common` 9 + `vs_station` 87 + `vs_coord` 16. È il numero da citare |
 | Canale driver contro il contratto (`ws-driver.md`) | ✅ verificato nei test — handshake coi tre token di `sample-tokens.md`, at-most-once dimostrato contando le chiamate al connettore, tabella dei rifiuti §4.1/§6, traduzione `offline` → `out_of_service`, `coordinator_reachable` end-to-end |
 | `vs_claim_client` ↔ `vs_mock_coord` sul contratto vero | ✅ verificato nei test — claim, eco del `GrantedAt` nel renew, release, revoca end-to-end, `station_stats` |
 | Docker compose (macchina A) | ✅ **eseguito** — 7 container su, coord1 (mock) riceve `station_up` da entrambe le stazioni (4 e 3 connettori) |
@@ -76,7 +77,7 @@ apps/vs_station/    vs_station_app, vs_station_sup, vs_ping,
                     vs_claim_null
                     + test EUnit  ← 39 (connettore, manager, client)
 apps/vs_coord/      vs_coord_app, vs_coord_sup, vs_coord_srv, vs_coord_bo
-                    + test EUnit sui claim  ← 22 test, verdi su OTP 29
+                    + test EUnit sui claim  ← 16 test, verdi su OTP 29
 apps/vs_mock_coord/ coordinatore finto di M1 (A): si registra col nome
                     vero vs_coord_srv, concede sempre — riferimento
                     eseguibile del contratto e banco dei test del client
@@ -326,26 +327,347 @@ Il matcher del renew accetta anche le forme a 3 e 4 campi: costano tre righe e t
 
 ---
 
+## 7f. Il ponte JInterface funziona — 25 agosto
+
+Era il rischio numero uno del piano (§10: *"JInterface fragile — provato in M0 prima di ogni altra cosa"*) e l'unica cosa di M1-B mai messa alla prova. Ora è verificato end-to-end, senza Docker.
+
+**Come:** un coordinatore vero avviato a mano su `vs@NINJA2218`, con due stazioni annunciate, e il back office che gli si aggancia come **nodo nascosto** `voltshare_bo_test@NINJA2218`.
+
+```
+[coordinatore]  back office bridge: publishing to backoffice on voltshare_bo_test@NINJA2218
+                station 1 announced from vs@NINJA2218
+[Java]          Erlang bridge starting: node=voltshare_bo_test@NINJA2218 mbox=backoffice
+[test]          Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**Cosa dimostra**, oltre al fatto che i due si vedono: la `StationDirectory` si popola alla connessione senza aspettare il push periodico (quindi `get_stations` all'avvio funziona), e i campi arrivano nella posizione giusta — nome, totale connettori, potenza di sito, tariffa e `ws_url` sono verificati uno per uno. Il parser positivo di `stations_update` è la parte più facile da sbagliare in silenzio, e un `assertEquals` sul nome non l'avrebbe presa: due interi scambiati passano inosservati finché non li guardi.
+
+**Il test resta:** `backoffice/src/test/java/.../ErlangBridgeIT.java`. Si lancia con
+
+```bash
+mvn test -Dtest=ErlangBridgeIT
+```
+
+Il suffisso `IT` fa sì che un `mvn test` normale non lo esegua, e senza un coordinatore attivo **si salta invece di fallire** (`assumeTrue` sul ping del nodo): un test rosso ogni volta che nessuno ha un nodo acceso insegnerebbe solo a ignorarlo. Le istruzioni per avviare il coordinatore sono nel javadoc del test.
+
+**Resta da provare:** il deploy vero su Tomcat, e il ponte dentro Docker — dove cambiano hostname e risoluzione DNS, cioè proprio le variabili che qui erano tutte in locale.
+
+---
+
+## 7g. Primo deploy su Tomcat — 25 agosto
+
+Docker Desktop era acceso ma **il daemon non rispondeva** (tre tentativi, nemmeno a `docker info`), quindi il compose resta da provare. Nel frattempo il war è stato messo su un Tomcat 10.1.34 scaricato in locale, con un coordinatore Erlang vero acceso accanto.
+
+Era la prima volta che le JSP venivano **compilate**: Jasper le traduce alla prima richiesta, quindi fino a qui un errore in una pagina o nel tag file non sarebbe emerso da nessun `mvn package`.
+
+| Prova | Esito |
+|---|---|
+| `GET /` | 302 → `/login.jsp` — `index.jsp` con `c:redirect` funziona |
+| `GET /login.jsp` | 200, pagina completa: tag file `page.tag`, EL, CSS, form |
+| `GET /stations` senza sessione | 302 → `/login.jsp?next=%2Fstations` — `AuthFilter` e il parametro di ritorno |
+| `GET /WEB-INF/views/stations.jsp` | **404** — lo spostamento deciso in code review regge: le pagine interne non sono raggiungibili dall'esterno |
+| `POST /login` con MySQL assente | 200 con *"Service temporarily unavailable, try again"* — l'errore SQL è gestito, non una pagina 500 |
+| Bridge dentro Tomcat | avviato dal `AppListener`, connesso a `vs@NINJA2218`, zero errori di parsing e zero disconnessioni |
+
+**Quello che ancora non è dimostrato:** la lobby con dati veri. Senza MySQL non si può fare login, quindi `stations.jsp` non è mai stata renderizzata con una lista di stazioni — la ricezione dei dati è provata dal test `ErlangBridgeIT`, ma il passaggio *directory → pagina* no.
+
+Serve MySQL, e MySQL arriva dal compose: **è il prossimo passo, appena il daemon Docker risponde.**
+
+---
+
+## 7h. Il primo `docker compose build` e una regressione mia — 25 agosto
+
+Primo build vero delle immagini. È fallito su `station1` e `station2`, e la causa era una correzione che avevo introdotto io il 24:
+
+```
+cp: cannot stat '_build/default/lib/vs_common/priv': No such file or directory
+cp: cannot stat '_build/default/lib/vs_common/include': No such file or directory
+ERROR: process "/bin/sh -c rebar3 compile && ... && cp -rL ..." exit code: 1
+```
+
+rebar3 lascia in ogni applicazione dei symlink `priv` e `include`; per le nostre puntano a directory che non esistono. Sono link rotti innocui — ma `-L` dereferenzia, su un link rotto `cp` fallisce, e con esso l'intero build.
+
+**Dove avevo sbagliato il ragionamento.** Avevo scritto che su Linux rebar3 *linka l'intera applicazione* in `_build`, e che quindi il `COPY --from` originale avrebbe portato nell'immagine finale link verso un `/build` inesistente. In realtà `ebin` è una directory reale anche su Linux: il `COPY` originale funzionava, e il "fix" ha rotto ciò che andava. L'avevo dichiarato come "rischio probabile ma non verificabile senza Docker" — la verifica ora dice che l'ipotesi era falsa.
+
+**Correzione:** copia esplicita di quello che il runtime usa davvero — `ebin` di ogni applicazione, più `priv` dove esiste — invece di clonare l'albero di `_build`. Non dipende più da come rebar3 dispone il proprio build tree, in nessuna delle due direzioni.
+
+Da ricordare: le due macchine si comportano diversamente, quindi un Dockerfile "ragionato" e mai eseguito vale poco. Questo è il primo build reale delle immagini, ed è servito a scoprirlo.
+
+---
+
+## 7i. M1-B chiusa: lo stack gira, la lobby mostra dati veri — 25 agosto
+
+Cinque container su, `coord1` con il **coordinatore vero** al posto del mock di A, e il percorso completo verificato dal browser:
+
+```
+POST /register  → 302 /stations          utente scritto su MySQL, sessione creata
+GET  /stations  → 200                    Pisa Centro (4 liberi) · Livorno Port (3 liberi)
+                                          con i nodi vs@station1 e vs@station2
+```
+
+È la catena intera: browser → Tomcat → MySQL per l'account → JSP → e i dati delle stazioni arrivati **da Erlang via JInterface**, non da una tabella. Era l'ultimo pezzo mancante di M1-B.
+
+### Il difetto che solo Docker poteva far emergere
+
+Al primo avvio il bridge restava in loop:
+
+```
+IOException: Nameserver not responding on backoffice when publishing voltshare_bo
+```
+
+Il "nameserver" è **EPMD**. JInterface non si limita a connettersi al cluster: *pubblica* il nome del proprio nodo sul port mapper del proprio host — e un container con il solo Tomcat non ne ha. In locale non poteva vedersi, perché su una macchina da sviluppo l'EPMD è già acceso, avviato dal primo nodo Erlang.
+
+Correzione: `erlang-base` nell'immagine del back office (il pacchetto più piccolo che porti il binario) ed `epmd -daemon` prima di Tomcat nell'entrypoint. Da tenere a mente: **la versione OTP di quel pacchetto non deve corrispondere a quella del cluster** — EPMD è un registro nome→porta con protocollo stabile fra release, e da lì non viene eseguito codice Erlang. Senza questa nota sembrerebbe che stiamo mescolando OTP 25 e OTP 29.
+
+### Stato dei container
+
+| Servizio | Stato |
+|---|---|
+| `mysql` | healthy, schema e seed caricati |
+| `coord1` | `coordinator vs@coord1 ready, serving`; entrambe le stazioni annunciate |
+| `station1`, `station2` | su, annunciate al coordinatore |
+| `backoffice` | Tomcat in 4,9 s, bridge connesso senza errori |
+
+Restano accesi: `docker compose down` da `src/deploy` per fermarli.
+
+---
+
+## 7j. Perché `station.jsp` resta su "connecting…" — 25 agosto
+
+Aperta la lobby e cliccato "Pisa Centro", la pagina mostra `connecting…` e non si muove. Non è una connessione fallita: è **testo statico** nell'HTML ([station.jsp:30](backoffice/src/main/webapp/WEB-INF/views/station.jsp#L30)), che il JavaScript avrebbe dovuto sostituire al primo messaggio. Quel JavaScript non esiste:
+
+```
+js/ws.js       → HTTP 404      la cartella js/ non esiste
+js/station.js  → HTTP 404
+```
+
+Il browser carica due `<script src>` inesistenti, nessun codice gira, nessuna connessione viene nemmeno tentata.
+
+**La stazione, invece, è pronta.** Interrogando il suo endpoint con HTTP:
+
+```
+http://localhost:9101/ws/driver → 426 Upgrade Required
+```
+
+426 è la risposta corretta di un endpoint WebSocket sollecitato in HTTP: cowboy è in ascolto e chiede l'upgrade. `vs_driver_ws`, `vs_driver_proto`, `vs_jwt`, `vs_connector`, `vs_station_mgr` sono tutti compilati e attivi. Quindi la metà server del canale driver funziona e nessuno la sta chiamando.
+
+Manca **solo il client browser** — `js/ws.js`, `js/station.js` e la sostituzione dello scheletro: passo 4 di M1, in carico ad A (piano §5.4). Deciso di **non scriverlo noi**: violerebbe la regola di proprietà dei file e rischierebbe lavoro doppio o un conflitto sul merge. Si riprova quando A consegna.
+
+Da verificare in quel momento, perché è il vero punto di contatto fra le due metà: il **JWT che B firma e A verifica su `join`**. Se segreto o claim non combaciano, il difetto si manifesterà nel codice di A pur non essendo suo. I tre token di prova in `contracts/sample-tokens.md` bastano a isolare la questione senza Tomcat.
+
+### Proprietà delle pagine, per non riaprire la domanda
+
+| Pagina | Chi |
+|---|---|
+| `index.jsp`, `login.jsp`, `register.jsp` | B |
+| `stations.jsp` (lobby), `error.jsp`, `station-unavailable.jsp` | B |
+| `css/app.css`, `WEB-INF/tags/page.tag` (layout comune) | B |
+| `station.jsp`, `session.jsp`, `js/` | **A** |
+
+`page.tag` è usato anche dalle pagine di A: l'applicazione resta visivamente una sola cosa senza che le due parti debbano accordarsi sul markup.
+
+---
+
 ## 8. Punti aperti
 
-- Il ponte JInterface non è mai stato eseguito. **È il primo controllo da fare** quando Docker ed Erlang saranno installati: nomi dei nodi, cookie, DNS fra container. La prova è scritta in fondo a `contracts/erlang-java.md`.
-- `Db` non è mai stato provato contro un MySQL vero.
-- Il back office non è mai stato deployato su Tomcat: `context.xml` e `web.xml` sono scritti ma non verificati.
+- ~~Il ponte JInterface non è mai stato eseguito~~ **chiuso il 25/08** (§7f, §7i): verificato in locale, su Tomcat e in Docker.
+- ~~`Db` non è mai stato provato contro un MySQL vero~~ **chiuso il 25/08**: registrazione e login scrivono e leggono dal MySQL del compose.
+- ~~Il back office non è mai stato deployato su Tomcat~~ **chiuso il 25/08** (§7g, §7i).
+- ~~Il matcher del `renew` a cinque campi~~ **chiuso il 24/08** (§7e): `renew_one` tollera le tre forme.
+- ~~`user_id = 0` nei claim adottati~~ **chiuso il 24/08**: il rinnovo a cinque campi porta `UserId`.
+- **Client browser del canale driver (A)**: `js/ws.js`, `js/station.js`, `station.jsp` finita. È l'unico pezzo che separa la demo di M1 dal funzionare end-to-end (§7j).
+- **JWT B→A mai verificato in transito**: da provare al primo `join` reale.
 - La lista stazioni si aggiorna con `<meta http-equiv="refresh">` a 15 secondi: scelta deliberata, da dichiarare nella relazione.
-- ~~`user_id = 0` nei claim adottati~~ **chiuso il 24/08**: il rinnovo a cinque campi porta `UserId` (vedi §7).
-- **Il matcher del `renew` in `vs_coord_srv` va portato alla 5-tupla — bloccante per l'integrazione**: oggi accetta le forme a 3 e 4 campi, e la 5-tupla che la stazione ora invia produrrebbe `function_clause`, cioè il coordinatore che muore a ogni rinnovo.
-- **PR formale su `claim.md`** (`GrantedAt` in `acquire`, rinnovo a cinque campi): la apre B con A come reviewer. È la regolarizzazione di modifiche già concordate e implementate da entrambi.
+- **PR formale su `claim.md`** (`GrantedAt` in `acquire`, rinnovo a cinque campi): regolarizza modifiche già concordate e implementate da entrambi. Il codice è allineato, resta l'atto formale.
 - Il coordinatore di M1 è **sempre leader** e non ha quorum: `mode` esiste già nello stato ma vale sempre `serving`. Elezione e maggioranza sono M3.
 
 ---
 
-## 9. Prossimo passo
+## 7k. M2-B: fatturazione e storico — 25 agosto
 
-La M1-B è scritta e testata; la M1-A ha stazione, claim client e mock **su `main`, verificati contro il contratto vero**. Quello che manca è la verifica di ciò che sta *fra* i componenti, più l'ultimo blocco di A.
+Fatto e verificato contro il MySQL del compose. Codice nuovo:
 
-1. ~~Installare Erlang/OTP + rebar3~~ ✅ · ~~far girare il cluster nel compose~~ ✅ su macchina A: due stazioni + coord1 (mock), `station_up` e rinnovi in transito.
-2. **B — prima di tutto**: matcher del `renew` a cinque campi e PR su `claim.md`. Poi la prova del ponte JInterface di `contracts/erlang-java.md` (il compose ora esiste: su macchina A gira già) e il deploy del `war` su Tomcat 10.1 con MySQL dal seed.
-3. **A**: passo 3 di M1 — dipendenze `cowboy`/`jsx`/`jose`, `vs_driver_ws` (join/JWT contro i sample token, dedup `request_id`, push `state`), poi `station.jsp` + `js/`.
-4. **Integrazione M1**: si sostituisce coord1 col `vs_coord` vero (stesso hostname, stesso nome nodo) e si prenota dal browser, end-to-end.
+| File | Ruolo |
+|---|---|
+| `model/SessionView.java` | bean (non record: EL cerca i getter) con i derivati per la pagina |
+| `dao/SessionDao.java` | storico per utente, sessioni non prezzate, la UPDATE di `cost_cents` |
+| `service/BillingService.java` | il calcolo e lo sweep |
+| `web/HistoryServlet.java` + `views/history.jsp` | la pagina, già presente nel menu e finora vuota |
+| `vs_coord_srv:session_closed/1`, `vs_coord_bo:session_closed/1` | inoltro dell'evento verso Java |
+| `test/service/BillingServiceTest.java` | 9 test sul calcolo puro |
 
-Solo dopo ha senso passare a M2. Aggiungere altro codice non verificato sopra codice non verificato è il modo più veloce per trovarsi con un debito difficile da districare.
+### La decisione che conta: l'evento è una sveglia, non un dato
+
+La strada ovvia era fatturare dentro il gestore di `session_closed`, con i numeri che l'evento
+porta. Scartata per tre motivi, tutti conseguenza del fatto che è un semplice messaggio Erlang:
+
+1. **La consegna è best-effort.** `{Mbox, Node} ! Msg` verso una mailbox assente viene scartato
+   in silenzio — di proposito, perché Tomcat giù non deve disturbare il cluster. Una sessione
+   chiusa durante un riavvio del back office non verrebbe prezzata **mai**.
+2. **L'evento può superare la riga.** La stazione fa l'INSERT e avvisa il coordinatore, e
+   niente ordina le due cose: fatturare per id può cercare una riga non ancora committata.
+3. **Il dato è già nel database.** L'evento porta ciò che porta la riga.
+
+Quindi il costo si calcola con uno **sweep** di `cost_cents IS NULL` ogni 60 secondi — lo schema
+lo indicizza già come `idx_unbilled` — e l'evento si limita a farlo partire prima. Perdere tutti
+gli eventi ritarda una ricevuta di un intervallo e non perde nulla.
+
+Con la UPDATE condizionata (`WHERE cost_cents IS NULL`) un evento duplicato non può far pagare
+due volte: **consegna at-least-once sopra una scrittura idempotente**, che è il modo standard di
+ottenere un comportamento effectively-once senza un canale exactly-once — che i sistemi
+distribuiti non offrono. Vale la pena dirlo all'orale: è lo stesso ragionamento del claim, cioè
+non fidarsi della consegna ma rendere innocua la ripetizione.
+
+Un thread solo per lo sweep (`newSingleThreadScheduledExecutor`), quindi timer ed eventi
+finiscono nella stessa coda e due sweep non possono sovrapporsi: nessun lock da scrivere.
+
+### Il calcolo
+
+```
+costo = energia × tariffa_stazione + minuti_overstay × OVERSTAY_CENTS_MIN
+```
+
+- `BigDecimal`, non `double`: `energy_kwh` è `DECIMAL(10,3)` e il risultato è denaro. 41,2 × 45
+  in virgola mobile binaria fa 1854,0000000000002.
+- Overstay **arrotondato per eccesso al minuto**: un secondo oltre la soglia costa un minuto
+  intero, altrimenti il primo minuto sarebbe gratis — l'opposto di un deterrente.
+- La tariffa si legge da `stations`, non dall'evento: è il prezzo al momento del regolamento, e
+  cambiarla non richiede di avvisare le stazioni.
+- Default `OVERSTAY_CENTS_MIN=50`, `BILLING_SWEEP_SECONDS=60`, entrambi nel compose.
+
+### Verifica eseguita
+
+Tre sessioni inserite a mano in MySQL (quello che farà la stazione in M2-A), `cost_cents` NULL:
+
+| kWh | stazione | overstay | atteso | ottenuto |
+|---|---|---|---|---|
+| 41,200 | Pisa (45 c) | 0 | 1854 | **1854** |
+| 20,000 | Pisa (45 c) | 240 s | 900 + 200 = 1100 | **1100** |
+| 33,500 | Livorno (42 c) | 0 | 1407 | **1407** |
+
+`/history` risponde 200 e mostra le tre righe con totale **€ 43,61**, durate, overstay `4 min`
+sulla riga giusta, nomi delle stazioni.
+
+Poi le due prove che contano davvero:
+
+- **Idempotenza**: messo a mano `cost_cents=9999` su una riga già fatturata → lo sweep **non
+  l'ha riscritta**. La UPDATE condizionata regge.
+- **Sweep senza evento**: inserita una quarta riga NULL e nessun evento inviato → prezzata dal
+  timer periodico a 604 = 12 × 42 + 2 minuti di overstay. È la prova che il back office non
+  dipende dalla consegna del messaggio.
+
+Le quattro righe di prova sono ancora in MySQL, intestate all'utente `m2test`. Si tolgono con
+`DELETE FROM sessions;` quando arriveranno quelle vere.
+
+### Cosa serve da A
+
+Scritto in `contracts/nota-per-A-M2.md`, nessuna delle due cose blocca B:
+
+1. **Il significato di `overstay_seconds`.** Proposta: secondi **già fatturabili**, con i cinque
+   minuti di tolleranza sottratti dalla stazione — perché `OVERSTAY_GRACE_SECONDS` è configurato
+   lì e in nessun altro posto. È l'unico punto dove possiamo interpretare lo stesso numero in
+   due modi, e l'errore sarebbe invisibile: un conto sbagliato di cinque minuti non lo nota
+   nessuno. Oggi `vs_connector` scrive `0` con il commento "overstay arrives in M4".
+2. **La chiamata a `vs_coord_srv:session_closed/1`** dopo l'INSERT.
+
+`claim.md` **non è stato toccato**: il messaggio stazione → coordinatore sta nel suo territorio e
+va nella PR con A come reviewer, insieme alle due modifiche già concordate. Dopo l'episodio del
+24/08 — modifica unilaterale del contratto, coordinatore in `function_clause` a ogni rinnovo —
+la regola vale anche quando la modifica sembra innocua.
+
+---
+
+## 7l. Nota di A sull'integrazione — 25 agosto
+
+A ha inviato `nota-per-B-integrazione.md`, scritta il 24 sera: verifica riga per riga dei punti
+di contatto fra le due metà, con esito **contratto allineato su tutti e sei i messaggi**.
+Risposta in `contracts/risposta-per-A-integrazione.md`.
+
+Gran parte del §3 (fare lo swap del mock, provare il ponte, deployare su Tomcat) è stata
+superata dai fatti il 25: è tutto fatto e verificato.
+
+### Cosa aveva ragione di segnalare
+
+**① PR mancante sui file congelati.** Accettato senza discussione: la regola l'ha scritta B e
+l'ha violata B, e quella modifica unilaterale è *precisamente* ciò che ha prodotto il crash del
+24. Che il contenuto fosse concordato non salva il metodo — il metodo serve proprio quando uno
+dei due è convinto che la modifica sia ovvia. Si apre PR retroattiva, con dentro anche il
+`session_closed` di M2.
+
+**② Conteggio dei test sbagliato.** Aveva ragione, e aveva pure previsto il totale. Misurato:
+
+```
+rebar3 eunit → 112 tests, 0 failures     (vs_common 9 + vs_station 87 + vs_coord 16)
+```
+
+Il "22" per `vs_coord` contava le `?assert*` invece dei casi; il "45" era un residuo di una
+misura precedente al merge. `PROGRESS` ora riporta un solo numero, misurato. Regola da tenere:
+**un numero che nessuno ha eseguito non è un dato.** All'orale si cita solo ciò che è stato
+misurato.
+
+**③a `-spec renew/2` disallineato.** Dichiarava la 4-tupla mentre l'implementazione ne accetta
+tre forme. Corretto: ora dichiara la 5-tupla, cioè il contratto, con una nota che la tolleranza
+per le forme vecchie è leniency dell'implementazione e non parte dell'interfaccia.
+
+### Dove l'analisi ha aggiunto qualcosa
+
+A proponeva di togliere le clausole legacy a 3 e 4 campi, ormai irraggiungibili in produzione.
+Vero — ma controllando prima di toccarle è emerso che **sono i test di B a percorrerle**:
+
+| Test | Forma |
+|---|---|
+| `own_claim_is_renewed` | 4 campi |
+| `unknown_claim_is_adopted` | 4 campi |
+| `renew_without_granted_at_is_accepted` | 3 campi |
+| `oldest_claim_wins_a_conflict` | 4 campi |
+| variante di `unknown_claim_is_adopted` | **5 campi** |
+
+Cinque test coprono forme che nessuno invia, **uno solo** copre quella che viaggia davvero. È
+un'inversione della copertura, e conta più del ramo morto in sé: il percorso di produzione del
+`renew` — un messaggio che arriva ogni dieci secondi e tocca tutti i claim — è quasi scoperto.
+
+Proposta rilanciata ad A: togliere le clausole ma **sostituirle con un catch-all che scarta la
+voce malformata e la registra**, invece di lasciare che produca `function_clause`. La lezione del
+24 non era "supportare le 3-tuple", era che *un messaggio inatteso ha ucciso il processo che
+teneva tutti i claim*. Togliere le clausole lasciando cadere il processo riapre quella porta nel
+momento peggiore, cioè quando qualcuno cambia una tupla senza accorgersene. Con il catch-all si
+ottiene ciò che A vuole — niente rami morti da spiegare — e in più una scelta di progetto
+raccontabile: **un rinnovo malformato perde un claim, non il coordinatore.**
+
+In attesa della risposta di A: la modifica tocca `vs_coord` (di B) ma nasce da una sua proposta,
+e riscrivere i cinque test è parte del lavoro.
+
+---
+
+## 9. Prossimo passo — M3-B, la parte che vale l'esame
+
+M1-B e M2-B sono chiuse e verificate (§7i, §7k). Quello che resta a B è la milestone su cui il
+progetto viene giudicato: **il coordinatore smette di essere singolo**.
+
+Oggi `vs_coord_srv` ha già `mode` nello stato, ma vale sempre `serving`: c'è un solo
+coordinatore, è sempre leader, e nessuno verifica di essere in maggioranza. M3 riempie proprio
+quel vuoto, secondo `piano.md` §6.1:
+
+1. **`vs_coord_election`** — bully: heartbeat 1 s, leader dato per morto dopo 3 battiti mancati,
+   messaggi `election` / `answer` / `leader`. Vince l'id più alto.
+2. **`vs_coord_membership`** — vista dei coordinatori vivi. Senza maggioranza (2 su 3) il nodo
+   passa a `suspended` e **rifiuta tutto**: è ciò che impedisce a due leader separati da una
+   partizione di concedere lo stesso veicolo due volte.
+3. **`vs_coord_rebuild`** — dopo la vittoria il nuovo leader interroga le stazioni con
+   `who_do_you_hold`, ricostruisce la tabella dei claim, e solo allora passa a `serving`. È qui
+   che si vede il principio già scritto in `DESIGN-NOTES`: il coordinatore è un **indice, non il
+   proprietario** dello stato, e per questo può ricostruirsi chiedendo invece di replicare un log.
+4. **`coord2` e `coord3` nel compose** — sono già scritti e commentati nel file, con `COORD_ID`
+   come priorità.
+
+Da A, in parallelo: rinnovo dei claim contro il nuovo leader, gestione di `{not_serving, Leader}`,
+revoca. Il contratto per farlo esiste già e la stazione lo implementa da M1.
+
+**La prova di accettazione** (scenario 5 della demo): si uccide il container del leader mentre
+una sessione è in corso; l'elezione avviene, il nuovo leader ricostruisce dalle stazioni, le
+prenotazioni riprendono da sole — e le sessioni di ricarica **non si fermano**, perché il
+coordinatore non è nel percorso dell'erogazione. Quest'ultimo punto è il più convincente da
+mostrare al docente e va provato esplicitamente.
+
+Resta fuori M1: il client browser di A (§7j). Non blocca M3 — il failover si dimostra dai log e
+dallo stato dei nodi — ma senza quello la demo dal browser non esiste, quindi va sollecitato.

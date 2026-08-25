@@ -19,15 +19,24 @@ WORKDIR /build
 COPY erlang/rebar.config erlang/rebar.lock ./
 COPY erlang/apps ./apps
 
-# `cp -rL` dereferences, and that matters: on Linux rebar3 links the umbrella
-# applications into _build instead of copying them. A plain `COPY --from` would
-# carry those links into an image where /build does not exist, leaving `-pa
-# /app/lib/*/ebin` pointing at nothing and the node dying on boot with a
-# "no such file or directory" for the .app. Dereferencing here costs nothing
-# and makes the result independent of how rebar3 lays out _build.
+# Collect what the runtime image actually needs: the compiled beams, and priv/
+# where an application has one.
+#
+# Not a plain `cp -rL` of _build: rebar3 leaves `priv` and `include` symlinks in
+# every application directory, and for ours they point at directories that do not
+# exist. Dereferencing a dangling link makes cp fail, which failed the whole build
+# — while `-L` was never needed in the first place, since `ebin` is a real
+# directory. Copying explicitly says what the image depends on and does not care
+# how rebar3 lays out its build tree.
 RUN rebar3 compile \
-    && mkdir -p /out \
-    && cp -rL _build/default/lib /out/lib
+    && mkdir -p /out/lib \
+    && for app in _build/default/lib/*/; do \
+           name=$(basename "$app"); \
+           mkdir -p "/out/lib/$name"; \
+           cp -rL "$app/ebin" "/out/lib/$name/"; \
+           if [ -d "$app/priv" ]; then cp -rL "$app/priv" "/out/lib/$name/"; fi; \
+       done \
+    && ls /out/lib
 
 FROM erlang:29.0.5
 

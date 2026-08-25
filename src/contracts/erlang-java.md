@@ -87,17 +87,43 @@ whole list.
 Announces who is serving now. Java records it and sends everything there afterwards. Until the
 first announcement it uses the first entry of `COORD_NODES`.
 
-### 2.3 From M2 and M4 — declared, not yet implemented
-
-Listed so both implementations grow in the same direction.
+### 2.3 `session_closed` — M2, implemented
 
 ```erlang
-%% M2 — a session has closed and must be persisted and priced
 {session_closed, SessionId :: integer(), UserId :: integer(),
                  StationId :: integer(), ConnId :: integer(),
                  EnergyKwh :: float(), OverstaySeconds :: integer(),
                  StartedAt :: integer(), EndedAt :: integer()}   %% epoch seconds
+```
 
+The station sends this to the coordinator after inserting the row into `sessions`; the
+coordinator forwards it here untouched (`vs_coord_srv:session_closed/1`).
+
+**Java does not read the payload.** This message is a *wake-up*, not a source of truth, and the
+distinction is the whole design of billing:
+
+- delivery is best-effort — `{Mbox, Node} ! Msg` to an absent mailbox is dropped in silence, on
+  purpose, so that Tomcat being down cannot disturb the cluster;
+- nothing orders the INSERT against this message, so it can arrive before the row it describes;
+- everything it carries is already in the row.
+
+So the back office prices sessions by sweeping `cost_cents IS NULL` every 60 seconds (the schema
+indexes it as `idx_unbilled`), and the event only makes that sweep run sooner. Losing every
+event delays a receipt by one interval and loses nothing. The UPDATE is conditional on
+`cost_cents IS NULL`, so a duplicated event cannot bill twice: **at-least-once delivery over an
+idempotent write**, which is how effectively-once behaviour is obtained without an
+exactly-once channel.
+
+`OverstaySeconds` is the **billable** overstay: the station has already subtracted its
+`OVERSTAY_GRACE_SECONDS`. The grace period is configured on the station and nowhere else, so
+the back office never subtracts it a second time. Pending A's confirmation — see
+`nota-per-A-M2.md` §2.
+
+### 2.4 From M4 — declared, not yet implemented
+
+Listed so both implementations grow in the same direction.
+
+```erlang
 %% M4 — penalty accounting, forwarded by the coordinator on behalf of a station
 {no_show, UserId :: integer(), StationId :: integer(), ConnId :: integer()}
 {show_up, UserId :: integer()}
