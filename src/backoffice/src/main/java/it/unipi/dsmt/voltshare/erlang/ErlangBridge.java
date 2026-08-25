@@ -11,6 +11,7 @@ import com.ericsson.otp.erlang.OtpMbox;
 import com.ericsson.otp.erlang.OtpNode;
 
 import it.unipi.dsmt.voltshare.model.StationView;
+import it.unipi.dsmt.voltshare.service.BillingService;
 import it.unipi.dsmt.voltshare.util.Env;
 
 import java.nio.charset.StandardCharsets;
@@ -149,8 +150,23 @@ public final class ErlangBridge {
         switch (tag.atomValue()) {
             case "stations_update" -> onStationsUpdate(tuple.elementAt(1));
             case "leader" -> onLeader(tuple.elementAt(1));
+            case "session_closed" -> onSessionClosed(tuple);
             default -> LOG.log(Level.FINE, "Ignoring message {0}", tag.atomValue());
         }
+    }
+
+    /**
+     * A station has closed a session and written its row.
+     *
+     * <p>The payload is deliberately not read. This message is a wake-up, not a source of
+     * truth: the row is already in MySQL, delivery here is best-effort, and the event can
+     * even overtake the INSERT that produced it. BillingService re-reads what needs pricing
+     * and prices it idempotently, so the only thing lost by ignoring an event is promptness.
+     * See the class comment there for the full argument.
+     */
+    private void onSessionClosed(OtpErlangTuple tuple) {
+        LOG.log(Level.FINE, "Session closed, waking the billing sweep: {0}", tuple);
+        BillingService.getInstance().requestSweep();
     }
 
     private void onLeader(OtpErlangObject value) {

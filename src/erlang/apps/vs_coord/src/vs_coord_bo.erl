@@ -17,7 +17,7 @@
 -module(vs_coord_bo).
 -behaviour(gen_server).
 
--export([start_link/0, publish/1, announce_leader/0]).
+-export([start_link/0, publish/1, announce_leader/0, session_closed/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(SERVER, ?MODULE).
@@ -47,6 +47,16 @@ publish(Stations) ->
 announce_leader() ->
     gen_server:cast(?SERVER, announce_leader).
 
+%% @doc Forward a station's `session_closed' event to Java.
+%%
+%% Sent as it arrives, with no bookkeeping: the back office treats this as a
+%% wake-up rather than as data, because the session is already a row in MySQL.
+%% If Tomcat is down the message is dropped and the sweep on the Java side
+%% prices the session late — one interval of delay, no loss.
+-spec session_closed(tuple()) -> ok.
+session_closed(Event) ->
+    gen_server:cast(?SERVER, {session_closed, Event}).
+
 %%%===================================================================
 %%% gen_server
 %%%===================================================================
@@ -75,6 +85,10 @@ handle_cast({publish, Stations}, State) ->
 
 handle_cast(announce_leader, State) ->
     send(State, {leader, node()}),
+    {noreply, State};
+
+handle_cast({session_closed, Event}, State) ->
+    send(State, Event),
     {noreply, State};
 
 handle_cast(_Msg, State) ->

@@ -25,7 +25,7 @@
 %% API used by the stations (through the contract) and by the tests
 -export([start_link/0,
          claim/5, renew/2, release/2,
-         station_up/1, station_stats/4,
+         station_up/1, station_stats/4, session_closed/1,
          stations/0, claims/0, mode/0]).
 
 %% gen_server callbacks
@@ -76,7 +76,13 @@ start_link() ->
 claim(ReqId, VehicleId, UserId, StationId, ConnId) ->
     gen_server:call(?SERVER, {claim, ReqId, VehicleId, UserId, StationId, ConnId}).
 
--spec renew(pos_integer(), [{binary(), pos_integer(), pos_integer(), vs_time:epoch_ms()}]) -> term().
+%% The five-field entry is the contract (claim.md §3.2) and the only shape any
+%% real station sends. The implementation still tolerates the earlier three- and
+%% four-field forms; that is deliberate leniency, not part of the interface, so
+%% it is not declared here — see renew_one/4.
+-spec renew(pos_integer(),
+            [{binary(), pos_integer(), pos_integer(), non_neg_integer(), vs_time:epoch_ms()}]) ->
+          {renewed, [binary()], [binary()], vs_time:epoch_ms()}.
 renew(StationId, Claims) ->
     gen_server:call(?SERVER, {renew, StationId, Claims}).
 
@@ -89,6 +95,19 @@ station_up(Announcement) ->
 
 station_stats(StationId, Free, Held, Charging) ->
     gen_server:cast(?SERVER, {station_stats, StationId, Free, Held, Charging}).
+
+%% @doc A station has closed a session and written its row to MySQL.
+%%
+%% Forwarded to the back office and otherwise not acted upon: the coordinator
+%% keeps no billing state, and the row it refers to is already in the database.
+%% The station calls this instead of talking to Java itself, so that the whole
+%% cluster keeps exactly one door onto the back office (piano.md §5.2).
+%%
+%% The tuple is passed through untouched — same shape on both hops, so there is
+%% no translation step that could disagree with contracts/erlang-java.md.
+-spec session_closed(tuple()) -> ok.
+session_closed(Event) ->
+    gen_server:cast(?SERVER, {session_closed, Event}).
 
 %% @doc Cluster map in the shape contracts/erlang-java.md defines.
 -spec stations() -> [tuple()].
@@ -148,6 +167,15 @@ handle_cast({station_up, StationId, Node, Name, WsUrl, SitePowerKw, Tariff, Conn
 
 handle_cast({station_stats, StationId, Free, Held, Charging}, State) ->
     {noreply, do_station_stats(StationId, Free, Held, Charging, State)};
+
+%% Straight through to Java. Not stored: if the back office is down the event is
+%% dropped, and that is acceptable precisely because it is not the record of the
+%% session — the row in MySQL is, and the back office finds it again by sweeping
+%% for unpriced sessions. Queueing here would add a second, weaker copy of state
+%% the database already keeps.
+handle_cast({session_closed, Event}, State) ->
+    vs_coord_bo:session_closed(Event),
+    {noreply, State};
 
 handle_cast(Unknown, State) ->
     logger:warning("coordinator: unexpected cast ~p", [Unknown]),
