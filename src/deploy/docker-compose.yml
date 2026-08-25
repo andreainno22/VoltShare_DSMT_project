@@ -102,59 +102,76 @@ services:
         condition: service_healthy
     networks: [voltshare]
 
-  # ---------------------------------------------------------------- M1 (A)
-  # Fake coordinator: always grants (apps/vs_mock_coord). It answers on
-  # the contract's registered name, so the stations cannot tell the
-  # difference. B replaces THIS service with the real coord1 — same
-  # hostname, same node name, nothing else in this file changes.
-  coord1:
+  # ------------------------------------------------------- coordinators (M3)
+  #
+  # Three replicas of the same image and the same configuration. They differ
+  # only by hostname, and that is on purpose: nothing here says which one is
+  # in charge.
+  #
+  # There is no COORD_ID. Bully priority is the position of each node in the
+  # sorted COORD_NODES list, which all three already share, so every node
+  # computes the same order without being told. A per-node id would be one
+  # more thing to configure and one more thing to get wrong — two nodes given
+  # the same id would both refuse to yield, and an election that never settles
+  # looks nothing like its cause.
+  #
+  # Highest position wins, so on a healthy start the leader is coord3.
+  # `docker kill coord3` is scenario 5 of the demo: coord2 takes over, rebuilds
+  # from the stations, and reservations resume by themselves. Charging sessions
+  # already running are untouched — the coordinator is not in the path of
+  # delivering power, it only decides who may hold a vehicle.
+  coord1: &coord
     build:
       context: ..
       dockerfile: deploy/Dockerfile.erlang
+    # One image name for all three, deliberately.
+    #
+    # Without it compose derives a name per service — voltshare-coord1,
+    # voltshare-coord2, voltshare-coord3 — and `docker compose build coord1`
+    # leaves the other two on yesterday's code. The symptom is nasty to read:
+    # the cluster comes up, elects a leader, and then one coordinator answers
+    # "unexpected cast" to a message the others consider ordinary. Sharing the
+    # tag makes divergence impossible.
+    image: voltshare-coord:local
     container_name: coord1
     hostname: coord1
-    environment:
+    environment: &coord_env
       NODE_SNAME: vs
-      # The real coordinator, as of 25/08: vs_coord serves the claim contract
-      # and pushes the station list to the back office. To go back to A's mock
-      # — for instance to test the station side in isolation — set this to
-      # vs_mock_coord and drop the JINTERFACE_* lines; nothing else changes.
       ERL_APP: vs_coord
       ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
       CLAIM_GRACE_SECONDS: ${CLAIM_GRACE_SECONDS:-60}
+      # The cluster, and with it the quorum arithmetic: 2 of these 3 must be
+      # visible for a coordinator to serve at all.
+      COORD_NODES: vs@coord1,vs@coord2,vs@coord3
+      # Liveness. Three missed beats at one second is a three-second verdict on
+      # a partition; Erlang's own net_ticktime would take sixty, and sixty
+      # seconds of a minority leader still granting claims is exactly what the
+      # quorum rule exists to prevent.
+      COORD_HEARTBEAT_MS: ${COORD_HEARTBEAT_MS:-1000}
+      COORD_HEARTBEAT_MISSES: ${COORD_HEARTBEAT_MISSES:-3}
+      COORD_ELECTION_WAIT_MS: ${COORD_ELECTION_WAIT_MS:-800}
+      COORD_REBUILD_TIMEOUT_MS: ${COORD_REBUILD_TIMEOUT_MS:-2000}
       # Where to push stations_update: must match the back office's node name.
+      # Every coordinator has it; only the one that is serving actually pushes.
       JINTERFACE_NODE: voltshare_bo@backoffice
       JINTERFACE_MBOX: backoffice
     networks: [voltshare]
 
-  # ---------------------------------------------------------------- B
-  # Enable when apps/vs_coord exists. Same image, different ERL_APP.
-  #
-  # coord1: &coord
-  #   build:
-  #     context: ..
-  #     dockerfile: deploy/Dockerfile.erlang
-  #   container_name: coord1
-  #   hostname: coord1
-  #   environment:
-  #     NODE_SNAME: vs
-  #     ERL_APP: vs_coord
-  #     ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
-  #     COORD_NODES: vs@coord1,vs@coord2,vs@coord3
-  #     COORD_ID: 1                # bully priority: highest id wins
-  #   networks: [voltshare]
-  #
-  # coord2:
-  #   <<: *coord
-  #   container_name: coord2
-  #   hostname: coord2
-  #   environment: { NODE_SNAME: vs, ERL_APP: vs_coord, COORD_ID: 2,
-  #                  ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare},
-  #                  COORD_NODES: vs@coord1,vs@coord2,vs@coord3 }
-  #
-  # coord3: ... same with COORD_ID: 3
-  #
+  coord2:
+    <<: *coord
+    container_name: coord2
+    hostname: coord2
+    environment:
+      <<: *coord_env
+
+  coord3:
+    <<: *coord
+    container_name: coord3
+    hostname: coord3
+    environment:
+      <<: *coord_env
+
   backoffice:
     build:
       context: ..

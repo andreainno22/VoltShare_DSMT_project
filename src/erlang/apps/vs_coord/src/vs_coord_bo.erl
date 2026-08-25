@@ -17,7 +17,7 @@
 -module(vs_coord_bo).
 -behaviour(gen_server).
 
--export([start_link/0, publish/1, announce_leader/0, session_closed/1]).
+-export([start_link/0, publish/1, announce_leader/0, standing_by/0, session_closed/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(SERVER, ?MODULE).
@@ -26,6 +26,7 @@
 -record(state, {mbox        :: atom(),
                 java_node   :: node(),
                 last        :: [tuple()],
+                serving     :: boolean(),
                 published   :: non_neg_integer()}).
 
 %%%===================================================================
@@ -41,11 +42,31 @@ start_link() ->
 publish(Stations) ->
     gen_server:cast(?SERVER, {publish, Stations}).
 
-%% @doc Tell the back office which node is serving. In M1 that is always this
-%% one; from M3 the newly elected leader calls it after winning.
+%% @doc Tell the back office which node is serving, and start publishing.
+%%
+%% Called by vs_coord_srv when this node becomes the leader. Until then this
+%% process stays silent — see {@link standing_by/0} for why that matters.
 -spec announce_leader() -> ok.
 announce_leader() ->
     gen_server:cast(?SERVER, announce_leader).
+
+%% @doc Stop talking to the back office: this node is no longer the leader.
+%%
+%% This is not tidiness, it is a correctness fix that M3 made necessary. Every
+%% coordinator runs this process, but a follower's station table is empty — it
+%% never receives `station_up', because stations only announce to the leader.
+%% If followers published on the same 30-second timer as the leader, each tick
+%% would overwrite the back office's directory with an empty list and the lobby
+%% would blink between the real stations and "no station is reporting".
+%%
+%% The same goes for the leader announcement: three coordinators announcing
+%% themselves at boot would leave the back office pointing at whichever spoke
+%% last, quite possibly a follower.
+%%
+%% So exactly one coordinator ever speaks to Java: the serving one.
+-spec standing_by() -> ok.
+standing_by() ->
+    gen_server:cast(?SERVER, standing_by).
 
 %% @doc Forward a station's `session_closed' event to Java.
 %%
@@ -65,28 +86,43 @@ init([]) ->
     Mbox = vs_env:get_atom("JINTERFACE_MBOX", backoffice),
     Java = vs_env:get_atom("JINTERFACE_NODE", 'voltshare_bo@backoffice'),
     erlang:send_after(?REPUBLISH_INTERVAL_MS, self(), republish),
-    logger:notice("back office bridge: publishing to ~p on ~p", [Mbox, Java]),
-    %% Announce straight away: if Tomcat is already up it learns the leader
-    %% without waiting for the first station to appear.
-    self() ! announce,
-    {ok, #state{mbox = Mbox, java_node = Java, last = [], published = 0}}.
+    logger:notice("back office bridge: ready to publish to ~p on ~p", [Mbox, Java]),
+    %% Silent until told we are the leader. A single-coordinator deployment
+    %% gets that within milliseconds — vs_coord_srv announces itself on boot —
+    %% so nothing is lost by waiting, and with three coordinators this is what
+    %% keeps two of them from talking over the third.
+    {ok, #state{mbox = Mbox, java_node = Java, last = [],
+                serving = false, published = 0}}.
 
 handle_call(status, _From, State) ->
     {reply, #{java_node => State#state.java_node,
               mbox      => State#state.mbox,
+              serving   => State#state.serving,
               stations  => length(State#state.last),
               published => State#state.published}, State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
-handle_cast({publish, Stations}, State) ->
+handle_cast({publish, Stations}, State = #state{serving = true}) ->
     {noreply, send_stations(Stations, State)};
+
+handle_cast({publish, _Stations}, State) ->
+    {noreply, State};
 
 handle_cast(announce_leader, State) ->
     send(State, {leader, node()}),
-    {noreply, State};
+    {noreply, State#state{serving = true}};
 
+handle_cast(standing_by, State) ->
+    %% `last' is cleared too: if this node is elected later it must publish
+    %% what it has rebuilt, never a snapshot from a term it no longer holds.
+    {noreply, State#state{serving = false, last = []}};
+
+%% Not gated on `serving'. A station only ever sends this to the leader, but if
+%% one arrives here during a handover it costs nothing to forward and the back
+%% office treats it as a wake-up anyway — the session is already a row in
+%% MySQL. Dropping it would delay a receipt for no reason.
 handle_cast({session_closed, Event}, State) ->
     send(State, Event),
     {noreply, State};
@@ -94,15 +130,16 @@ handle_cast({session_closed, Event}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(announce, State) ->
-    send(State, {leader, node()}),
-    {noreply, State};
-
 %% Periodic resend, so a back office that started late, or missed a message,
-%% converges without anybody having to ask.
-handle_info(republish, State) ->
+%% converges without anybody having to ask. Followers stay quiet: their station
+%% table is empty and republishing it would blank the lobby.
+handle_info(republish, State = #state{serving = true}) ->
     erlang:send_after(?REPUBLISH_INTERVAL_MS, self(), republish),
     {noreply, send_stations(State#state.last, State)};
+
+handle_info(republish, State) ->
+    erlang:send_after(?REPUBLISH_INTERVAL_MS, self(), republish),
+    {noreply, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
