@@ -46,8 +46,16 @@
 %% What the driver channel is allowed to see as a refusal. `vs_driver_ws'
 %% turns these into the wire codes of ws-driver.md §6; keeping them as
 %% atoms here means the state machine never formats a message.
--type refusal() :: already_held | no_claim | suspended | retry_later
-                 | not_yours | not_your_reservation | invalid_state.
+%% `already_held' and `vehicle_committed' are two different refusals and
+%% ws-driver.md §4.1 gives them two different rows: `already_held' is
+%% raised HERE, by held/3 and charging/3 — *this connector* is taken, try
+%% the next one. `vehicle_committed' comes back from the COORDINATOR
+%% through claim_mod — *your vehicle* is reserved somewhere else, and no
+%% other connector will help. This state machine never matches either: it
+%% rebounds whatever claim_mod answered (see free/3), so the distinction
+%% costs a word in this declaration and no branch anywhere.
+-type refusal() :: already_held | vehicle_committed | no_claim | suspended
+                 | retry_later | not_yours | not_your_reservation | invalid_state.
 
 -export_type([refusal/0]).
 

@@ -97,8 +97,6 @@ Refusals — the mapping from the coordinator's answer to what the driver sees:
 
 The last row is the deliberate one: with no coordinator the station refuses **new reservations** and keeps everything already running (claim.md §4). Availability is sacrificed exactly where safety demands it and nowhere else.
 
-> **M1 note.** The first two rows are indistinguishable at the station's own boundary: `vs_connector:refusal()` uses one atom, `already_held`, both for "this connector is not free" and for the coordinator's "that vehicle is committed elsewhere". M1 therefore answers `ALREADY_HELD` in both cases. Telling them apart needs a new refusal atom in the connector state machine, which is deferred rather than forgotten.
-
 ### 4.2 `cancel_reservation`
 
 ```jsonc

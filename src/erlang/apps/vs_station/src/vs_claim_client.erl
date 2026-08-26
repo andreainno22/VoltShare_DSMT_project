@@ -390,7 +390,15 @@ call_one(Msg, Node, T) ->
 %%%===================================================================
 
 %% Wire refusals → the connector's refusal atoms (claim.md §3.1 table).
-map_refusal(already_held)    -> already_held;
+%%
+%% `already_held' is renamed on the way in, and the rename is the point:
+%% in the coordinator's vocabulary it means "that VEHICLE is committed"
+%% (claims are per vehicle), while in the station's it means "that
+%% CONNECTOR is taken". Same word, two facts. Letting it through
+%% unchanged made the driver channel answer ALREADY_HELD to both, and a
+%% driver told the connector was busy tries the next connector — where he
+%% fails identically, because the connector was never the problem.
+map_refusal(already_held)    -> vehicle_committed;
 map_refusal(suspended)       -> suspended;
 map_refusal(rebuilding)      -> retry_later;
 map_refusal(unknown_station) -> retry_later;

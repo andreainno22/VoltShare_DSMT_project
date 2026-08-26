@@ -122,7 +122,13 @@ wire_refusals_are_mapped_to_connector_atoms_test() ->
               ok = vs_mock_coord:set_reply({error, Wire}),
               ?assertEqual({error, Refusal}, acquire())
           end,
-          [{already_held, already_held},
+          %% The input is what the coordinator really sends (claim.md §3.1);
+          %% only the name it is given inside the station changes. In the
+          %% coordinator's vocabulary `already_held' is about the VEHICLE,
+          %% so it arrives as `vehicle_committed' — the station's own
+          %% `already_held' means the CONNECTOR is taken and is raised by
+          %% vs_connector, never here.
+          [{already_held, vehicle_committed},
            {suspended,    suspended},
            {rebuilding,   retry_later}])
     end).

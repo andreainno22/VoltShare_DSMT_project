@@ -76,6 +76,8 @@ cases() ->
       fun reserve_acks_with_the_lease/0},
      {"refusals map to the wire codes",
       fun refusals_map_to_the_wire_codes/0},
+     {"the two refusals of 4.1 stay apart",
+      fun the_two_refusals_of_section_4_1_stay_apart/0},
      {"an unmapped refusal becomes invalid_state",
       fun an_unmapped_refusal_becomes_invalid_state/0},
      {"a replayed request_id does not reserve twice",
@@ -120,6 +122,7 @@ frame(Action, ReqId, Payload) ->
 
 type_of(#{type := T}) -> T.
 code_of(#{payload := #{code := C}}) -> C.
+message_of(#{payload := #{message := M}}) -> M.
 
 %%%===================================================================
 %%% §3 — the handshake
@@ -278,12 +281,44 @@ refusals_map_to_the_wire_codes() ->
               ?assertEqual(error, type_of(Frame)),
               ?assertEqual(Code, code_of(Frame))
       end,
-      [{already_held,  <<"ALREADY_HELD">>},
-       {no_claim,      <<"NO_CLAIM">>},
-       {suspended,     <<"SUSPENDED">>},
-       {retry_later,   <<"RETRY_LATER">>},
-       {not_yours,     <<"NOT_YOURS">>},
-       {invalid_state, <<"INVALID_STATE">>}]).
+      [{already_held,      <<"ALREADY_HELD">>},
+       {vehicle_committed, <<"NO_CLAIM">>},
+       {no_claim,          <<"NO_CLAIM">>},
+       {suspended,         <<"SUSPENDED">>},
+       {retry_later,       <<"RETRY_LATER">>},
+       {not_yours,         <<"NOT_YOURS">>},
+       {invalid_state,     <<"INVALID_STATE">>}]).
+
+%% The test that would fail if anyone ever merged the two refusals back
+%% together. Same action, same connector, same session — only the atom
+%% the connector answers with differs, and the driver must be told two
+%% different things: "try the next connector" versus "your car is booked
+%% somewhere else, and no connector here will help".
+%%
+%% Two DIFFERENT request_ids on purpose: with the same one the second
+%% call would be replayed from the at-most-once cache (§7.2) and the
+%% stub's second answer would never be consulted, so the test would pass
+%% without proving anything.
+the_two_refusals_of_section_4_1_stay_apart() ->
+    S = joined_session(),
+
+    %% raised by vs_connector itself: this outlet is taken
+    vs_driver_stub:set_reserve({error, already_held}),
+    {[Local], _} = handle(frame(<<"reserve">>, <<"req-local">>, #{connector_id => 1}), S),
+
+    %% relayed from the coordinator: this vehicle is committed elsewhere
+    vs_driver_stub:set_reserve({error, vehicle_committed}),
+    {[Remote], _} = handle(frame(<<"reserve">>, <<"req-remote">>, #{connector_id => 1}), S),
+
+    ?assertEqual(<<"ALREADY_HELD">>, code_of(Local)),
+    ?assertEqual(<<"NO_CLAIM">>, code_of(Remote)),
+    ?assertNotEqual(code_of(Local), code_of(Remote)),
+
+    %% and the sentence, which is the half the driver actually reads —
+    %% verbatim from the "Meaning shown" column of §4.1
+    ?assertEqual(<<"your vehicle already holds a reservation elsewhere">>,
+                 message_of(Remote)),
+    ?assertNotEqual(message_of(Local), message_of(Remote)).
 
 %% `not_your_reservation' is a real refusal of vs_connector with no code
 %% in §6: it is raised by `plugged', an event of the charge point
