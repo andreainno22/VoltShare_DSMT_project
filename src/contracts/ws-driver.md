@@ -14,6 +14,8 @@ ws://<station-host>:8080/ws/driver?station_id=<id>
 
 The URL is not built by the browser: it comes from `stations.ws_url` in the database, is rendered into the page by `StationPageServlet`, and reaches the JavaScript as the constant `WS_URL` (jwt.md §2). A station never assumes it knows its own public address.
 
+**The query string is the client's half.** `stations.ws_url` is what the station announced about itself — `ws://host:9101/ws/driver` — and carries no query string, while the handler closes `4400` when `station_id` is missing from it, and again when it names a station this node does not serve. `js/ws.js` appends `?station_id=` from the `STATION` constant already on the page. The split is deliberate: the station publishes an address, the page says which station it believes it is talking to, and a page pointed at the wrong one is a bug that shows itself instead of being quietly absorbed.
+
 One connection per open page. A driver with two tabs has two connections and receives every push twice, which is harmless: pushes are complete snapshots (§7.1).
 
 Frames are **text**, one JSON object per frame. Binary frames are rejected with close code `4400`.
