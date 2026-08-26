@@ -30,12 +30,21 @@ public class SessionDao {
             """;
 
     /**
-     * The tariff has to come from {@code stations}, not from the closing event: it is the
-     * price at settlement, and keeping it in one place means a tariff change does not need
-     * every station to be told about it.
+     * Both tariffs come from {@code stations}, not from the closing event and not from the
+     * environment: they are the price at settlement, and keeping them in one place means a
+     * change does not need every station to be told about it.
+     *
+     * <p>{@code tariff_cents_min_overstay} is read here because the schema makes it a
+     * <em>per-station</em> price. An earlier version of this DAO selected only the energy
+     * tariff and let {@link it.unipi.dsmt.voltshare.service.BillingService} take the overstay
+     * rate from an environment variable — so one addend of the same formula was per station
+     * and the other per deployment, and the column the contract had created for it was read
+     * by nobody. Both happened to be 50, so nothing failed; it would have surfaced the day one
+     * site priced overstay differently from another.
      */
     private static final String UNBILLED = """
-            SELECT s.id, s.energy_kwh, s.overstay_seconds, st.tariff_cents_kwh
+            SELECT s.id, s.energy_kwh, s.overstay_seconds,
+                   st.tariff_cents_kwh, st.tariff_cents_min_overstay
               FROM sessions s
               JOIN stations st ON st.id = s.station_id
              WHERE s.cost_cents IS NULL
@@ -75,7 +84,8 @@ public class SessionDao {
                             rs.getLong("id"),
                             rs.getDouble("energy_kwh"),
                             rs.getInt("overstay_seconds"),
-                            rs.getInt("tariff_cents_kwh")));
+                            rs.getInt("tariff_cents_kwh"),
+                            rs.getInt("tariff_cents_min_overstay")));
                 }
                 return out;
             }
@@ -119,6 +129,7 @@ public class SessionDao {
      * What pricing needs and nothing more. A record is fine here, unlike the view models:
      * this one never reaches a JSP, so no expression language ever looks for getters on it.
      */
-    public record Unbilled(long id, double energyKwh, int overstaySeconds, int tariffCentsKwh) {
+    public record Unbilled(long id, double energyKwh, int overstaySeconds,
+                           int tariffCentsKwh, int overstayCentsPerMinute) {
     }
 }

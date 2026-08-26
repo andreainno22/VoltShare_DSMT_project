@@ -71,11 +71,16 @@
                 </tbody>
             </table>
 
+            <%--
+              Both rates are per station, so no single figure is quoted here: it would be
+              wrong for every session charged at a different site.
+            --%>
             <p class="muted">
-                Energy is charged at the tariff of the station at the time of settlement.
-                Occupying a connector after charging has finished costs ${overstayCentsMin}
-                cents per minute, starting five minutes after the vehicle is full —
-                unplugging inside those five minutes costs nothing.
+                Energy and overstay are both charged at the tariff of the station where the
+                session took place, as it stood at the time of settlement. The overstay charge
+                starts five minutes after the vehicle is full — unplugging inside those five
+                minutes costs nothing, and the minutes shown above are the ones actually
+                charged for.
             </p>
         </c:otherwise>
     </c:choose>

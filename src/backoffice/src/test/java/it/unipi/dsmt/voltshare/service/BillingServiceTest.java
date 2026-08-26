@@ -71,6 +71,25 @@ class BillingServiceTest {
         assertEquals(OVERSTAY, BillingService.cost(30.0, 0, 30, OVERSTAY));
     }
 
+    /**
+     * The overstay rate is per station, like the energy tariff — it is a column of
+     * {@code stations}, not a deployment-wide setting. The first version of the sweep read it
+     * from an environment variable instead, so the same formula mixed a per-station price with
+     * a global one and the column existed unread. Nothing failed, because both were 50.
+     *
+     * <p>This is the test that would have caught it, and the reason it is written with two
+     * different rates: a regression here is invisible to any test that uses only one.
+     */
+    @Test
+    void overstayIsPricedByTheStationsOwnRate() {
+        int pisa = 50;
+        int livorno = 80;
+        int fiveMinutes = 5 * 60;
+
+        assertEquals(250, BillingService.cost(0.0, TARIFF, fiveMinutes, pisa));
+        assertEquals(400, BillingService.cost(0.0, TARIFF, fiveMinutes, livorno));
+    }
+
     @Test
     void negativeInputIsRejectedRatherThanPriced() {
         // A malformed row must not silently produce a credit.
