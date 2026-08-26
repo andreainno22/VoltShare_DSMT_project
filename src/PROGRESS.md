@@ -766,6 +766,81 @@ percorso dell'erogazione.
 
 ---
 
+## 7o. A trova un bug nella fatturazione — 26 agosto
+
+`risposta-per-B-M2.md` accetta entrambe le richieste di M2 e, in fondo, sotto *"non c'entra con le
+tue domande"*, segnala un difetto reale nel codice di B. Risposta in `risposta-per-A-M2.md`.
+
+### La tariffa di overstay stava in due posti
+
+`schema.sql` — contratto congelato — definisce `stations.tariff_cents_min_overstay`, cioè una
+tariffa **per stazione**. Verifica sul repository:
+
+```
+$ grep -rn "tariff_cents_min_overstay" --include=*.java --include=*.erl --include=*.sql .
+contracts/schema.sql:55:    tariff_cents_min_overstay INT  NOT NULL DEFAULT 50
+```
+
+**Una sola occorrenza: la riga che la definisce.** Nessuno la leggeva.
+
+`BillingService` usava invece `Env.getInt("OVERSTAY_CENTS_MIN", 50)`, un valore **globale**. Quindi
+nella stessa formula un addendo era per stazione (l'energia, letta dal join) e l'altro per
+deployment. Entrambi valevano 50, perciò nessun test poteva accorgersene.
+
+L'errore vero non è stato dimenticare la colonna: è stato **inventare una configurazione** per un
+prezzo che il contratto aveva già deciso dove vivesse, metterla nel compose come se fosse la
+fonte, e scriverci sopra dei test che la usavano. Tre strati che si confermavano a vicenda.
+
+### Correzione
+
+- `SessionDao` seleziona `st.tariff_cents_min_overstay`; `Unbilled` lo porta.
+- `BillingService` lo usa; `OVERSTAY_CENTS_MIN` **eliminata**, non degradata a default — finché
+  resta è una seconda fonte per lo stesso prezzo, e quella che vince in silenzio. Tolta anche dal
+  compose, con una riga che dice perché non c'è.
+- `history.jsp` non cita più una cifra globale: con la tariffa per stazione quella frase era falsa
+  per metà delle righe di una pagina che elenca sessioni di siti diversi. Effetto che A non aveva
+  menzionato e che discende dalla stessa causa.
+- Nuovo test `overstayIsPricedByTheStationsOwnRate`, **con due tariffe diverse** (50 e 80): con una
+  sola la regressione è invisibile, che è il motivo per cui dieci test precedenti non l'avevano
+  vista.
+
+**Verificato in Docker.** Due sessioni identiche — 10 kWh, 5 minuti di overstay — su stazioni con
+overstay a 50 e a 80:
+
+| Sessione | Stazione | Energia | Overstay | Totale |
+|---|---|---|---|---|
+| 5 | Pisa Centro | 10 × 45 = 450 | 5 × 50 = 250 | **700** |
+| 6 | Livorno Port | 10 × 42 = 420 | 5 × 80 = 400 | **820** |
+
+Al primo tentativo Livorno usciva 670, cioè 420 + 5 × **50**: il container girava l'immagine
+precedente perché il build era stato interrotto. Vale la pena annotarlo — un fix che sembra non
+funzionare, quando il codice è giusto, quasi sempre è un'immagine non ricostruita.
+
+### Le altre due decisioni
+
+**`overstay_seconds` è il netto**: A conferma, la stazione sottrae `OVERSTAY_GRACE_SECONDS`.
+Tolta la riserva *pending* da `erlang-java.md` §2.3. A allinea anche il campo omonimo nel frame
+`session` di `ws-driver.md`, così il nome significa una cosa sola su entrambi i canali. Da notare
+il modo in cui ha preso la decisione: dichiarando **cosa si perde** — con il netto non si può più
+sapere a posteriori quanto restano attaccate le auto, e un cambio di tolleranza rende le righe
+vecchie incomparabili.
+
+**`StartedAt` / `EndedAt` passano a millisecondi.** Il contratto diceva "epoch seconds" mentre ogni
+altro campo del confine è in millisecondi (`GrantedAt`, `ExpiresAt`, `NewExpiresAt`, `expires_at`).
+A ha ragione e l'argomento è lo stesso che B usa altrove: un fattore 1000 non rompe nessun tipo,
+non fallisce nessun test, e si manifesta come una data nel 1970. `OverstaySeconds` resta in secondi
+perché **se lo porta nel nome**.
+
+### Nota di metodo
+
+Due volte in due giorni A ha trovato qualcosa di sostanziale leggendo codice di B: prima
+l'inversione della copertura dei test sul `renew` (§7l), ora questa. In entrambi i casi il difetto
+era invisibile a chi l'aveva scritto perché *coerente con sé stesso* — 50 = 50, e cinque test che
+esercitano la forma sbagliata. È l'argomento più concreto a favore delle PR incrociate, e vale la
+pena dirlo nella relazione invece che rivendicare solo il risultato.
+
+---
+
 ## 7n. Il metodo dei branch, finalmente applicato — 25 agosto
 
 Le due milestone di oggi sono entrate su `main` **passando da una PR**, non da un push diretto:
