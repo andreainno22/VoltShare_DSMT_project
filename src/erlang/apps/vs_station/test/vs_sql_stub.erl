@@ -17,7 +17,7 @@
 -module(vs_sql_stub).
 
 -export([start_link/1, query/4, insert_id/1]).
--export([reset/0, set_mode/1, set_connect/1, set_vehicle/1,
+-export([reset/0, set_mode/1, set_connect/1, set_vehicle/1, set_insert_id/1,
          queries/0, last_insert_id/0]).
 
 -define(MODE,    {?MODULE, mode}).
@@ -25,16 +25,24 @@
 -define(VEHICLE, {?MODULE, vehicle}).
 -define(QUERIES, {?MODULE, queries}).
 -define(NEXT_ID, {?MODULE, next_id}).
+-define(ID_MODE, {?MODULE, id_mode}).
 
 reset() ->
     persistent_term:put(?MODE, ok),
     persistent_term:put(?CONNECT, ok),
     persistent_term:put(?VEHICLE, {ok, 2}),
     persistent_term:put(?QUERIES, []),
-    persistent_term:put(?NEXT_ID, 1000).
+    persistent_term:put(?NEXT_ID, 1000),
+    persistent_term:put(?ID_MODE, ok).
 
-%% ok | refuse | raise
+%% ok | refuse | odd | raise
+%%   `odd' is an `{error, _}' that is NOT a mysql-otp server_reason(): the
+%%   server answered something this code cannot classify, which is what the
+%%   per-row attempt counter exists for.
 set_mode(Mode)       -> persistent_term:put(?MODE, Mode).
+%% ok | raise -- what insert_id/1 does. Reading the id is a call to the
+%% connection like any other, so it can fail on its own.
+set_insert_id(What)  -> persistent_term:put(?ID_MODE, What).
 %% ok | refuse | raise — what start_link/1 does
 set_connect(What)    -> persistent_term:put(?CONNECT, What).
 %% what the vehicles SELECT answers
@@ -70,6 +78,8 @@ insert_reply() ->
         refuse ->
             %% the shape mysql-otp gives a server-side error
             {error, {1452, <<"23000">>, <<"Cannot add or update a child row">>}};
+        odd ->
+            {error, timeout};
         raise ->
             exit({noproc, {gen_server, call, []}})
     end.
@@ -82,6 +92,10 @@ vehicle_reply() ->
         Other        -> Other
     end.
 
-insert_id(_Conn) -> persistent_term:get(?NEXT_ID, 1000).
+insert_id(_Conn) ->
+    case persistent_term:get(?ID_MODE, ok) of
+        ok    -> persistent_term:get(?NEXT_ID, 1000);
+        raise -> exit({noproc, {gen_server, call, []}})
+    end.
 
 record(Q) -> persistent_term:put(?QUERIES, [Q | persistent_term:get(?QUERIES, [])]).

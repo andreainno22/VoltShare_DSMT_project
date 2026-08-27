@@ -1007,3 +1007,138 @@ mailbox che non c'è ancora.
 L'unica cosa che il suo riavvio costa sono le righe ancora in coda dentro di lui: è la finestra
 di perdita di §13.1, e il `terminate/2` la scrive nel log riga per riga invece di lasciarla
 scoprire dopo.
+
+---
+
+## 14. Correzioni lotto 1 — quello che il driver paga (M2-A fix 1)
+
+La review di M2-A (`REVIEW_M2A_ESITO.md`) ha trovato nove difetti. I quattro di questo lotto
+hanno in comune una cosa: nessuno rompeva un test, e tutti cambiavano quanto un driver paga o
+se paga. Gli altri cinque restano al lotto 2.
+
+### 14.1 La finestra di `closing`, e cosa costa
+
+Fino a qui `closing` scriveva la riga **in entrata**. Su due dei cinque modi di arrivarci —
+`stop_session` e `revoke` — quella è una frame troppo presto: entrambi cominciano mandando un
+comando `stop` all'hardware, e §5 dice che la colonnina lo applica e *riferisce il risultato*.
+Lo riferisce con l'`unplugged` che porta il totale vero (`cp.js`, `onStop` → `unplug`). Il
+connettore era già in `closing`, dove i cast tardivi venivano assorbiti senza guardarli, e in
+`sessions` finiva l'ultimo `meter`: fino a `METER_INTERVAL_S` di energia regalata, che a
+150 kW sono 0,208 kWh — nove centesimi su ogni sessione chiusa dal driver, sistematici.
+
+Ora `closing` non scrive in entrata: arma un `state_timeout` di `CLOSING_SETTLE_MS`
+(nuovo, default 2000) e ascolta. Dentro la finestra un `meter` conta ancora, con lo stesso
+`max` monotono di `charging`; un `unplugged` chiude l'attesa **subito**, perché è l'ultima
+parola dell'hardware e non c'è altro da aspettare. Il principio del passo 3 non cambia — tutto
+ciò che deve accadere una volta sola accade in un punto solo, `settle/1` — quel punto si è
+spostato dall'entrata all'uscita.
+
+Il percorso più comune non paga niente: `charging(cast, {unplugged, E})` non applica più
+l'energia da sé, **posta l'evento in avanti** con `{next_event, cast, {unplugged, E}}`. Così
+`closing` lo consuma un istante dopo l'`enter`, liquida immediatamente, e c'è **un solo posto**
+che sa leggere un `unplugged` invece di due che devono restare d'accordo.
+
+Il prezzo, dichiarato invece che scoperto dopo:
+
+* l'outlet resta in `closing` fino a `CLOSING_SETTLE_MS` in più — invisibile al driver, che la
+  sessione la vede finita comunque;
+* il `release` del claim slitta di altrettanto; il claim scade in minuti, quindi non se ne
+  accorge nessuno;
+* la potenza allocata rientra nel pool entro il `power_tick` successivo, o alla liquidazione
+  se la finestra si chiude prima. `closing` non emette nessun evento in entrata, quindi il
+  manager non ricalcola *subito*; ma `vs_power:is_live/1` non conta `closing`, quindi un tick
+  che cada dentro la finestra libera già la quota. Il caso peggiore è la finestra intera
+  senza tick in mezzo: due secondi su un tick da cinque, al più mezzo tick di budget fermo su
+  un sito che sta liberando un outlet. Accettato; se un giorno desse fastidio, la risposta è
+  un evento sull'entrata in `closing`, non una finestra più corta.
+
+Due secondi non sono un numero tondo scelto a caso: §5 dà all'hardware `LIMIT_APPLY_SECONDS`
+(5) per onorare un limite, e `METER_INTERVAL_S` è 5. Due stanno comodamente sotto entrambi,
+quindi la finestra non aspetta mai un tick di `meter` che non stava per arrivare.
+
+### 14.2 L'offset dell'energia, e perché due adozioni diverse dietro lo stesso frame
+
+`§4.3` dice che ogni cifra della colonnina è **cumulativa dall'inizio suo**, e la colonnina non
+sa niente delle sessioni che finiscono. Quando la stazione chiude una sessione **lasciando il
+cavo attaccato** — la grazia scaduta di §3.2, il guasto di §4.1 — l'hardware continua a
+contare da dove contava, e il `plugged` con cui riannuncia il cavo (§6.2) porta un cumulativo
+che **comprende la riga appena scritta**. Adottarlo intero era il doppio addebito: venti kWh
+erogati, trentadue fatturati.
+
+Il punto delicato è che lo **stesso frame** arriva in due situazioni diverse:
+
+* **il nodo è morto** (§6, il caso per cui il contratto prescrive l'adozione): non esiste
+  nessuna riga, nessuno ha contato quell'energia tranne la colonnina, e adottare il cumulativo
+  intero è giusto;
+* **il connettore è vivo e ha già scritto** (la grazia, il guasto): la riga c'è, e riadottare
+  il cumulativo la fattura una seconda volta.
+
+Non serve una bandiera per distinguerle, e infatti non ce n'è una. `#data.energy_billed` è il
+cumulativo che l'hardware riporterà la prossima volta, scritto da `settle/1` solo sulle due
+uscite che finiscono in `out_of_service` — le due che lasciano il cavo dentro. Un processo
+appena avviato ha il campo a `0.0`, quindi **dopo un riavvio del nodo l'offset è zero e
+l'adozione del contratto si comporta esattamente come prima**: la differenza fra i due casi è
+la memoria del processo, che è precisamente ciò che li distingue nella realtà.
+
+Tre dettagli che non sono decorazione:
+
+1. **Si porta avanti il cumulativo, non la fetta.** `carried/2` somma `energy_kwh +
+   energy_offset`, così due guasti di fila sullo stesso cavo sottraggono tutta la storia e non
+   solo l'ultimo tratto. Con la fetta soltanto, il terzo tratto sarebbe stato rifatturato.
+2. **L'offset vive nella sessione, non solo nel seme.** `#session.energy_offset` viene
+   sottratto da *ogni* lettura successiva — `meter` e `unplugged` — prima del `max` monotono.
+   Sottrarlo solo all'adozione avrebbe rimesso l'intero cumulativo nella riga finale.
+3. **Si decide una volta, all'adozione.** Se il cumulativo riportato è **almeno** quanto era
+   già stato fatturato, l'hardware sta ancora contando la stessa erogazione e l'offset vale. Se
+   riporta **meno**, il suo contatore è ripartito — un'altra auto, un riavvio del firmware, uno
+   scollegamento che non abbiamo visto — e un offset che si riferisce a un'erogazione conclusa
+   non significa niente: si butta e il payload si prende per quello che dice. Senza questo, i
+   2 kWh onesti di un'auto nuova sarebbero stati fatturati zero.
+
+L'offset viene consumato da **tutte e tre** le porte verso `charging` (`free`, `held`,
+`out_of_service`), non solo da quella di §6: il percorso `guasto → out_of_service →
+available → free → plugged` adotta da `free`, ed è un percorso reale.
+
+**Residuo dichiarato.** `stop_session` e `revoke` non portano avanti nessun offset, perché
+finiscono in `free` e la lettura è "alla macchina è stato detto di smettere". Con `cp.js` è
+vero — risponde al `stop` staccando — ma un hardware reale potrebbe tenere il cavo dentro e
+non azzerare il contatore. In quel caso un `plugged` successivo verrebbe adottato intero. Non
+è un difetto dimostrato e nessuna prova della review lo copre; è scritto qui perché sia una
+scelta e non una dimenticanza.
+
+### 14.3 `vs_station_db`: tre guasti, tre prezzi, tre risposte
+
+`flush/1` scrive la testa della coda e si ferma se la testa non passa, quindi **come** fallisce
+una scrittura decide se tutte le sessioni dietro si muovono. Prima ce n'era una sola risposta
+per due guasti diversi, ed è così che una riga sola incastrava la coda per sempre.
+
+* **La riga non si sa codificare** — `insert_params/1` solleva, perché manca un campo o non è
+  quello che la colonna prende. Non è partito niente e non partirà mai: la riga solleverà
+  uguale fra un'ora. Scartata subito, con il `logger:error` che ne è l'ultima copia. È valutata
+  **fuori** dalla `try` attorno alla query, così "non riesco a costruirla" e "non sono riuscito
+  a mandarla" smettono di essere lo stesso evento — che è esattamente l'errore che le teneva
+  insieme.
+* **Il server ha risposto un errore** — torna `{error, _}`. Un `server_reason()` viene scartato
+  come prima; qualunque altra forma viene contata sulla riga (`MAX_ROW_ATTEMPTS`, 5) e scartata
+  quando i tentativi sono finiti. Non si prova a indovinare quali codici MySQL siano
+  permanenti: la lista dipende dalla versione del server e sarebbe sbagliata il giorno dopo.
+  Cinque tentativi falliti sono la prova empirica.
+* **La scrittura non è partita** — la chiamata solleva. La connessione non c'è e la riga non è
+  mai arrivata. Riprovata per sempre e **non contata**: un'interruzione lunga non deve bruciare
+  i tentativi di righe che non hanno ancora avuto la loro occasione. Con `conn = undefined`
+  `flush/1` non arriva nemmeno a `write/4`, quindi un'interruzione normale non costa niente.
+
+Il contatore vive nella coda (`{Row, Attempts}`) ma **non esce di lì**: `queued_rows` risponde
+con le righe nude, perché quello che un test chiede è quali sessioni non sono scritte, mai
+quante volte ci si è provato.
+
+### 14.4 L'annuncio non è protetto insieme all'INSERT
+
+`announce/3` stava nel corpo dopo `of`, che in Erlang **non è coperto** dal `catch` della
+stessa `try`: è una regola del linguaggio, non una svista. Leggere l'id inserito è a sua volta
+una chiamata alla connessione, quindi una connessione che moriva fra l'INSERT riuscito e quella
+lettura faceva uscire l'eccezione dal gen_server, e il writer si portava dietro tutta la coda.
+
+I due guasti non valgono lo stesso: un annuncio perso costa **una ricevuta prezzata un minuto
+dopo** (B spazza `cost_cents IS NULL`), un writer morto costa **tutte le righe in coda**. La
+differenza di prezzo è il motivo per cui adesso hanno una rete per uno.

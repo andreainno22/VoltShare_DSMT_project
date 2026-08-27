@@ -1326,6 +1326,73 @@ che il coordinatore non possiede.
 
 ---
 
+## 7t. Lotto 1 delle correzioni della review — 27 agosto
+
+Una sessione di review su M2-A (`REVIEW_M2A_ESITO.md`) ha trovato nove difetti, ognuno con un
+test scritto per fallire. Quattro toccano quanto un driver paga, e sono questi. Gli altri cinque
+(D-3 oscillazione del taper, D-4 sessione senza `max_kw`, D-5 riga persa in silenzio, D-8
+prenotazione che trapela nello snapshot, D-9 novanta secondi che diventano centottanta) vanno nel
+lotto 2 e sono stati **lasciati stare apposta**: le loro cinque prove continuano a fallire, ed è
+il controllo che la correzione non ha effetti fuori dal suo perimetro.
+
+**Le due verifiche bloccanti, prima di scrivere una riga.** Baseline `rebar3 eunit` senza
+`--app`: 244 test, 0 fallimenti. Con le prove del revisore rimesse nell'albero: 254 con
+esattamente 10 fallimenti, quelli attesi. Se ne fosse fallito un numero diverso le prove non
+avrebbero più descritto il codice davanti a me, e correggere alla cieca è peggio che non
+correggere. (Piano e prompt dicevano «quattro passano, sei continuano a fallire»: sono cinque e
+cinque — D-1 ha due prove, il percorso della grazia e quello del guasto.)
+
+**D-1, l'energia fatturata due volte.** Il difetto peggiore, e quello con la diagnosi più
+interessante: lo *stesso* frame `plugged` arriva in due situazioni che non sono la stessa cosa.
+Se il nodo è morto non esiste nessuna riga e adottare il cumulativo intero è giusto — è §6 del
+contratto. Se invece il connettore è vivo e ha appena scritto una riga (grazia scaduta, guasto),
+quel cumulativo comprende energia già fatturata. Il connettore ora ricorda quanto ha appena
+scritto e lo sottrae; un processo appena avviato ha il campo a zero, quindi il caso del contratto
+resta identico senza un ramo dedicato. Dettagli in `scelte_di_progetto.md` §14.2 — in
+particolare perché si porta avanti il cumulativo e non la fetta, e perché un contatore ripartito
+fa buttare l'offset invece di applicarlo.
+
+**D-2, la riga scritta una frame troppo presto.** `stop_session` e `revoke` mandano un `stop`
+all'hardware e §5 dice che l'hardware riferisce il risultato — con l'`unplugged` che porta il
+totale vero. La riga veniva scritta prima, con l'ultimo `meter`: nove centesimi a sessione,
+sistematici. Ora `closing` ascolta per `CLOSING_SETTLE_MS` (2000) prima di scrivere, e un
+`unplugged` chiude l'attesa subito. Il percorso comune non paga niente perché la transizione
+posta l'evento in avanti invece di applicarlo da sé.
+
+**D-6 e D-7, la coda del writer.** `announce/3` stava nel corpo dopo `of` — che il `catch` della
+stessa `try` non copre, per regola del linguaggio — quindi un `insert_id/1` su una connessione
+appena morta uccideva il writer e con lui la coda intera. E ogni errore non riconosciuto
+diventava `retry`, quindi una riga che non sarebbe passata mai teneva ferme tutte quelle dietro.
+Ora i tre modi di fallire una scrittura sono distinti per quanto costano: non codificabile →
+scartata subito; il server ha detto no in un modo che non capiamo → cinque tentativi e poi
+scartata; non è partita → riprovata per sempre e non contata.
+
+**Un test esistente è stato corretto, e va detto.**
+`an_out_of_service_connector_adopts_a_reconnected_session_test` asseriva che la sessione adottata
+partisse da 12.3 kWh — cioè asseriva il doppio addebito come comportamento atteso. Ora asserisce
+0.0 e in più che le due righe sommate diano quello che è uscito dall'outlet, che è la proprietà
+per cui l'offset esiste. Un test che codifica un difetto non è una rete di sicurezza, è il
+difetto scritto due volte.
+
+Anche la prova D-2 del revisore è stata risequenziata: aspettava l'evento `session_closed`
+*fra* lo stop e l'`unplugged`, il che incorporava la tempistica del difetto (sotto
+scrittura-in-entrata l'evento partiva prima che l'hardware potesse rispondere). L'asserzione non
+è cambiata, e la prova risequenziata è stata rieseguita contro il connettore **non** corretto
+per controllare che fallisse ancora: fallisce.
+
+**Numeri.** Suite committabile 260 test, 0 fallimenti (244 di prima + 16 nuovi). Con le dieci
+prove del revisore: 270 con 5 fallimenti, tutti del lotto 2. End-to-end sui container
+ricostruiti, contro MySQL vero: venti kWh erogati attraverso un guasto e una riconnessione danno
+due righe da 12.000 e 8.000 — **venti**, non trentadue; e uno `stop_session` con l'`unplugged`
+subito dopo scrive **10.200**, il totale dell'hardware, non i 10.0 dell'ultimo `meter`.
+
+**Una cosa trovata per strada:** `station1` stava girando da cinque ore un'immagine anteriore al
+commit del passo 3, senza `vs_station_db` nell'albero di supervisione. Il revisore l'aveva
+dichiarato e aveva misurato solo su `station2`; entrambe sono state ricostruite prima delle
+misure di adesso, e i beam dei container hanno lo stesso md5 di `_build`. Vale la pena
+ricordarsene: `docker compose up -d` non ricostruisce, e un'immagine vecchia misura il codice
+sbagliato senza dirlo.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha

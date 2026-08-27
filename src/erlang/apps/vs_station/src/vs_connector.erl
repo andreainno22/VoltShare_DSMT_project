@@ -106,6 +106,14 @@
                   claim_id    :: binary() | undefined,
                   started_at  :: vs_time:epoch_ms(),
                   energy_kwh  = 0.0 :: float(),
+                  %% D-1. The charge point counts from *its* start and
+                  %% knows nothing about sessions ending (§4.3, §6), so a
+                  %% cable that was never unplugged keeps reporting totals
+                  %% that include energy already written to `sessions'.
+                  %% This is how much of every reading belongs to a row
+                  %% that exists already; it is subtracted before the
+                  %% monotone `max', never after.
+                  energy_offset = 0.0 :: float(),
                   power_kw    = 0.0 :: float(),
                   soc_pct     = 0   :: non_neg_integer(),
                   battery_kwh = 0.0 :: float(),
@@ -125,6 +133,15 @@
                cp          = undefined :: pid() | undefined,
                cp_mon      = undefined :: reference() | undefined,
                cp_grace_ms :: pos_integer(),
+               %% D-2: how long `closing' listens before it writes.
+               settle_ms   :: pos_integer(),
+               %% D-1: the cumulative the hardware will report next, if it
+               %% still has the cable. Set by `settle/1' on the two paths
+               %% that end a session without the cable coming out; read and
+               %% cleared by the next adoption, whichever door it uses.
+               %% Zero in a freshly started process, which is why a station
+               %% restart keeps the full adoption of §6 with no branch.
+               energy_billed = 0.0 :: float(),
                %% D4: `closing' is the one exit every ending session goes
                %% through, and it has two destinations. The default is the
                %% only one M1 knew; the fault paths set it for one trip and
@@ -230,7 +247,9 @@ init(Opts) ->
                  claim_mod  = maps:get(claim_mod, Opts, vs_claim_null),
                  db_mod     = maps:get(db_mod, Opts, vs_station_db),
                  notify_to  = maps:get(notify_to, Opts, undefined),
-                 cp_grace_ms = maps:get(cp_grace_ms, Opts, cp_grace_ms())},
+                 cp_grace_ms = maps:get(cp_grace_ms, Opts, cp_grace_ms()),
+                 settle_ms   = maps:get(closing_settle_ms, Opts,
+                                        closing_settle_ms())},
     %% Announce to whoever tracks connectors (vs_station_mgr). This runs
     %% at first boot AND at every supervisor restart, which is how the
     %% manager's registry heals after a crash without polling anyone. It
@@ -288,10 +307,11 @@ free({call, From}, {reserve, UserId, VehicleId}, Data) ->
 %% No claim is involved, which is also why a suspended account can still
 %% charge this way (SCOPE §3.3).
 free({call, From}, {plugged, Info}, Data) ->
-    Session = session_from(Info, undefined),
+    Session = adopt(Info, undefined, Data),
     logger:notice("connector ~p walk-in session for user ~p",
                   [Data#data.conn_id, Session#session.user_id]),
-    {next_state, charging, Data#data{session = Session}, [{reply, From, ok}]};
+    {next_state, charging, consumed(Data#data{session = Session}),
+     [{reply, From, ok}]};
 
 %% §4.3: "a meter for a connector with no session is dropped and logged".
 %% Logged and nothing else — no `notify', because a charge point sends one
@@ -366,10 +386,11 @@ held({call, From}, {plugged, Info}, Data = #data{hold = Hold}) ->
             %% payload names. The charge point identifies a vehicle (§4.2)
             %% and has no voice on the account: the person billed is the
             %% one the claim was granted to.
-            Session = session_from(Info#{user_id => Hold#hold.user_id},
-                                   Hold#hold.claim_id),
+            Session = adopt(Info#{user_id => Hold#hold.user_id},
+                            Hold#hold.claim_id, Data),
             notify(Data, {session_started, Hold#hold.user_id}),
-            {next_state, charging, Data#data{session = Session}, [{reply, From, ok}]};
+            {next_state, charging, consumed(Data#data{session = Session}),
+             [{reply, From, ok}]};
         false ->
             %% The reservation survives: someone else's car at the cable is
             %% not a reason to punish the holder.
@@ -440,13 +461,9 @@ charging(enter, _Old, Data = #data{session = S, rated_kw = Rated}) ->
     {keep_state, Data1};
 
 charging(cast, {meter, Reading}, Data = #data{session = S}) ->
-    %% Energy is cumulative and monotonic: a meter that resets on a
-    %% firmware glitch must not subtract energy already delivered
-    %% (ws-chargepoint.md §4.3).
-    Energy = max(S#session.energy_kwh, maps:get(energy_kwh, Reading, S#session.energy_kwh)),
-    S2 = S#session{energy_kwh = Energy,
-                   power_kw   = maps:get(power_kw, Reading, S#session.power_kw),
-                   soc_pct    = maps:get(soc_pct,  Reading, S#session.soc_pct)},
+    S2 = (apply_meter(Reading, S))#session{
+           power_kw = maps:get(power_kw, Reading, S#session.power_kw),
+           soc_pct  = maps:get(soc_pct,  Reading, S#session.soc_pct)},
     {keep_state, Data#data{session = S2}};
 
 %% §5: stored **and** forwarded. Stored because the page and the allocator
@@ -465,9 +482,12 @@ charging({call, From}, {stop_session, UserId}, Data = #data{session = #session{u
 charging({call, From}, {stop_session, _Other}, _Data) ->
     {keep_state_and_data, [{reply, From, {error, not_yours}}]};
 
-charging(cast, {unplugged, EnergyKwh}, Data = #data{session = S}) ->
-    Final = max(S#session.energy_kwh, EnergyKwh),
-    {next_state, closing, Data#data{session = S#session{energy_kwh = Final}}};
+%% The cable is out and the hardware has said its last word. The event is
+%% posted forward instead of being applied here: `closing' knows how to
+%% take a final total and settle on it at once, so there is one place that
+%% reads an `unplugged' rather than two that must agree.
+charging(cast, {unplugged, EnergyKwh}, Data) ->
+    {next_state, closing, Data, [{next_event, cast, {unplugged, EnergyKwh}}]};
 
 %% A revocation while charging still wins (claim.md §5.4). It is the rarest
 %% path in the system and the one most worth getting right: the contract
@@ -512,12 +532,64 @@ charging(EventType, Event, Data) ->
 %%% closing
 %%%===================================================================
 
-%% Everything that must happen exactly once when a session ends happens
-%% here, on entry: write the row, release the claim, tell whoever is
-%% listening. Then the connector leaves on a zero timeout, so the work is
-%% done in a state of its own rather than smeared across the transitions
-%% that can reach it.
-closing(enter, _Old, Data = #data{session = S}) ->
+%% Everything that must happen exactly once when a session ends still
+%% happens in one place — `settle/1' — but that place is now the way
+%% **out** of this state rather than the way in.
+%%
+%% D-2. The old shape wrote on entry, and on the two paths that get here
+%% by *telling the hardware to stop* (`stop_session', `revoke') that is a
+%% frame too early: §5 has the charge point apply the command and report
+%% back, and it reports back with the `unplugged' carrying the true total
+%% (cp.js answers `stop' with exactly that). The row was written from the
+%% last `meter' instead, losing up to METER_INTERVAL_S of energy — at
+%% 150 kW, a fifth of a kilowatt-hour off every driver-ended session.
+%%
+%% So `closing' listens for `settle_ms' before it writes. In that window a
+%% `meter' still counts and an `unplugged' ends the wait at once, because
+%% an `unplugged' is the hardware's last word and there is nothing further
+%% to wait for. Nothing else about the state changes: late casts are
+%% absorbed as before, calls still rebound `invalid_state', and
+%% `after_closing' still decides where the connector goes next.
+%%
+%% What it costs, stated rather than discovered: the outlet stays in
+%% `closing' up to `settle_ms' longer, the claim is released that much
+%% later (its lease is minutes, so nothing notices), and the allocation
+%% this session held returns to the pool only at the settle. A connector
+%% reached by an `unplugged' — the common ending — pays none of it: the
+%% transition posts the event forward and the window closes immediately.
+closing(enter, _Old, Data) ->
+    {keep_state, Data, [{state_timeout, Data#data.settle_ms, settle}]};
+
+%% The hardware has finished talking. Take the total and write.
+closing(cast, {unplugged, EnergyKwh}, Data = #data{session = S}) ->
+    settle(Data#data{session = final_energy(EnergyKwh, S)});
+
+%% Still talking. A reading that arrives between the `stop' command and
+%% the `unplugged' is energy that was really delivered, and the monotone
+%% `max' of §4.3 applies here exactly as it does in `charging'.
+closing(cast, {meter, Reading}, Data = #data{session = S}) ->
+    {keep_state, Data#data{session = apply_meter(Reading, S)}};
+
+%% Nothing more came. Write what we measured — which is what §3.2 asks for
+%% on the fault paths anyway: "closed with the energy last reported".
+closing(state_timeout, settle, Data) ->
+    settle(Data);
+
+%% Late events from a charge point that is one step behind are expected
+%% here, not exceptional: absorb them.
+closing(cast, _Ignored, _Data) ->
+    keep_state_and_data;
+
+closing(EventType, Event, Data) ->
+    handle_common(EventType, Event, closing, Data).
+
+%% The one place a session becomes a row.
+%%
+%% D4: where `closing' lets out. `free' for every path M1 knew; the fault
+%% paths of §3.2 and §4.1 ask for `out_of_service' instead. The field is
+%% put back in the same step it is read, so the *next* session to end here
+%% leaves the normal way — a one-trip flag, not a mode.
+settle(Data = #data{session = S, after_closing = Next}) ->
     EndedAt = vs_time:now_ms(),
     Row = #{user_id      => S#session.user_id,
             station_id   => Data#data.station_id,
@@ -537,22 +609,22 @@ closing(enter, _Old, Data = #data{session = S}) ->
     ok = (Data#data.db_mod):insert_session(Row),
     release(Data, completed),
     notify(Data, {session_closed, Row}),
-    {keep_state, Data, [{state_timeout, 0, done}]};
+    {next_state, Next, Data#data{after_closing = free,
+                                 energy_billed = carried(Next, S)}}.
 
-%% D4: where `closing' lets out. `free' for every path M1 knew; the fault
-%% paths of §3.2 and §4.1 ask for `out_of_service' instead. The field is
-%% put back in the same step it is read, so the *next* session to end here
-%% leaves the normal way — a one-trip flag, not a mode.
-closing(state_timeout, done, Data = #data{after_closing = Next}) ->
-    {next_state, Next, Data#data{after_closing = free}};
-
-%% Late events from a charge point that is one step behind are expected
-%% here, not exceptional: absorb them.
-closing(cast, _Ignored, _Data) ->
-    keep_state_and_data;
-
-closing(EventType, Event, Data) ->
-    handle_common(EventType, Event, closing, Data).
+%% D-1. `out_of_service' is reached by the two endings that leave the cable
+%% in the car — the fault of §4.1 and the grace of §3.2 — and neither of
+%% them tells the charge point to forget anything. It goes on counting from
+%% its own start, so the `plugged' that re-announces the cable (§6.2) will
+%% carry a cumulative that includes the row just written. What is
+%% remembered is that cumulative, not this session's share of it: chained
+%% faults on one cable then subtract the whole history, not the last slice.
+%%
+%% Every other ending has been told the cable is out, and carries nothing.
+carried(out_of_service, #session{energy_kwh = Kwh, energy_offset = Offset}) ->
+    Kwh + Offset;
+carried(free, _Session) ->
+    0.0.
 
 %%%===================================================================
 %%% out_of_service
@@ -600,12 +672,14 @@ out_of_service(cast, {cp_status, _Status}, _Data) ->
 %% deliberately not attempted — "the car keeps charging, the session is
 %% billed, the reservation is gone".
 out_of_service({call, From}, {plugged, Info}, Data) ->
-    Session = session_from(Info, undefined),
+    Session = adopt(Info, undefined, Data),
     logger:notice("connector ~p: adopting a session from reconnected hardware "
-                  "for user ~p (~p kWh already counted)",
+                  "for user ~p (~p kWh already counted, ~p kWh already billed "
+                  "and taken off)",
                   [Data#data.conn_id, Session#session.user_id,
-                   Session#session.energy_kwh]),
-    {next_state, charging, Data#data{session = Session}, [{reply, From, ok}]};
+                   Session#session.energy_kwh, Session#session.energy_offset]),
+    {next_state, charging, consumed(Data#data{session = Session}),
+     [{reply, From, ok}]};
 
 out_of_service(cast, {meter, Reading}, Data) ->
     logger:warning("connector ~p: meter for a connector with no session "
@@ -718,12 +792,60 @@ reported_state(charging, #session{limit_kw = Limit}) when Limit =:= +0.0 ->
 reported_state(State, _Session) ->
     State.
 
+%% The three doorways into `charging' all go through these two, so the
+%% offset is applied and cleared in one place rather than three. Splitting
+%% them keeps the clearing visible at the call site: an adoption *consumes*
+%% what a previous session left behind, whichever door it came through.
+adopt(Info, ClaimId, #data{energy_billed = Billed}) ->
+    session_from(Info, ClaimId, Billed).
+
+consumed(Data) ->
+    Data#data{energy_billed = 0.0}.
+
+%% §4.3 — every figure the charge point sends is cumulative since *its*
+%% start. `energy_offset' is how much of that has already been written to
+%% `sessions' by an earlier session on the same cable; the subtraction
+%% comes first, the monotone `max' of §4.3 second. The `max(0.0, ...)'
+%% costs nothing when the offset is zero, which is every ordinary session.
+delivered(Reported, #session{energy_offset = Offset}) ->
+    max(0.0, float(Reported) - Offset).
+
+%% A `meter' reading applied to a session. A payload with no `energy_kwh'
+%% changes nothing rather than reading as zero.
+apply_meter(Reading, S) ->
+    case maps:get(energy_kwh, Reading, undefined) of
+        undefined -> S;
+        Reported  -> S#session{energy_kwh = max(S#session.energy_kwh,
+                                                delivered(Reported, S))}
+    end.
+
+%% The total on an `unplugged' — same arithmetic, said once for the one
+%% caller that has a bare number rather than a reading map.
+final_energy(Reported, S) ->
+    S#session{energy_kwh = max(S#session.energy_kwh, delivered(Reported, S))}.
+
 %% §6 — reconciliation. `energy_kwh' is seeded from the payload because a
 %% charge point that reconnects after a station restart reports the total
 %% it has counted, and it is the only side that counted it. The default is
 %% 0.0, so every caller that never heard of reconciliation — the tests,
 %% the walk-in path — behaves exactly as before.
-session_from(Info, ClaimId) ->
+%%
+%% D-1 — the same frame arrives in two situations and they are not the
+%% same session. If the reported cumulative is at least what a previous
+%% session on this cable was already billed for, the hardware is still
+%% counting the same physical delivery: the offset applies and this
+%% session starts from the difference. If it reports **less**, its counter
+%% has restarted — a different car, a firmware reset, a real unplug we
+%% never saw — and an offset from a delivery that is over means nothing:
+%% it is dropped and the payload is taken at face value. Deciding it once,
+%% here, is what keeps a later `unplugged' from having to guess.
+session_from(Info, ClaimId, Offset) ->
+    Reported = float(maps:get(energy_kwh, Info, 0.0)),
+    {Offset1, Energy} =
+        case Offset > 0.0 andalso Reported >= Offset of
+            true  -> {Offset, Reported - Offset};
+            false -> {0.0, Reported}
+        end,
     #session{user_id     = maps:get(user_id, Info),
              vehicle_id  = maps:get(vehicle_id, Info),
              claim_id    = ClaimId,
@@ -731,7 +853,8 @@ session_from(Info, ClaimId) ->
              %% no memory of what happened before the crash, and §6 makes
              %% the meter total the thing that is billed, not the duration.
              started_at  = vs_time:now_ms(),
-             energy_kwh  = float(maps:get(energy_kwh, Info, 0.0)),
+             energy_kwh  = Energy,
+             energy_offset = Offset1,
              soc_pct     = maps:get(soc_pct, Info, 0),
              battery_kwh = maps:get(battery_kwh, Info, 0.0),
              max_kw      = maps:get(max_kw, Info, 0)}.
@@ -820,3 +943,13 @@ notify(#data{notify_to = To, conn_id = ConnId}, Event) ->
 cp_grace_ms() ->
     vs_env:get_int("CP_HEARTBEAT_MISSED", 3)
         * vs_env:get_int("CP_HEARTBEAT_INTERVAL_S", 30) * 1000.
+
+%% D-2 — how long `closing' waits for the charge point's last word before
+%% writing the row without it. §5 gives the equipment `LIMIT_APPLY_SECONDS'
+%% to honour a limit and says it "reflects the result" of a command; two
+%% seconds is the same order of magnitude and well inside the five of
+%% `METER_INTERVAL_S', so a session never waits for a meter tick it was
+%% not going to get. A charge point that is simply gone costs exactly this
+%% much and nothing more.
+closing_settle_ms() ->
+    vs_env:get_int("CLOSING_SETTLE_MS", 2000).

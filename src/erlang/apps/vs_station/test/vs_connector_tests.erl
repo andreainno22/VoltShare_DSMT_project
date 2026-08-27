@@ -28,6 +28,13 @@ start_connector(Extra) ->
                         lease_seconds => 900,
                         claim_mod     => vs_claim_stub,
                         db_mod        => vs_db_stub,
+                        %% M2 fix 1 (D-2): `closing' now waits for the charge
+                        %% point's last word before writing. Two seconds is
+                        %% right in production and dead time here, so the
+                        %% fixture shortens it exactly as it shortens
+                        %% `cp_grace_ms' -- the behaviour under test is what
+                        %% gets written, never how long the wait is.
+                        closing_settle_ms => 100,
                         notify_to     => self()}, Extra),
     {ok, Pid} = vs_connector:start_link(Opts),
     Pid.
@@ -745,7 +752,231 @@ an_out_of_service_connector_adopts_a_reconnected_session_test() ->
                                          max_kw => 150, energy_kwh => 12.3}),
         ?assertEqual(charging, state_of(Pid)),
         Session = maps:get(session, vs_connector:snapshot(Pid)),
-        ?assertEqual(12.3, maps:get(energy_kwh, Session)),
-        %% and the car is un-suspended by the same route as any other start
+        %% M2 fix 1 (D-1). This assertion used to read 12.3 -- the whole
+        %% cumulative, seeded straight from the payload -- and that was the
+        %% double-billing: those 12.3 kWh are already in the row the grace
+        %% wrote a moment ago, and counting them again put them on a second
+        %% invoice. The adopted session starts at nothing delivered *since*
+        %% that row, and the hardware's total is reached again only when the
+        %% car has actually taken more.
+        ?assertEqual(0.0, maps:get(energy_kwh, Session)),
+        %% ...and the two rows together add up to what left the outlet,
+        %% which is the property the whole offset exists for.
+        vs_connector:unplugged(Pid, 20.0),
+        wait_until(fun() -> length(vs_db_stub:rows()) =:= 2 end),
+        ?assertEqual(20.0, lists:sum([maps:get(energy_kwh, R)
+                                      || R <- vs_db_stub:rows()])),
+        %% and the car was un-suspended by the same route as any other start
         ?assertEqual(#{command => set_limit, limit_kw => 150.0}, expect_cmd(Cp2))
+    end).
+
+%%%===================================================================
+%%% M2 fix 1 (D-2) — the row is written when the hardware has finished
+%%%                  talking, not when the station stops listening
+%%%===================================================================
+
+plug_with(Pid, EnergyKwh) ->
+    vs_connector:plugged(Pid, #{user_id => ?USER, vehicle_id => ?VEHICLE,
+                                soc_pct => 22, battery_kwh => 58.0,
+                                max_kw => 150, energy_kwh => EnergyKwh}).
+
+billed() -> lists:sum([maps:get(energy_kwh, R) || R <- vs_db_stub:rows()]).
+
+%% §5: the charge point applies the `stop' and reports the result, and
+%% cp.js reports it as the `unplugged' carrying the true total. Writing on
+%% entry to `closing' put the row in one frame too early and billed the
+%% last `meter' instead — up to METER_INTERVAL_S of energy given away on
+%% every session a driver ends.
+a_driver_stop_bills_the_total_the_hardware_reports_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 10.0, power_kw => 150.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:unplugged(Pid, 10.2),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(10.2, maps:get(energy_kwh, Row))
+    end).
+
+%% The same for a revocation, which is the other ending that starts by
+%% telling the hardware to stop.
+a_revocation_bills_the_total_the_hardware_reports_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = vs_claim_stub:last_claim_id(),
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 4.0, power_kw => 100.0}),
+        vs_connector:revoke(Pid, ClaimId),
+        vs_connector:unplugged(Pid, 4.4),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(4.4, maps:get(energy_kwh, Row))
+    end).
+
+%% A reading that arrives inside the window is energy that was really
+%% delivered, and the monotone `max' of §4.3 applies here as it does in
+%% `charging'.
+a_meter_inside_the_window_still_counts_test() ->
+    with_connector(#{closing_settle_ms => 400}, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 5.0, power_kw => 150.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:meter(Pid, #{energy_kwh => 5.4, power_kw => 30.0}),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(5.4, maps:get(energy_kwh, Row))
+    end).
+
+%% Nobody answers — the charge point is gone, or simply says nothing. The
+%% window expires and the row is written with what was measured, which is
+%% what §3.2 asks for anyway.
+a_silent_charge_point_settles_at_the_deadline_test() ->
+    with_connector(#{closing_settle_ms => 120}, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 8.0, power_kw => 50.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        ?assertEqual([], vs_db_stub:rows()),      %% not yet
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        ?assertEqual(free, state_of(Pid)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(8.0, maps:get(energy_kwh, Row))
+    end).
+
+%% The common ending pays none of the wait: an `unplugged' is the last
+%% word, so the window closes on arrival rather than on the clock. With a
+%% five second window the row is still there in a fraction of it.
+an_unplugged_does_not_wait_for_the_window_test() ->
+    with_connector(#{closing_settle_ms => 5000}, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        {Micros, _} = timer:tc(fun() ->
+                          vs_connector:unplugged(Pid, 12.0),
+                          wait_until(fun() -> state_of(Pid) =:= free end)
+                      end),
+        ?assert(Micros < 1000000),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(12.0, maps:get(energy_kwh, Row))
+    end).
+
+%%%===================================================================
+%%% M2 fix 1 (D-1) — energy already written to a row is never written
+%%%                  to a second one
+%%%===================================================================
+
+%% The other door onto the same defect. A fault closes the session, the
+%% hardware says `available' again, the connector goes back to `free', and
+%% the cable that never came out is re-announced as a walk-in. The offset
+%% has to survive `out_of_service' AND `free' to be there when it is read.
+a_fault_then_a_replug_through_free_bills_each_kwh_once_test() ->
+    with_connector(fun(Pid) ->
+        Cp = fake_cp(),
+        ok = vs_connector:attach_cp(Pid, Cp),
+        ok = plug_with(Pid, 0.0),
+        vs_connector:meter(Pid, #{energy_kwh => 9.0, power_kw => 40.0}),
+        vs_connector:cp_status(Pid, faulted),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        ?assertEqual(out_of_service, state_of(Pid)),
+
+        vs_connector:cp_status(Pid, available),
+        wait_until(fun() -> state_of(Pid) =:= free end),
+        ok = plug_with(Pid, 9.0),                 %% same cable, same counter
+        vs_connector:unplugged(Pid, 15.0),
+        wait_until(fun() -> length(vs_db_stub:rows()) =:= 2 end),
+        ?assertEqual([9.0, 6.0], [maps:get(energy_kwh, R) || R <- vs_db_stub:rows()]),
+        ?assertEqual(15.0, billed())
+    end).
+
+%% Two faults on one cable. What is carried forward is the cumulative the
+%% hardware will report, not this session's share of it, so the second
+%% offset subtracts the whole history rather than the last slice.
+two_faults_on_one_cable_still_bill_each_kwh_once_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug_with(Pid, 0.0),
+        vs_connector:meter(Pid, #{energy_kwh => 5.0}),
+        vs_connector:cp_status(Pid, faulted),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+
+        ok = plug_with(Pid, 5.0),
+        vs_connector:meter(Pid, #{energy_kwh => 12.0}),
+        vs_connector:cp_status(Pid, faulted),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+
+        ok = plug_with(Pid, 12.0),
+        vs_connector:unplugged(Pid, 20.0),
+        wait_until(fun() -> length(vs_db_stub:rows()) =:= 3 end),
+        ?assertEqual([5.0, 7.0, 8.0], [maps:get(energy_kwh, R) || R <- vs_db_stub:rows()]),
+        ?assertEqual(20.0, billed())
+    end).
+
+%% The offset is only meaningful while the hardware is counting the same
+%% delivery. A charge point that comes back reporting LESS than what was
+%% already billed has restarted its counter — a different car, a firmware
+%% reset, an unplug we never saw — and the payload is taken at face value.
+%% Without this the honest 2 kWh of a new car would be billed as nothing.
+a_restarted_counter_drops_the_offset_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug_with(Pid, 0.0),
+        vs_connector:meter(Pid, #{energy_kwh => 4.0}),
+        vs_connector:cp_status(Pid, faulted),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+
+        vs_connector:cp_status(Pid, available),
+        wait_until(fun() -> state_of(Pid) =:= free end),
+        ok = plug_with(Pid, 0.0),                 %% a fresh counter
+        Session = maps:get(session, vs_connector:snapshot(Pid)),
+        ?assertEqual(0.0, maps:get(energy_kwh, Session)),
+        vs_connector:unplugged(Pid, 2.0),
+        wait_until(fun() -> length(vs_db_stub:rows()) =:= 2 end),
+        ?assertEqual([4.0, 2.0], [maps:get(energy_kwh, R) || R <- vs_db_stub:rows()])
+    end).
+
+%% §6 as the contract writes it — the station restarted, so this process
+%% has no memory and no offset. Nothing changes for that case, which is
+%% the point of keeping the offset in the process rather than in a flag.
+a_fresh_connector_adopts_the_full_cumulative_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug_with(Pid, 31.5),
+        Session = maps:get(session, vs_connector:snapshot(Pid)),
+        ?assertEqual(31.5, maps:get(energy_kwh, Session)),
+        vs_connector:unplugged(Pid, 33.0),
+        wait_until(fun() -> vs_db_stub:rows() =/= [] end),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(33.0, maps:get(energy_kwh, Row))
+    end).
+
+%% And an ending that DOES take the cable out carries nothing forward: the
+%% next car on that outlet starts from its own zero.
+an_unplugged_carries_no_offset_to_the_next_car_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug_with(Pid, 0.0),
+        vs_connector:unplugged(Pid, 7.0),
+        wait_until(fun() -> vs_db_stub:rows() =/= [] end),
+        ok = plug_with(Pid, 0.0),
+        vs_connector:meter(Pid, #{energy_kwh => 3.0}),
+        vs_connector:unplugged(Pid, 3.0),
+        wait_until(fun() -> length(vs_db_stub:rows()) =:= 2 end),
+        ?assertEqual([7.0, 3.0], [maps:get(energy_kwh, R) || R <- vs_db_stub:rows()])
+    end).
+
+%% The third doorway. The offset is consumed by every adoption, not only
+%% by the two the review exercised: after a fault the outlet goes back to
+%% `free' and can be *reserved* before the cable is re-announced, so the
+%% session opens from `held'. Same helpers, same subtraction — and this is
+%% the path no proof of the review covers.
+a_reserved_replug_after_a_fault_bills_each_kwh_once_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug_with(Pid, 0.0),
+        vs_connector:meter(Pid, #{energy_kwh => 6.0}),
+        vs_connector:cp_status(Pid, faulted),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+
+        vs_connector:cp_status(Pid, available),
+        wait_until(fun() -> state_of(Pid) =:= free end),
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertEqual(held, state_of(Pid)),
+        ok = plug_with(Pid, 6.0),                 %% the cable never came out
+        ?assertEqual(charging, state_of(Pid)),
+        vs_connector:unplugged(Pid, 10.0),
+        wait_until(fun() -> length(vs_db_stub:rows()) =:= 2 end),
+        ?assertEqual([6.0, 4.0], [maps:get(energy_kwh, R) || R <- vs_db_stub:rows()]),
+        ?assertEqual(10.0, billed())
     end).

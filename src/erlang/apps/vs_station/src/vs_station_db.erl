@@ -61,6 +61,44 @@
 %%% over an idempotent write**, which is how effectively-once behaviour is
 %%% obtained without an exactly-once channel.
 %%%
+%%% ## Three failures, three prices, three answers
+%%%
+%%% `flush/1' writes the head and stops if the head cannot be written, so
+%%% *how* a write fails decides whether every session behind it moves.
+%%% Lumping the three together is how the queue used to wedge on one bad
+%%% row, and it is why they are now told apart before anything else:
+%%%
+%%%   * **the row cannot be encoded** — `insert_params/1' raises, because
+%%%     a field is missing or is not what the column takes. Nothing was
+%%%     sent, nothing ever will be: the row will raise again in an hour.
+%%%     Dropped at once, with the `logger:error' that is its last copy.
+%%%     Evaluated **outside** the `try' around the query, so that "we
+%%%     cannot build this" and "we could not send it" stop being the same
+%%%     event.
+%%%   * **the server answered an error** — `{error, _}' comes back. The
+%%%     row reached MySQL and MySQL said no. A `server_reason()' is
+%%%     dropped as before; anything else is counted against the row
+%%%     (`MAX_ROW_ATTEMPTS') and dropped once the count is spent. No
+%%%     attempt is made to decide which MySQL codes are permanent: that
+%%%     list depends on the server version and would be wrong the day
+%%%     after. Five failed attempts are the empirical proof.
+%%%   * **the write could not be sent** — the call raises. The connection
+%%%     is gone and the row never left. Retried for ever, and **not
+%%%     counted**: an outage must not spend the attempts of rows that
+%%%     never had their turn. `flush/1' does not even reach `write/3'
+%%%     while `conn' is `undefined', so a plain outage costs nothing.
+%%%
+%%% ## The announcement is not protected together with the INSERT
+%%%
+%%% `announce/3' used to sit in the body after `of', which in Erlang is
+%%% **not** covered by that `try''s `catch' — a rule of the language, not
+%%% an oversight. An `insert_id/1' on a connection that has just died, or
+%%% anything raising on the way to the claim client, therefore left the
+%%% gen_server and took the whole queue with it. The two failures are not
+%%% worth the same: a lost announcement costs one receipt priced a minute
+%%% late (B sweeps `cost_cents IS NULL'), a dead writer costs every row
+%%% still queued. They get one net each.
+%%%
 %%% ## Times: epoch milliseconds in, DATETIME out, UTC in between
 %%%
 %%% `sessions.started_at'/`ended_at' are `DATETIME' and the connector
@@ -110,11 +148,18 @@
 
 -define(VEHICLE_SQL, "SELECT user_id FROM vehicles WHERE id = ?").
 
+%% How many times the server may answer an error we do not recognise
+%% before the row is given up on. Per row, never per queue.
+-define(MAX_ROW_ATTEMPTS, 5).
+
 -record(state, {conn      = undefined :: pid() | undefined,
                 conn_opts            :: list(),
                 %% oldest first: the head is the next row to write, and the
-                %% head is also what the cap drops
-                queue     = []        :: [map()],
+                %% head is also what the cap drops. Each entry carries the
+                %% number of times the *server* has refused it in a way we
+                %% could not classify; `queued_rows' unwraps it, so the
+                %% counter is invisible outside this module.
+                queue     = []        :: [{map(), non_neg_integer()}],
                 retry     = undefined :: reference() | undefined,
                 retry_ms              :: pos_integer(),
                 queue_max             :: pos_integer(),
@@ -258,8 +303,10 @@ handle_call({user_for_vehicle, VehicleId}, _From,
 %% from a test file works until somebody adds a field in the middle, and
 %% then fails somewhere unrelated; two named questions cost nothing and
 %% say what the tests are actually asking about.
+%% The rows, without the attempt counter: what a test asks about is which
+%% sessions are still unwritten, never how often they have been tried.
 handle_call(queued_rows, _From, State) ->
-    {reply, State#state.queue, State};
+    {reply, [Row || {Row, _Attempts} <- State#state.queue], State};
 
 handle_call(connection, _From, State) ->
     {reply, State#state.conn, State};
@@ -311,9 +358,9 @@ terminate(_Reason, #state{queue = Queue}) ->
 %% long outage the recent sessions are the ones still worth saving, and
 %% the log line is the last copy of the one being dropped.
 enqueue(Row, State = #state{queue = Queue, queue_max = Max}) ->
-    case Queue ++ [Row] of
+    case Queue ++ [{Row, 0}] of
         Full when length(Full) > Max ->
-            [Dropped | Kept] = Full,
+            [{Dropped, _} | Kept] = Full,
             logger:error("station db: queue full at ~p rows, dropping the oldest "
                          "unwritten session (this line is its last copy): ~p",
                          [Max, Dropped]),
@@ -335,43 +382,99 @@ flush(State = #state{conn = undefined}) ->
     schedule_retry(State);
 flush(State = #state{queue = []}) ->
     cancel_retry(State);
-flush(State = #state{conn = Conn, queue = [Row | Rest]}) ->
-    case write(Conn, Row, State) of
+flush(State = #state{conn = Conn, queue = [{Row, Attempts} | Rest]}) ->
+    case write(Conn, Row, Attempts, State) of
         ok ->
             flush(State#state{queue = Rest});
         refused ->
-            %% The server answered and said no — a foreign key that does
-            %% not resolve, a value out of range. Retrying forever would
-            %% wedge every session behind this one, so the row is dropped
-            %% here and the log keeps it.
+            %% The row is not going in — the server said no, or it cannot
+            %% be built at all. Retrying forever would wedge every session
+            %% behind this one, so it is dropped here and the log keeps it.
             flush(State#state{queue = Rest});
-        retry ->
-            schedule_retry(State)
+        {retry, Attempts1} ->
+            %% Back at the head, with whatever the attempt cost it. The
+            %% queue does not move until this row does or gives up.
+            schedule_retry(State#state{queue = [{Row, Attempts1} | Rest]})
     end.
 
-%% Two failures that look alike and are not. A reply from the server means
-%% the row is wrong and will be wrong next time too; an exception means the
-%% connection is gone and the row never got there.
-write(Conn, Row, #state{query_timeout_ms = Timeout, sql_mod = Sql,
-                        claim_mod = ClaimMod}) ->
-    try Sql:query(Conn, ?INSERT_SQL, insert_params(Row), Timeout) of
+%% Three failures that look alike and are not — see the module doc.
+write(Conn, Row, Attempts, #state{query_timeout_ms = Timeout, sql_mod = Sql,
+                                  claim_mod = ClaimMod}) ->
+    case params(Row) of
+        {ok, Params} ->
+            send(Conn, Row, Params, Attempts, Timeout, Sql, ClaimMod);
+        error ->
+            refused
+    end.
+
+%% Building the parameters is not talking to the database, and must not be
+%% mistaken for it: a row that cannot be encoded is dropped, not retried.
+params(Row) ->
+    try {ok, insert_params(Row)}
+    catch Class:Reason ->
+            logger:error("station db: a session row cannot be turned into "
+                         "INSERT parameters (~p:~p), dropping it (this line is "
+                         "its last copy): ~p", [Class, Reason, Row]),
+            error
+    end.
+
+send(Conn, Row, Params, Attempts, Timeout, Sql, ClaimMod) ->
+    Result = try Sql:query(Conn, ?INSERT_SQL, Params, Timeout)
+             catch
+                 SendClass:SendReason ->
+                     %% The connection is gone and the row never got there.
+                     %% Not counted: an outage must not spend the attempts
+                     %% of a row that never had its turn.
+                     logger:warning("station db: INSERT could not be sent "
+                                    "(~p:~p), will retry",
+                                    [SendClass, SendReason]),
+                     not_sent
+             end,
+    case Result of
         ok ->
-            announce(Sql:insert_id(Conn), Row, ClaimMod),
+            %% Out of the try on purpose: the row is already safe, and the
+            %% announcement must never be able to take the writer down
+            %% with it (module doc).
+            announce(Sql, Conn, Row, ClaimMod),
             ok;
+        not_sent ->
+            {retry, Attempts};
         {error, {Code, SqlState, Msg}} ->
             logger:error("station db: MySQL refused a session row "
                          "(~p ~s ~s), dropping it: ~p",
                          [Code, SqlState, Msg, Row]),
             refused;
+        {error, Reason} when Attempts + 1 >= ?MAX_ROW_ATTEMPTS ->
+            logger:error("station db: INSERT failed ~p times (~p), giving up on "
+                         "this row so the queue can move (this line is its last "
+                         "copy): ~p", [Attempts + 1, Reason, Row]),
+            refused;
         {error, Reason} ->
-            logger:warning("station db: INSERT failed (~p), will retry", [Reason]),
-            retry
-    catch
-        Class:Reason ->
-            logger:warning("station db: INSERT could not be sent (~p:~p), "
-                           "will retry", [Class, Reason]),
-            retry
+            logger:warning("station db: INSERT failed (~p), will retry "
+                           "(attempt ~p of ~p)",
+                           [Reason, Attempts + 1, ?MAX_ROW_ATTEMPTS]),
+            {retry, Attempts + 1};
+        Other ->
+            %% A shape this code does not know. Treated like any other
+            %% answer from the server: counted, not retried for ever.
+            logger:warning("station db: unexpected INSERT result ~p, will retry "
+                           "(attempt ~p of ~p)",
+                           [Other, Attempts + 1, ?MAX_ROW_ATTEMPTS]),
+            {retry, Attempts + 1}
     end.
+
+%% Reading the insert id is itself a call to the connection, so it lives
+%% inside the announcement's own net rather than the INSERT's: if it
+%% raises, the row is still written and only the wake-up is lost.
+announce(Sql, Conn, Row, ClaimMod) ->
+    try announce(Sql:insert_id(Conn), Row, ClaimMod)
+    catch Class:Reason ->
+            logger:warning("station db: a session row was written but the back "
+                           "office wake-up did not leave (~p:~p); the sweep "
+                           "will price it within the minute: ~p",
+                           [Class, Reason, Row])
+    end,
+    ok.
 
 %% After the INSERT, never before: the id the event carries does not exist
 %% until the row does.

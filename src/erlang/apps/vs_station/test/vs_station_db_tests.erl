@@ -371,3 +371,111 @@ the_vehicle_lookup_is_an_error_when_the_writer_is_gone_test() ->
              catch Class:Reason -> {error, {Class, Reason}}
              end,
     ?assertMatch({error, {exit, _}}, Result).
+
+%%%===================================================================
+%%% M2 fix 1 (D-6) — the announcement has its own net
+%%%===================================================================
+
+%% `announce/3' used to sit in the body after `of', which the `try' around
+%% the INSERT does not cover. Reading the insert id is itself a call to the
+%% connection, so a connection that dies between a successful INSERT and
+%% that read used to kill the writer — and the writer takes the queue with
+%% it. The row is safe by then; only the wake-up is worth losing.
+a_failing_insert_id_does_not_kill_the_writer_test() ->
+    vs_sql_stub:reset(),
+    with_db(#{}, fun(Pid) ->
+        vs_sql_stub:set_insert_id(raise),
+        vs_station_db:insert_session(?ROW),
+        wait_until(fun() -> inserts() =/= [] end),
+        %% the row went in...
+        ?assertEqual(1, length(inserts())),
+        %% ...the wake-up did not, and nobody died for it
+        ?assertEqual([], events()),
+        ?assert(erlang:is_process_alive(Pid)),
+        ?assertEqual(0, queued(Pid))
+    end).
+
+%% The same guarantee for everything behind the announcement: three rows
+%% queued, the first one's announcement blowing up, and the other two are
+%% still written.
+a_failing_announcement_does_not_take_the_queue_down_test() ->
+    vs_sql_stub:reset(),
+    vs_sql_stub:set_connect(refuse),
+    with_db(#{}, fun(Pid) ->
+        [vs_station_db:insert_session((?ROW)#{connector_id => N}) || N <- [5, 6, 7]],
+        wait_until(fun() -> queued(Pid) =:= 3 end),
+        vs_sql_stub:set_insert_id(raise),
+        vs_sql_stub:set_connect(ok),
+        wait_until(fun() -> queued(Pid) =:= 0 end),
+        ?assert(erlang:is_process_alive(Pid)),
+        ?assertEqual([5, 6, 7], [lists:nth(3, P) || P <- inserts()])
+    end).
+
+%%%===================================================================
+%%% M2 fix 1 (D-7) — one bad row does not wedge the ones behind it
+%%%===================================================================
+
+%% A row that cannot be turned into parameters is not a transport failure,
+%% and treating it as one is what used to stop the queue for ever: the
+%% badarg came out of `insert_params/1' inside the same `try' as the query,
+%% was read as "the row never got there", and went back to the head.
+a_row_that_cannot_be_encoded_is_dropped_and_the_queue_moves_test() ->
+    vs_sql_stub:reset(),
+    with_db(#{}, fun(Pid) ->
+        vs_station_db:insert_session((?ROW)#{started_at => undefined}),
+        vs_station_db:insert_session((?ROW)#{connector_id => 6}),
+        vs_station_db:insert_session((?ROW)#{connector_id => 7}),
+        wait_until(fun() -> queued(Pid) =:= 0 end),
+        %% the poison row never reached MySQL and the good ones did
+        ?assertEqual([6, 7], [lists:nth(3, P) || P <- inserts()]),
+        ?assertEqual(2, length(events()))
+    end).
+
+%% An error the code cannot classify is counted, not retried for ever.
+%% Five attempts are the empirical proof that the row does not go in; no
+%% list of MySQL codes is consulted, because that list changes with the
+%% server version.
+an_unclassified_server_error_gives_up_after_the_attempts_test() ->
+    vs_sql_stub:reset(),
+    vs_sql_stub:set_mode(odd),                 %% {error, timeout}: not a server_reason()
+    with_db(#{retry_ms => 10}, fun(Pid) ->
+        vs_station_db:insert_session((?ROW)#{connector_id => 5}),
+        wait_until(fun() -> queued(Pid) =:= 0 end),
+        ?assertEqual(5, length(inserts())),    %% MAX_ROW_ATTEMPTS
+        ?assertEqual([], events()),
+        %% and the queue is free again for the next session
+        vs_sql_stub:set_mode(ok),
+        vs_station_db:insert_session((?ROW)#{connector_id => 6}),
+        wait_until(fun() -> events() =/= [] end),
+        ?assertEqual(1, length(events()))
+    end).
+
+%% ...but a failure to *send* is not counted at all. A long outage must
+%% not spend the attempts of a row that never had its turn: here the row
+%% survives far more transport failures than the cap allows, and is
+%% written the moment the database answers again.
+a_transport_failure_never_spends_an_attempt_test() ->
+    vs_sql_stub:reset(),
+    vs_sql_stub:set_mode(raise),               %% the call itself blows up
+    with_db(#{retry_ms => 10}, fun(Pid) ->
+        vs_station_db:insert_session(?ROW),
+        wait_until(fun() -> length(inserts()) >= 12 end),   %% >> MAX_ROW_ATTEMPTS
+        ?assertEqual(1, queued(Pid)),
+        vs_sql_stub:set_mode(ok),
+        wait_until(fun() -> queued(Pid) =:= 0 end),
+        ?assertEqual(1, length(events()))
+    end).
+
+%% The counter lives in the queue, and the introspection the tests use must
+%% not see it: `queued_rows' answers with the sessions, never with how
+%% often they have been tried.
+the_queue_introspection_still_answers_with_rows_test() ->
+    vs_sql_stub:reset(),
+    vs_sql_stub:set_connect(refuse),
+    with_db(#{}, fun(Pid) ->
+        vs_station_db:insert_session((?ROW)#{connector_id => 42}),
+        wait_until(fun() -> queued(Pid) =:= 1 end),
+        [Row] = queue(Pid),
+        ?assert(is_map(Row)),
+        ?assertEqual(42, maps:get(connector_id, Row))
+    end).
