@@ -877,6 +877,108 @@ Nel merito dimostra la stessa cosa, e in più è vera.
 
 ---
 
+## 7p. M2-A passo 1: il canale colonnina — 27 agosto
+
+Branch `a/m2-chargepoint`. Nuovi `vs_cp_proto`, `vs_cp_ws`, `src/emulator/cp.js`; modificati
+`vs_connector` (D1-D5), `vs_station_app` (secondo listener), `vs_station_db`
+(`user_for_vehicle/1`). Contratto `contracts/ws-chargepoint.md` **non toccato**: è
+implementabile com'è scritto, incluse le tre assenze che sembrano dimenticanze e non lo sono
+(nessuna cache di dedup, nessun frame `error`, nessun ack sugli eventi — vedi
+`scelte_di_progetto.md` §11.9).
+
+Prima di questo passo, `plugged`/`meter`/`unplugged` esistevano come API di `vs_connector` e
+**nessun codice di produzione le chiamava**: solo i test. Il sistema sapeva prenotare e non
+sapeva caricare.
+
+### Le tre premesse che il piano dichiarava NON VERIFICATE — ora misurate
+
+| Premessa | Misura | Esito |
+|---|---|---|
+| Suite attuale 133 test, 0 fallimenti | `rebar3 eunit` (senza `--app`), 27/08 | **verificata**: 133/0 esatti |
+| Node sul host ha il `WebSocket` globale | `node --version` → v24.18.0; `typeof WebSocket` → `function` | **verificata** |
+| Un secondo listener cowboy convive col primo | app vera avviata, `cowboy:start_clear(vs_cp_listener, 8081)` accanto a `vs_driver_listener`, GET su entrambe le rotte | **verificata**: `{ok,Pid}`, `426 Upgrade Required` da 8080/ws/driver **e** da 8081/ws/cp, ranch non si lamenta |
+
+La terza è stata provata **prima** di scrivere il listener vero, con un modulo usa-e-getta:
+se ranch avesse protestato, il piano andava fermato lì e non dopo due ore di codice.
+
+### Verificato — girato davvero
+
+- **Suite: 180 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 133 di baseline + 47 nuovi:
+  18 su `vs_connector` (D1-D5, grazia, sostituzione socket, riconciliazione) e 29 su
+  `vs_cp_proto` (handshake e 4404, boot/ack, heartbeat, i quattro esiti del `plugged`,
+  meter/unplugged/status, envelope, e le quattro verdette del trasporto — 4404, 4409,
+  encoding del comando, shutdown).
+- **Sessione walk-in completa sul compose**, emulatore dal host contro
+  `ws://localhost:9201/ws/cp?station_id=1&connector_id=3`, connettore 3: `boot` → ack
+  (heartbeat 30 s, meter 5 s, limit 0) → `plugged` → `set_limit 150` dal connettore → `meter`
+  → `unplugged`. **Emulatore `final energy_kwh = 1.206`, log stazione
+  `session closed (not yet persisted): … energy_kwh => 1.206`: differenza 0.000**, contro una
+  tolleranza dichiarata di ±0.01. La sessione è stata letta dal log della stazione, non da
+  `station.jsp`.
+- **Riconciliazione §6 sul compose**: `docker restart station1` con l'emulatore in carica a
+  **1.417 kWh**. La stazione, andandosene, ha mandato `stop {reason: station_shutdown}` e ha
+  chiuso 1001; l'emulatore ha tenuto cavo e contatore, si è riconnesso col backoff
+  (1 s → 2 s), ha rimandato `boot` (`status: occupied`) e `plugged` con
+  `energy_kwh: 1.417`, e la stazione ha **adottato** la sessione: il `meter` successivo
+  riporta 1.625 — mai indietro. `started_at` della riga è l'istante dell'adozione, non del
+  cavo: la stazione non ha memoria del pre-crash e §6 fa fede al totale del contatore.
+- **Grazia dei tre heartbeat, sul compose**: emulatore ucciso a sessione in corso. Il log dice
+  `connector 3: no charge point for 90000 ms mid-session - closing with the last measured
+  energy` — 90 s = `CP_HEARTBEAT_MISSED × CP_HEARTBEAT_INTERVAL_S` letti dall'ambiente, non
+  una costante — e la riga è stata scritta con **2.875 kWh**, esattamente l'ultimo `meter`
+  ricevuto. Poi `out_of_service`.
+- **Rientro in servizio**: un nuovo `boot` con `status: available` →
+  `charge point reports available - back in service` → `free`, e la sessione successiva è
+  finita nel modo ordinario (`energy_kwh => 0.583`, di nuovo pari al totale dell'emulatore).
+  È la prova E2E che `after_closing` è una bandierina di sola andata (§11.5).
+- **I due listener convivono nel container**: `GET :9101/ws/driver` → `426 Upgrade Required`,
+  `GET :9201/ws/cp` → `426 Upgrade Required`, dopo tutto quanto sopra.
+- **`warnings_as_errors` attivo**: la build passa pulita, nessun `catch Expr` deprecato.
+
+### Non provato — e perché
+
+- **`station.jsp` non è stato aperto in Chrome.** La sessione walk-in è stata verificata dal
+  log della stazione, che è l'alternativa prevista. Manca quindi la conferma visiva che
+  `out_of_service` e la sessione arrivino fino alla pagina — anche se la catena è verificata
+  per struttura (`wire_connector_state/1` ha la clausola passante, l'enum di `ws-driver.md`
+  §5.1 contiene già `out_of_service`).
+- **Un connettore che crasha a sessione in corso** riparte `free` con `cp = undefined`, e
+  niente dice al socket CP di riagganciarsi: i comandi smettono di fluire fino alla
+  riconnessione del socket. È semantica di riavvio già presente da M1, non introdotta qui, e
+  il `meter` successivo finisce nel log "meter senza sessione" invece che nel vuoto. Non
+  allargato: il rimedio è un `attach_cp` scatenato dal `connector_up`, che tocca il manager.
+- **La notifica `session_interrupted` non arriva al browser.** Il connettore *emette* l'evento
+  verso il manager, come già fa per `claim_revoked`, ma il frame `notification` di
+  `ws-driver.md` non è implementato sul canale driver (verificato: nessun builder in
+  `vs_driver_proto`). Fuori perimetro, com'era per gli eventi di M1.
+- **`user_for_vehicle/1` è uno stub dichiarato**: risponde l'identità e lo scrive nel log a
+  ogni chiamata. Finché non c'è la SELECT del passo 3, un walk-in apre la sessione su
+  `user_id = vehicle_id` — corretto per il seed dove i due coincidono, falso altrove.
+- **Il rifiuto 4409 non è stato provato su un socket vero**: c'è il test del trasporto
+  (`{cp_replaced}` → close 4409) e quello del connettore (il vecchio pid riceve
+  `{cp_replaced}`), ma due emulatori sullo stesso connettore non sono mai stati messi in
+  concorrenza sul compose.
+- **La seconda uscita da `out_of_service` non è stata provata E2E.** L'adozione di §6 su un
+  connettore fuori servizio (colonnina tornata `occupied` dopo la grazia, `plugged` col
+  cumulativo) ha il test unitario ma non uno scenario sul compose: servirebbe un
+  `docker network disconnect` di oltre 90 s tenendo vivo l'emulatore. Il buco è stato trovato
+  in revisione, non dai test: tutti gli scenari eseguiti rientravano in servizio da un
+  connettore libero, dove basta `available`.
+- **`limit_kw: 0` come "sospeso"** è implementato e coperto dai test unitari, ma nessuno
+  scenario E2E lo ha esercitato: nel passo 1 il limite viene impostato una volta sola e non
+  scende mai. Sarà lo scenario naturale del passo 2, quando l'allocatore ripartisce.
+
+### Catena dei chiamanti: una voce che il piano non aveva
+
+Il piano (§6) elencava sei funzioni modificate. La ricerca per struttura (grep sui nomi, non
+sui file attesi) ne ha trovata una settima, e per fortuna non richiede modifiche:
+`vs_claim_client:count_stats/1` legge lo stato dei connettori per le `station_stats` verso il
+coordinatore. Ha un catch-all `_ -> {F, H, Ch}`, quindi `out_of_service` viene contato come
+niente — la stessa semantica di `offline`, che è quella giusta. Se il catch-all non ci fosse
+stato, un connettore guasto avrebbe fatto crashare il client dei claim.
+
+---
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha

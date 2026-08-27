@@ -434,3 +434,225 @@ La stazione manda un `ping` insieme a ogni tick di stato (§9.8). Il browser ris
 ### 10.11 Cosa la pagina non fa
 
 Niente lista d'attesa (§4.4) e niente riquadro di sessione (§5.2, richiede il canale colonnina di M2), coerentemente con §9.9. Il campo `waitlist` arriva come costante dichiarata e viene semplicemente ignorato dal rendering.
+
+---
+
+## 11. Il canale colonnina (`vs_cp_ws`, `vs_cp_proto`) — M2-A passo 1
+
+Contratto: `contracts/ws-chargepoint.md`. È il confine del sistema: sopra c'è logica di
+produzione, sotto c'è hardware emulato, e l'emulatore è credibile solo se questa interfaccia
+è una che una colonnina vera potrebbe implementare. Le cinque decisioni D1-D5 del piano
+stanno qui con le alternative scartate.
+
+### 11.1 Lo stesso taglio del canale driver: protocollo e trasporto separati
+
+`vs_cp_proto` tiene tutte le decisioni (handshake, envelope, dispatch, autorizzazione del
+`plugged`, costruzione dei frame), `vs_cp_ws` solo le callback cowboy. È la stessa mossa
+già motivata in §9.1 e vale per la stessa ragione, misurata: un handler cowboy non si
+esercita da EUnit senza far partire un listener e un client WebSocket, e un client
+significherebbe `gun` come quarta dipendenza portata solo per i test. Con lo split, i 29
+test del canale colonnina sono chiamate di funzione su mappe ordinarie e `rebar3 eunit` non
+apre la porta 8081.
+
+I collaboratori iniettati sono tre, come di là: `conn_mod`, `mgr_mod`, `db_mod`.
+
+### 11.2 D1 — l'utente della sessione: dall'hold se c'è, dal veicolo se è walk-in
+
+Il payload `plugged` identifica il **veicolo** (§4.2), `session_from/2` pretende un
+`user_id`, e il mapping è 1:1 nello schema (`vehicles.user_id UNIQUE`).
+
+- **Con prenotazione**: la sessione si apre sull'utente dell'**hold**, non su quello che il
+  payload nomina. È lui che viene fatturato, e §7.1 dice che la colonnina riferisce e non
+  decide — quindi il payload non ha voce in capitolo. Il test
+  `a_reserved_session_is_billed_to_the_holder_test` manda apposta un `user_id` sbagliato.
+- **Walk-in**: `vs_cp_proto` risolve `vehicle → user` con la nuova callback
+  `db_mod:user_for_vehicle/1`. Lo stub in `vs_station_db` risponde l'identità e **lo dichiara
+  nel log a ogni chiamata**; il passo 3 sostituisce il corpo con la SELECT e l'interfaccia
+  non cambia.
+
+*Alternativa scartata:* chiedere al coordinatore. Il coordinatore non possiede la tabella
+`vehicles`, e si aggiungerebbe una chiamata remota su un percorso che deve funzionare anche
+a sito isolato (autonomia di stazione, SCOPE §4). La risoluzione è locale per lo stesso
+motivo per cui il walk-in non chiede un claim.
+
+### 11.3 D2 — `out_of_service` è un quinto stato del `gen_statem`, non un flag
+
+"Non prenotabile, invisibile come libero, sessione chiusa" è esattamente ciò che uno stato
+esprime e che un flag lascerebbe a un `case` in ogni ramo. Il guadagno concreto:
+`handle_common` risponde già `invalid_state` alle call che non gestisce, quindi un `reserve`
+su un connettore fuori servizio **si rifiuta da solo**, senza una riga scritta per l'occasione
+(`an_out_of_service_connector_cannot_be_reserved_test`).
+
+La catena verso la pagina regge senza modifiche a `vs_driver_proto`: `wire_connector_state/1`
+ha la clausola passante `Other -> Other` e l'enum di `ws-driver.md` §5.1 contiene già
+`out_of_service`. Verificato anche il secondo consumatore, che il piano non elencava:
+`vs_claim_client:count_stats/1` conta gli stati per le `station_stats` e ha un catch-all `_`
+che assorbe il nuovo atomo contandolo come niente — la stessa semantica di `offline`, che è
+quella giusta (non libero, non usabile).
+
+Ingressi: `{cp_status, faulted|unavailable}` e la perdita del CP oltre la grazia (D3).
+La stazione non decide **mai** da sola che un connettore è guarito — §7.2 dice che sul fisico
+l'autorità è l'hardware — quindi entrambe le uscite le apre la colonnina:
+
+1. **`status: available`** → `free`. Il caso semplice: l'apparato è tornato e non ha nessuno
+   attaccato.
+2. **`plugged` (riconciliazione §6)** → `charging`, sessione adottata dai numeri riportati.
+
+La seconda è quella che è facile lasciare fuori, ed è quella che serve davvero. Una colonnina
+che ha smesso di farsi sentire **mentre erogava** non torna dicendo `available`: torna dicendo
+`occupied` — che non solleva niente — e poi riannuncia il cavo. Senza questa clausola il
+`plugged` verrebbe rifiutato `invalid_state`, l'ack del `boot` avrebbe già consegnato
+`limit_kw: 0`, e un'auto fisicamente attaccata resterebbe sospesa per sempre ad aspettare un
+`available` che un apparato occupato non manda mai. La sessione precedente qui non c'è più —
+è stata chiusa con l'ultima energia misurata all'ingresso in `out_of_service` — quindi il
+connettore adotta ciò che l'hardware riporta, esattamente come `free` fa per un walk-in.
+Senza claim, di proposito: §6 dice che ricostruire la prenotazione non si tenta, "l'auto
+continua a caricare, la sessione viene fatturata, la prenotazione non c'è più".
+
+### 11.4 D3 — tre heartbeat persi = `idle_timeout` del socket **più** una grazia sul distacco
+
+Il contratto dà una regola sola (§3.2, "tre heartbeat persi") e i modi di non farsi sentire
+sono due, quindi l'implementazione è in due pezzi che scadono sullo stesso numero:
+
+- **il socket tace**: `idle_timeout` di cowboy = `CP_HEARTBEAT_MISSED × CP_HEARTBEAT_INTERVAL_S`
+  (90 s). Conta solo il traffico in ingresso (misurato in M1, §9.8), quindi "nessun frame di
+  alcun tipo per 90 s" implementa "non si fa sentire" — e una colonnina in carica che manda
+  `meter` ogni 5 s non scade mai, che è la semantica voluta. Su questo canale **non c'è
+  ping**, all'opposto del canale driver: lì il timeout andava aggirato perché una pagina che
+  guarda tace legittimamente, qui il timeout *è* la regola.
+- **il socket muore**: il connettore riceve il `DOWN` e **non** va subito fuori servizio.
+  Arma `{timeout, cp_grace}` della stessa durata e lo cancella se un CP si riattacca.
+
+*Perché la grazia:* §1 del contratto prevede esplicitamente il blip di rete con riconnessione
+in 1 s. Marcare fuori servizio all'istante rilascerebbe una prenotazione viva per un guasto
+durato un secondo. Alla scadenza: `held` → release + `session_interrupted` + `out_of_service`;
+`charging` → chiusura con l'ultima energia (riga scritta) + `out_of_service`; `free` →
+`out_of_service`.
+
+Due dettagli che sono bug se sbagliati, e hanno un test ciascuno:
+
+1. È un timeout **generico** (`{timeout, Name}`), non uno `state_timeout`: quest'ultimo viene
+   cancellato da qualsiasi cambio di stato, e la grazia deve sopravvivere al passaggio
+   `charging → closing`.
+2. `attach_cp/2` fa `demonitor(..., [flush])` sul vecchio pid **prima** di monitorare il
+   nuovo. Senza il flush, il `DOWN` del socket che abbiamo appena sostituito è già in
+   mailbox e armerebbe la grazia di un connettore la cui colonnina sta benissimo
+   (`the_death_of_a_replaced_socket_is_not_a_fault_test`).
+
+### 11.5 D4 — `closing` parametrico sull'uscita, e la bandierina è di sola andata
+
+`closing` era l'unica uscita di ogni sessione che finisce e usciva sempre verso `free`. Il
+percorso guasto deve uscire verso `out_of_service`, quindi `#data.after_closing` (default
+`free`) viene letto dal timeout di `closing`.
+
+**Viene rimesso a `free` nello stesso passo in cui è letto.** Se restasse impostato, la
+sessione *successiva* — chiusa normalmente da un `unplugged` — uscirebbe anch'essa verso
+`out_of_service`: un difetto latente che nessun test del percorso guasto avrebbe visto.
+`available_brings_it_back_and_the_next_session_ends_free_test` esiste per questo.
+
+I tre percorsi esistenti (`stop_session`, `unplugged`, `revoke`) non toccano il campo, quindi
+il loro comportamento è invariato per costruzione, non per verifica.
+
+### 11.6 D5 — `set_limit` interinale al posto dell'allocatore
+
+Il contratto vuole un limite dopo l'autorizzazione e legge `limit_kw: 0` come "sospeso":
+senza un valore vero l'emulatore non caricherebbe mai. Il passo 1 introduce l'API definitiva
+`vs_connector:set_limit/2` (cast: memorizza in `#session.limit_kw` e inoltra al CP) e la
+invoca **una volta sola**, all'ingresso in `charging`, con `min(rated_kw, max_kw)` — la presa
+non dà più di quanto è tarata, l'auto non prende più di quanto è costruita.
+
+Il passo 2 sposta il **calcolo** nell'allocatore del manager e richiama la stessa API a ogni
+arrivo, partenza e tick; il **trasporto** non cambia più. È l'unico punto del passo 1
+dichiaratamente provvisorio, e con più auto può sommare oltre `SITE_POWER_KW`: è lo status
+quo di oggi (nessuno alloca niente), non una regressione.
+
+*Bordo dichiarato:* un `plugged` senza `max_kw` parte sospeso, perché `min(150, 0) = 0`. È la
+lettura onesta di `min`, il contratto rende il campo obbligatorio (§4.2), e inventare un
+limite per un'auto che non ha dichiarato niente sarebbe la stazione che decide cosa può
+prendere l'hardware — esattamente la divisione che §7.2 vieta. Il `set_limit` successivo
+(un tick, dal passo 2) lo corregge.
+
+### 11.7 Il campo `#data.cp` **è** il registro
+
+Una connessione per connettore (§1) significa che l'unico posto dove una lookup potrebbe
+guardare è lo stato del connettore stesso. Il socket appena connesso fa
+`vs_connector:attach_cp(Pid, self())`; il connettore monitora il nuovo e manda al vecchio
+`{cp_replaced}`, che chiude 4409. Niente gproc, niente seconda ETS, nessun processo in più
+da tenere coerente con la realtà.
+
+La direzione delle chiamate resta quella di M1: socket → connettore in call/cast, connettore
+→ socket **solo** con `!`. Un socket occupato o morto non deve poter bloccare il processo che
+possiede una presa fisica, e la regola "i connettori non fanno chiamate remote" resta intatta.
+
+### 11.8 `attach_cp` sul `boot`, non sull'upgrade
+
+Il legame si crea alla prima frase del protocollo, non all'apertura del socket. §3.1 rende
+`boot` il primo frame "prima di qualsiasi altra cosa", quindi una riconnessione vera sfratta
+comunque il socket stantìo entro un millisecondo dall'arrivo. Legare all'upgrade invece
+lascerebbe che una connessione TCP mezza aperta — una scansione di porte, un probe di un
+proxy — buttasse fuori una colonnina funzionante dal proprio connettore prima di aver detto
+una parola.
+
+Conseguenza dichiarata: un socket che si connette e non manda mai `boot` viene raccolto
+dall'`idle_timeout` (90 s) senza aver disturbato nessuno.
+
+### 11.9 Niente cache di dedup, niente frame `error`, niente ack sugli eventi
+
+Tre assenze, ognuna richiesta dal contratto e ognuna facile da "migliorare" per sbaglio:
+
+- **Nessuna cache dei `request_id`.** §2 è esplicito: qui non è una chiave di deduplicazione,
+  "gli eventi dei due lati sono naturalmente idempotenti o naturalmente ordinati". Un `meter`
+  ripetuto lo assorbe il massimo monotòno, un `plugged` ripetuto la macchina a stati. Il
+  canale driver ha bisogno dell'at-most-once perché un `reserve` ripetuto prenderebbe un
+  secondo connettore; qui niente ha quella forma.
+- **Nessun frame `error`.** §2 dà a questo canale esattamente due tipi stazione → colonnina,
+  `ack` e `command`. Un envelope illeggibile viene **loggato e scartato**, non risposto con
+  un frame che il contratto non definisce: il contratto è di A, e non si allarga dal lato
+  dell'implementazione. Resta rumoroso, che è ciò che §7.6 chiede.
+- **Nessun ack sugli eventi.** La scaletta di §9 risponde a `plugged`, `meter` e `unplugged`
+  con un comando o con niente; solo `boot` e `heartbeat` portano un `ack` (§3.1, §3.2).
+
+Conseguenza sui test: metà delle asserzioni del canale guardano cosa è stato chiesto al
+connettore, non cosa è tornato sul filo — perché sul filo non torna niente.
+
+### 11.10 Il connettore si rilegge a ogni evento, il pid non si memorizza
+
+`vs_station_mgr:lookup_pid/1` è una dirty read della ETS del manager, lo stesso idioma di
+`vs_claim_client` e per la stessa ragione: il socket non deve accodarsi dietro un manager che
+sta bootando. Tenersi il pid dell'handshake sarebbe più veloce e sbagliato: un connettore che
+crasha riparte con un pid nuovo, e il socket continuerebbe a castare `meter` in una mailbox
+morta invece che nel processo vivo — dove il log "meter senza sessione" di §4.3 è proprio ciò
+che dice che i due lati hanno divergito.
+
+Il rifiuto dell'handshake (4404) usa la stessa lettura: "il registro non c'è ancora" e "non è
+mio" meritano la stessa risposta, cioè riprova più tardi.
+
+### 11.11 Due listener e due porte, non due rotte su una
+
+`vs_driver_listener` su 8080 e `vs_cp_listener` su 8081, listener ranch distinti con router
+distinti. Non sono due rotte dello stesso server perché sono due **confini** diversi: il
+canale driver guarda internet attraverso un JWT, il canale colonnina guarda una rete di sito
+senza autenticazione alcuna (§2, dichiarato come assunzione invece che finto risolto). Due
+porte significa che il link di sito si può chiudere in firewall sulla VLAN degli apparati
+senza toccare quella pubblica.
+
+Stessa politica del primo listener se la porta è occupata: **rumoroso ma non fatale**. Qui
+con più forza che di là, non con meno — le sessioni già in corso sono la cosa che si sta
+proteggendo.
+
+### 11.12 L'emulatore: Node puro, zero dipendenze, e la rampa del limite
+
+`src/emulator/cp.js` non ha `package.json` e non ne avrà: il client `WebSocket` è un globale
+di Node da 22 in poi (misurato: 24.18.0, `typeof WebSocket === "function"`). Niente da
+installare significa niente che possa essere rotto sulla macchina dove si mostra la demo.
+
+Due scelte di modellazione che non sono decorazione:
+
+- **Il limite si applica a rampa**, non a gradino, su `LIMIT_APPLY_SECONDS` (§5: "real
+  hardware ramps"). Un emulatore che salta al valore nuovo istantaneamente farebbe sembrare
+  lo scenario della potenza migliore di quanto è.
+- **`stop` con reason `station_shutdown` non stacca il cavo.** La stazione se ne va, l'auto
+  no: l'emulatore smette di erogare, tiene il contatore e si riconnette — che è esattamente
+  la riconciliazione di §6, e il modo in cui la si dimostra senza staccare niente a mano.
+  Ogni altra reason termina la sessione con un `unplugged` che riporta il totale, perché qui
+  non c'è nessuno che possa tirare fisicamente il cavo.

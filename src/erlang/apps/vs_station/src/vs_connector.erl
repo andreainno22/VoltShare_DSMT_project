@@ -14,6 +14,9 @@
 %%%    └──────session written · claim released────────────────── closing
 %%%   free ──plugged, no reservation (walk-in)──────────────────▶ charging
 %%%
+%%%   any ──charge point faulted │ gone past the grace──▶ out_of_service
+%%%   out_of_service ──charge point boots `available'──▶ free
+%%%
 %%% Two rules are structural rather than checked:
 %%%
 %%%   * **Claim first, commit after.** `free' asks the coordinator and moves
@@ -27,21 +30,54 @@
 %%% The claim client and the database are injected as modules (`claim_mod',
 %%% `db_mod'). The connector knows the interface, not the transport, which
 %%% is what makes it testable without a coordinator and without MySQL.
+%%%
+%%% ## The charge point (ws-chargepoint.md, M2 step 1)
+%%%
+%%% `#data.cp' holds the pid of the socket process that speaks for the
+%%% hardware on this connector, monitored. **That field is the registry**:
+%%% one connection per connector (§1) means the connector's own state is
+%%% the only place a lookup could consult, so there is no second ETS and
+%%% no gproc. A newly connected socket calls `attach_cp/2'; the one being
+%%% replaced is told `{cp_replaced}' and closes itself with 4409.
+%%%
+%%% The direction of the calls is unchanged from M1: socket → connector in
+%%% call/cast, connector → socket with `!' only. The connector still makes
+%%% no remote call of its own.
+%%%
+%%% Losing the socket does **not** take the connector out of service at
+%%% once: §1 of the contract plans for the network blip with a one second
+%%% reconnect, and a reservation must not die of a one second fault. The
+%%% `DOWN' arms `{timeout, cp_grace}' — a *generic* timeout, so it
+%%% survives the state changes that a `state_timeout' would cancel — and
+%%% `attach_cp/2' cancels it. Its length is three missed heartbeats
+%%% (§3.2), the same window cowboy uses as the socket's `idle_timeout'.
 %%%-------------------------------------------------------------------
 -module(vs_connector).
 -behaviour(gen_statem).
 
 %% API
 -export([start_link/1, reserve/3, cancel/2, plugged/2, unplugged/2,
-         meter/2, stop_session/2, revoke/2, snapshot/1]).
+         meter/2, stop_session/2, revoke/2, snapshot/1,
+         attach_cp/2, set_limit/2, cp_status/2]).
 %% gen_statem
 -export([init/1, callback_mode/0, terminate/3]).
 %% state functions
--export([free/3, held/3, charging/3, closing/3]).
+-export([free/3, held/3, charging/3, closing/3, out_of_service/3]).
 
 -type conn_id()    :: pos_integer().
 -type user_id()    :: pos_integer().
 -type vehicle_id() :: pos_integer().
+
+%% ws-chargepoint.md §4.1 — the four the hardware may report.
+-type cp_status()  :: available | occupied | faulted | unavailable.
+%% ws-chargepoint.md §5 — the reasons a `stop' command may carry. The
+%% connector raises three of the six; `not_your_reservation' is built by
+%% `vs_cp_proto' (it answers a refused `plugged', which never becomes a
+%% transition here), `station_shutdown' by `vs_cp_ws' on the way down, and
+%% `target_reached' waits for the allocator of M2 step 2.
+-type stop_reason() :: driver_stopped | claim_revoked | faulted.
+
+-export_type([cp_status/0, stop_reason/0]).
 
 %% What the driver channel is allowed to see as a refusal. `vs_driver_ws'
 %% turns these into the wire codes of ws-driver.md §6; keeping them as
@@ -84,7 +120,16 @@
                db_mod     :: module(),
                notify_to  :: pid() | atom() | undefined,
                hold       = undefined :: #hold{} | undefined,
-               session    = undefined :: #session{} | undefined}).
+               session    = undefined :: #session{} | undefined,
+               %% the charge point socket of this connector, and its monitor
+               cp          = undefined :: pid() | undefined,
+               cp_mon      = undefined :: reference() | undefined,
+               cp_grace_ms :: pos_integer(),
+               %% D4: `closing' is the one exit every ending session goes
+               %% through, and it has two destinations. The default is the
+               %% only one M1 knew; the fault paths set it for one trip and
+               %% `closing' puts it back (see closing/3).
+               after_closing = free :: free | out_of_service}).
 
 %%%===================================================================
 %%% API
@@ -138,6 +183,35 @@ revoke(Pid, ClaimId) ->
 snapshot(Pid) ->
     gen_statem:call(Pid, snapshot).
 
+%% @doc Bind a charge point socket to this connector (ws-chargepoint.md §1).
+%%
+%% A **call**, not a cast, and that is the whole point: the socket must
+%% know it is the live one before it acknowledges the `boot', and the
+%% reply is the synchronisation. Any previous socket is told
+%% `{cp_replaced}' and its monitor is dropped with `flush', so the death
+%% of the socket we ourselves replaced cannot arm the grace timer and take
+%% a perfectly healthy connector out of service.
+-spec attach_cp(pid(), pid()) -> ok.
+attach_cp(Pid, CpPid) ->
+    gen_statem:call(Pid, {attach_cp, CpPid}).
+
+%% @doc The ceiling this connector may draw, in kW (§5 `set_limit').
+%%
+%% A cast, and idempotent by repetition: §5 has the station re-send the
+%% limit on every recomputation rather than diffing, so a charge point
+%% that missed a frame is right again within one tick. Meaningful only
+%% while charging; anywhere else there is nothing to limit and the event
+%% is absorbed.
+-spec set_limit(pid(), number()) -> ok.
+set_limit(Pid, Kw) ->
+    gen_statem:cast(Pid, {set_limit, Kw}).
+
+%% @doc Physical status reported by the hardware (§4.1). The hardware is
+%% authoritative on this and the station never argues with it.
+-spec cp_status(pid(), cp_status()) -> ok.
+cp_status(Pid, Status) ->
+    gen_statem:cast(Pid, {cp_status, Status}).
+
 %%%===================================================================
 %%% gen_statem
 %%%===================================================================
@@ -155,7 +229,8 @@ init(Opts) ->
                                        vs_env:get_int("LEASE_SECONDS", 900)) * 1000,
                  claim_mod  = maps:get(claim_mod, Opts, vs_claim_null),
                  db_mod     = maps:get(db_mod, Opts, vs_station_db),
-                 notify_to  = maps:get(notify_to, Opts, undefined)},
+                 notify_to  = maps:get(notify_to, Opts, undefined),
+                 cp_grace_ms = maps:get(cp_grace_ms, Opts, cp_grace_ms())},
     %% Announce to whoever tracks connectors (vs_station_mgr). This runs
     %% at first boot AND at every supervisor restart, which is how the
     %% manager's registry heals after a crash without polling anyone. It
@@ -218,6 +293,34 @@ free({call, From}, {plugged, Info}, Data) ->
                   [Data#data.conn_id, Session#session.user_id]),
     {next_state, charging, Data#data{session = Session}, [{reply, From, ok}]};
 
+%% §4.3: "a meter for a connector with no session is dropped and logged".
+%% Logged and nothing else — no `notify', because a charge point sends one
+%% of these every METER_INTERVAL_S and turning each into a state push
+%% would flood every open page with a change that never happened. The log
+%% line is what §7.6 asks for: divergence is found, never patched.
+free(cast, {meter, Reading}, Data) ->
+    logger:warning("connector ~p: meter for a connector with no session "
+                   "(state free): ~p", [Data#data.conn_id, Reading]),
+    keep_state_and_data;
+
+free(cast, {cp_status, Status}, Data) when Status =:= faulted;
+                                           Status =:= unavailable ->
+    logger:warning("connector ~p: charge point reports ~p - out of service",
+                   [Data#data.conn_id, Status]),
+    {next_state, out_of_service, Data};
+
+free(cast, {cp_status, Status}, Data) ->
+    logger:debug("connector ~p: charge point reports ~p while free",
+                 [Data#data.conn_id, Status]),
+    keep_state_and_data;
+
+%% D3: the socket has been gone for three heartbeats. Nothing was
+%% reserved and nothing was charging, so there is nothing to unwind.
+free({timeout, cp_grace}, _Content, Data) ->
+    logger:warning("connector ~p: no charge point for ~p ms - out of service",
+                   [Data#data.conn_id, Data#data.cp_grace_ms]),
+    {next_state, out_of_service, Data};
+
 free(EventType, Event, Data) ->
     handle_common(EventType, Event, free, Data).
 
@@ -259,7 +362,12 @@ held({call, From}, {reserve, _UserId, _VehicleId}, _Data) ->
 held({call, From}, {plugged, Info}, Data = #data{hold = Hold}) ->
     case maps:get(vehicle_id, Info) =:= Hold#hold.vehicle_id of
         true ->
-            Session = session_from(Info, Hold#hold.claim_id),
+            %% D1: the session opens on the **holder**, not on whoever the
+            %% payload names. The charge point identifies a vehicle (§4.2)
+            %% and has no voice on the account: the person billed is the
+            %% one the claim was granted to.
+            Session = session_from(Info#{user_id => Hold#hold.user_id},
+                                   Hold#hold.claim_id),
             notify(Data, {session_started, Hold#hold.user_id}),
             {next_state, charging, Data#data{session = Session}, [{reply, From, ok}]};
         false ->
@@ -274,6 +382,34 @@ held(cast, {revoke, ClaimId}, Data = #data{hold = #hold{claim_id = ClaimId, user
     %% No release message: the coordinator revoked it, it already knows.
     {next_state, free, Data};
 
+held(cast, {meter, Reading}, Data) ->
+    logger:warning("connector ~p: meter for a connector with no session "
+                   "(state held): ~p", [Data#data.conn_id, Reading]),
+    keep_state_and_data;
+
+%% §3.2: "any reservation on it is released with a session_interrupted
+%% notification". `cancelled' is the release reason — claim.md §5.6 fixes
+%% the four allowed words and this is the station cancelling, not the
+%% lease running out.
+held(cast, {cp_status, Status}, Data = #data{hold = #hold{user_id = U}})
+  when Status =:= faulted; Status =:= unavailable ->
+    logger:warning("connector ~p: charge point reports ~p while reserved by "
+                   "user ~p - releasing", [Data#data.conn_id, Status, U]),
+    release(Data, cancelled),
+    notify(Data, {session_interrupted, U}),
+    {next_state, out_of_service, Data};
+
+held(cast, {cp_status, _Status}, _Data) ->
+    keep_state_and_data;
+
+held({timeout, cp_grace}, _Content, Data = #data{hold = #hold{user_id = U}}) ->
+    logger:warning("connector ~p: no charge point for ~p ms while reserved by "
+                   "user ~p - releasing", [Data#data.conn_id,
+                                           Data#data.cp_grace_ms, U]),
+    release(Data, cancelled),
+    notify(Data, {session_interrupted, U}),
+    {next_state, out_of_service, Data};
+
 held(EventType, Event, Data) ->
     handle_common(EventType, Event, held, Data).
 
@@ -281,9 +417,27 @@ held(EventType, Event, Data) ->
 %%% charging
 %%%===================================================================
 
-charging(enter, _Old, Data) ->
-    notify(Data, {state_changed, charging}),
-    keep_state_and_data;
+%% D5 — the interim allocation. The contract wants a limit after the
+%% authorisation and reads `limit_kw: 0' as "suspended", so a session that
+%% never received one would sit at zero and the emulator would never
+%% charge. One value, computed once, on the single transition into the
+%% state: `min(rated_kw, max_kw)' — the outlet cannot give more than it is
+%% rated for and the car cannot take more than it is built for. M2 step 2
+%% moves the *calculation* into the manager's allocator and calls
+%% `set_limit/2' on every arrival and departure; the *transport* below
+%% does not change again.
+%%
+%% A `plugged' payload with no `max_kw' therefore starts suspended. That is
+%% the honest reading of `min' and the contract makes the field mandatory
+%% (§4.2); inventing a limit for a car that never declared one would be the
+%% station deciding what hardware can take, which is exactly the split §7.2
+%% forbids. The next `set_limit' — one tick, in M2 step 2 — corrects it.
+charging(enter, _Old, Data = #data{session = S, rated_kw = Rated}) ->
+    Limit = float(min(Rated, S#session.max_kw)),
+    Data1 = Data#data{session = S#session{limit_kw = Limit}},
+    notify(Data1, {state_changed, charging}),
+    send_cp(Data1, #{command => set_limit, limit_kw => Limit}),
+    {keep_state, Data1};
 
 charging(cast, {meter, Reading}, Data = #data{session = S}) ->
     %% Energy is cumulative and monotonic: a meter that resets on a
@@ -295,7 +449,17 @@ charging(cast, {meter, Reading}, Data = #data{session = S}) ->
                    soc_pct    = maps:get(soc_pct,  Reading, S#session.soc_pct)},
     {keep_state, Data#data{session = S2}};
 
+%% §5: stored **and** forwarded. Stored because the page and the allocator
+%% both read it back off the snapshot; forwarded because the hardware is
+%% the only thing that can actually apply it.
+charging(cast, {set_limit, Kw}, Data = #data{session = S}) ->
+    Limit = float(Kw),
+    Data1 = Data#data{session = S#session{limit_kw = Limit}},
+    send_cp(Data1, #{command => set_limit, limit_kw => Limit}),
+    {keep_state, Data1};
+
 charging({call, From}, {stop_session, UserId}, Data = #data{session = #session{user_id = UserId}}) ->
+    send_cp(Data, stop_cmd(driver_stopped)),
     {next_state, closing, Data, [{reply, From, ok}]};
 
 charging({call, From}, {stop_session, _Other}, _Data) ->
@@ -311,10 +475,35 @@ charging(cast, {unplugged, EnergyKwh}, Data = #data{session = S}) ->
 charging(cast, {revoke, ClaimId}, Data = #data{session = #session{claim_id = ClaimId, user_id = U}}) ->
     logger:warning("connector ~p claim ~s revoked mid-session", [Data#data.conn_id, ClaimId]),
     notify(Data, {claim_revoked, U}),
+    send_cp(Data, stop_cmd(claim_revoked)),
     {next_state, closing, Data};
 
 charging({call, From}, {reserve, _U, _V}, _Data) ->
     {keep_state_and_data, [{reply, From, {error, already_held}}]};
+
+%% §4.1: "`faulted' immediately takes the connector out of service and
+%% stops any session". The row is still written, with the energy last
+%% measured — §3.2, a session that cannot be measured must not keep
+%% accruing cost, but the energy already delivered was delivered.
+charging(cast, {cp_status, Status}, Data = #data{session = #session{user_id = U}})
+  when Status =:= faulted; Status =:= unavailable ->
+    logger:error("connector ~p: charge point reports ~p mid-session - closing "
+                 "with the last measured energy", [Data#data.conn_id, Status]),
+    send_cp(Data, stop_cmd(faulted)),
+    notify(Data, {session_interrupted, U}),
+    {next_state, closing, Data#data{after_closing = out_of_service}};
+
+charging(cast, {cp_status, _Status}, _Data) ->
+    keep_state_and_data;
+
+%% D3, the mirror case of §3.2: the hardware stopped talking. No `stop'
+%% command goes out — there is nobody left to send it to.
+charging({timeout, cp_grace}, _Content, Data = #data{session = #session{user_id = U}}) ->
+    logger:warning("connector ~p: no charge point for ~p ms mid-session - closing "
+                   "with the last measured energy",
+                   [Data#data.conn_id, Data#data.cp_grace_ms]),
+    notify(Data, {session_interrupted, U}),
+    {next_state, closing, Data#data{after_closing = out_of_service}};
 
 charging(EventType, Event, Data) ->
     handle_common(EventType, Event, charging, Data).
@@ -325,9 +514,9 @@ charging(EventType, Event, Data) ->
 
 %% Everything that must happen exactly once when a session ends happens
 %% here, on entry: write the row, release the claim, tell whoever is
-%% listening. Then the connector returns to `free' on a zero timeout, so
-%% the work is done in a state of its own rather than smeared across the
-%% transitions that can reach it.
+%% listening. Then the connector leaves on a zero timeout, so the work is
+%% done in a state of its own rather than smeared across the transitions
+%% that can reach it.
 closing(enter, _Old, Data = #data{session = S}) ->
     EndedAt = vs_time:now_ms(),
     Row = #{user_id      => S#session.user_id,
@@ -349,8 +538,12 @@ closing(enter, _Old, Data = #data{session = S}) ->
     notify(Data, {session_closed, Row}),
     {keep_state, Data, [{state_timeout, 0, done}]};
 
-closing(state_timeout, done, Data) ->
-    {next_state, free, Data};
+%% D4: where `closing' lets out. `free' for every path M1 knew; the fault
+%% paths of §3.2 and §4.1 ask for `out_of_service' instead. The field is
+%% put back in the same step it is read, so the *next* session to end here
+%% leaves the normal way — a one-trip flag, not a mode.
+closing(state_timeout, done, Data = #data{after_closing = Next}) ->
+    {next_state, Next, Data#data{after_closing = free}};
 
 %% Late events from a charge point that is one step behind are expected
 %% here, not exceptional: absorb them.
@@ -361,6 +554,72 @@ closing(EventType, Event, Data) ->
     handle_common(EventType, Event, closing, Data).
 
 %%%===================================================================
+%%% out_of_service
+%%%===================================================================
+
+%% D2 — a fifth state, not a flag on the other four. "Not reservable,
+%% invisible as free, session closed" is what a state says and what a flag
+%% would leave to a `case' in every branch. `reserve' refuses itself here:
+%% there is no clause for it, so `handle_common' answers `invalid_state',
+%% which is exactly the right answer.
+%%
+%% It is reached from a fault (§4.1) or from the charge point going quiet
+%% past the grace (§3.2), and left only when the hardware says it is
+%% `available' again — the station never decides on its own that a
+%% connector has healed (§7.2: the hardware is authoritative on physical
+%% state).
+out_of_service(enter, _Old, Data) ->
+    notify(Data, {state_changed, out_of_service}),
+    {keep_state, Data#data{hold = undefined, session = undefined}};
+
+%% §3.1: "booting resets nothing" — the charge point reports its true
+%% status and the station reconciles. An `available' is that reconciliation.
+out_of_service(cast, {cp_status, available}, Data) ->
+    logger:notice("connector ~p: charge point reports available - back in service",
+                  [Data#data.conn_id]),
+    {next_state, free, Data};
+
+out_of_service(cast, {cp_status, _Status}, _Data) ->
+    keep_state_and_data;
+
+%% The second way out, and the one that is easy to leave missing. A charge
+%% point that went quiet past the grace **while delivering** does not come
+%% back saying `available': it says `occupied', which lifts nothing, and
+%% then re-announces the cable (§6.2). This connector no longer has the
+%% session — it was closed with the last measured energy on the way in
+%% here — so it adopts what the hardware reports, exactly as `free' does
+%% for a walk-in.
+%%
+%% Without this clause the reconnection would be refused `invalid_state',
+%% the boot ack would have handed out `limit_kw: 0', and a car that is
+%% physically plugged in would sit suspended forever waiting for an
+%% `available' that occupied hardware never sends.
+%%
+%% No claim, on purpose: §6 says reconstructing the reservation is
+%% deliberately not attempted — "the car keeps charging, the session is
+%% billed, the reservation is gone".
+out_of_service({call, From}, {plugged, Info}, Data) ->
+    Session = session_from(Info, undefined),
+    logger:notice("connector ~p: adopting a session from reconnected hardware "
+                  "for user ~p (~p kWh already counted)",
+                  [Data#data.conn_id, Session#session.user_id,
+                   Session#session.energy_kwh]),
+    {next_state, charging, Data#data{session = Session}, [{reply, From, ok}]};
+
+out_of_service(cast, {meter, Reading}, Data) ->
+    logger:warning("connector ~p: meter for a connector with no session "
+                   "(state out_of_service): ~p", [Data#data.conn_id, Reading]),
+    keep_state_and_data;
+
+%% Already out of service: the grace timer of a second disconnection has
+%% nothing left to take away.
+out_of_service({timeout, cp_grace}, _Content, _Data) ->
+    keep_state_and_data;
+
+out_of_service(EventType, Event, Data) ->
+    handle_common(EventType, Event, out_of_service, Data).
+
+%%%===================================================================
 %%% common
 %%%===================================================================
 
@@ -369,11 +628,36 @@ closing(EventType, Event, Data) ->
 handle_common({call, From}, snapshot, State, Data) ->
     {keep_state_and_data, [{reply, From, build_snapshot(State, Data)}]};
 
+%% Valid in every state on purpose: a charge point may reconnect while the
+%% connector is charging, closing or out of service, and the contract's
+%% "the newest socket wins" (§1) must not depend on what the station
+%% happens to be doing. Cancelling the grace timer here is the other half
+%% of D3 — a blip that heals inside the window leaves no trace at all.
+handle_common({call, From}, {attach_cp, CpPid}, _State, Data) ->
+    Data1 = attach(CpPid, Data),
+    {keep_state, Data1, [{reply, From, ok}, {{timeout, cp_grace}, cancel}]};
+
 handle_common({call, From}, _Event, _State, _Data) ->
     {keep_state_and_data, [{reply, From, {error, invalid_state}}]};
 
 handle_common(cast, _Event, _State, _Data) ->
     keep_state_and_data;
+
+%% The states that have something to unwind match this themselves; this
+%% clause is what keeps a stray firing — in `closing', say — from being a
+%% `function_clause' crash instead of a no-op.
+handle_common({timeout, cp_grace}, _Content, _State, _Data) ->
+    keep_state_and_data;
+
+%% The socket died. Not "the connector is broken": §1 plans for the blip,
+%% so the verdict is deferred by exactly three missed heartbeats and
+%% `attach_cp/2' cancels it if the hardware comes back in time.
+handle_common(info, {'DOWN', Ref, process, _Pid, Reason}, State,
+              Data = #data{cp_mon = Ref, conn_id = ConnId, cp_grace_ms = Grace}) ->
+    logger:warning("connector ~p: charge point socket gone in ~p (~p); "
+                   "~p ms of grace", [ConnId, State, Reason, Grace]),
+    {keep_state, Data#data{cp = undefined, cp_mon = undefined},
+     [{{timeout, cp_grace}, Grace, lost}]};
 
 handle_common(info, Info, State, Data) ->
     logger:debug("connector ~p ignoring ~p in ~p", [Data#data.conn_id, Info, State]),
@@ -405,17 +689,58 @@ build_snapshot(State, Data = #data{hold = Hold, session = S}) ->
                                 vehicle_id => S#session.vehicle_id,
                                 started_at => S#session.started_at,
                                 energy_kwh => S#session.energy_kwh,
-                                soc_pct    => S#session.soc_pct}}
+                                soc_pct    => S#session.soc_pct,
+                                %% for the `boot' ack of §3.1, which hands
+                                %% the charge point the limit in force
+                                limit_kw   => S#session.limit_kw}}
     end.
 
+%% §6 — reconciliation. `energy_kwh' is seeded from the payload because a
+%% charge point that reconnects after a station restart reports the total
+%% it has counted, and it is the only side that counted it. The default is
+%% 0.0, so every caller that never heard of reconciliation — the tests,
+%% the walk-in path — behaves exactly as before.
 session_from(Info, ClaimId) ->
     #session{user_id     = maps:get(user_id, Info),
              vehicle_id  = maps:get(vehicle_id, Info),
              claim_id    = ClaimId,
+             %% The adoption instant, not the plug instant: the station has
+             %% no memory of what happened before the crash, and §6 makes
+             %% the meter total the thing that is billed, not the duration.
              started_at  = vs_time:now_ms(),
+             energy_kwh  = float(maps:get(energy_kwh, Info, 0.0)),
              soc_pct     = maps:get(soc_pct, Info, 0),
              battery_kwh = maps:get(battery_kwh, Info, 0.0),
              max_kw      = maps:get(max_kw, Info, 0)}.
+
+%% Monitor the newcomer, drop the incumbent. `demonitor(..., [flush])'
+%% matters more than it looks: without the flush, the DOWN of the socket
+%% we just replaced may already be in the mailbox, and it would arm the
+%% grace timer of a connector whose charge point is perfectly healthy.
+attach(CpPid, Data = #data{cp = CpPid}) ->
+    Data;                                   %% the same socket, re-announcing
+attach(CpPid, Data = #data{cp = Old, cp_mon = OldRef, conn_id = ConnId}) ->
+    case Old of
+        undefined ->
+            ok;
+        _ ->
+            _ = erlang:demonitor(OldRef, [flush]),
+            logger:notice("connector ~p: charge point socket replaced", [ConnId]),
+            Old ! {cp_replaced}
+    end,
+    Ref = erlang:monitor(process, CpPid),
+    Data#data{cp = CpPid, cp_mon = Ref}.
+
+%% The one direction the connector talks to hardware: a plain message, never
+%% a call. A socket that is busy or gone must never be able to block the
+%% process that owns a physical outlet.
+send_cp(#data{cp = undefined}, _Cmd) ->
+    ok;
+send_cp(#data{cp = Pid}, Cmd) ->
+    Pid ! {cp_cmd, Cmd},
+    ok.
+
+stop_cmd(Reason) -> #{command => stop, reason => Reason}.
 
 %% Releasing is best-effort by contract (claim.md §5.6): the claim expires
 %% on its own, so a failed release is logged and forgotten rather than
@@ -460,3 +785,15 @@ notify(#data{notify_to = To, conn_id = ConnId}, Event) when is_atom(To) ->
 notify(#data{notify_to = To, conn_id = ConnId}, Event) ->
     To ! {connector_event, ConnId, Event},
     ok.
+
+%%%===================================================================
+%%% configuration — ws-chargepoint.md §10
+%%%===================================================================
+
+%% "Three missed heartbeats and the connector is marked out_of_service"
+%% (§3.2), read as a duration. The same number is cowboy's `idle_timeout'
+%% on the charge point socket, so the two halves of the rule — no frames
+%% arriving, no socket at all — expire together.
+cp_grace_ms() ->
+    vs_env:get_int("CP_HEARTBEAT_MISSED", 3)
+        * vs_env:get_int("CP_HEARTBEAT_INTERVAL_S", 30) * 1000.
