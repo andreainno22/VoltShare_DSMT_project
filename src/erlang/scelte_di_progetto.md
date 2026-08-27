@@ -405,6 +405,8 @@ Il backoff si azzera su un **`join` riuscito**, non su una `open` TCP: una stazi
 
 La misura è stata fatta con un client Node, che usa la stessa classe `WebSocket` del browser; che un browser vero si comporti identicamente è coerente col fatto che la corsa è a livello TCP/WebSocket e non nell'API, ma **non è stato osservato in un browser** — l'estensione non era disponibile. È l'unica cosa del passo 4 che resta da guardare con gli occhi.
 
+**Dopo una chiusura fatale il canale è finito, e `send()` lo dice subito.** Non è un caso limite: il token dura 60 minuti e la scadenza si controlla **solo** al `join` (`jwt.md` §1), quindi qualunque sessione più lunga del token finisce lì — con la griglia ancora disegnata dall'ultimo snapshot e non più viva. Accodare l'azione lascerebbe il pulsante disabilitato per sempre senza dire niente; `send()` rifiuta invece all'istante (misurato: 7 ms) con la frase che il driver può usare, *"your session has expired — reload the page"*. Trovato dalla verifica, non dalla lettura.
+
 ### 10.5 `?station_id=` lo appende il client
 
 `stations.ws_url` è quello che la stazione ha annunciato di sé e che il coordinatore ha memorizzato — `ws://localhost:9101/ws/driver`, **senza query string** — mentre `vs_driver_ws` chiude `4400` se `station_id` manca o nomina un'altra stazione. Appenderlo è quindi compito del client, ed è commentato nel punto in cui avviene: è il dettaglio che, al passo successivo, nessuno ricorda.

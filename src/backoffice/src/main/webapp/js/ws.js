@@ -46,8 +46,16 @@ function createDriverChannel(config) {
         4408: 'token_expired'
     };
 
+    /* What to tell a driver who clicks after one of those. */
+    var FATAL_MESSAGE = {
+        4400: 'the station refused this page',
+        4401: 'not authorised — reload the page',
+        4408: 'your session has expired — reload the page'
+    };
+
     var socket   = null;
     var joined   = false;
+    var refused  = null;        // the fatal close code, once one has arrived
     var backoff  = BACKOFF_MIN_MS;
     var pending  = new Map();   // request_id -> call, in flight right now
     var queue    = [];          // actions raised before the join was acked
@@ -99,6 +107,7 @@ function createDriverChannel(config) {
                        socket.readyState === WebSocket.OPEN)) {
             return;
         }
+        refused = null;
         status('connecting');
         socket = new WebSocket(endpoint());
         socket.onopen    = onOpen;
@@ -201,6 +210,17 @@ function createDriverChannel(config) {
 
     function send(action, payload) {
         var call = makeCall(action, payload);
+        if (refused) {
+            /* The channel is finished and no reconnection is coming (§7.5).
+             * This is not an edge case: the token lasts 60 minutes and its
+             * expiry is checked only at `join` (jwt.md §1), so any demo that
+             * outlives it ends here, with a grid still drawn from the last
+             * snapshot and no longer live.  Queuing the action would leave
+             * the button disabled for ever and say nothing; failing at once
+             * lets the page tell the driver to reload. */
+            fail(call, FATAL[refused], FATAL_MESSAGE[refused]);
+            return call.promise;
+        }
         if (!joined) {
             /* §3: nothing but join may travel before the join is acked, so
              * the action waits rather than being refused — the page can be
@@ -289,6 +309,7 @@ function createDriverChannel(config) {
         failAll('disconnected', 'the connection dropped before the station answered');
 
         if (FATAL[event.code]) {
+            refused = event.code;
             /* No reconnection.  The token lives in the page (jwt.md §2), so
              * sending it again would send the identical token; and a loop on
              * 4400 would bury a bug of ours under retries. */
