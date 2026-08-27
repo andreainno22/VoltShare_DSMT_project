@@ -526,14 +526,15 @@ closing(enter, _Old, Data = #data{session = S}) ->
             ended_at     => EndedAt,
             energy_kwh   => S#session.energy_kwh,
             overstay_seconds => 0},          %% overstay arrives in M4
-    case (Data#data.db_mod):insert_session(Row) of
-        ok -> ok;
-        {error, Reason} ->
-            %% The car has already charged; losing the row must not lose the
-            %% connector. Logged loudly, retried by the DB layer in M2.
-            logger:error("connector ~p could not write session: ~p",
-                         [Data#data.conn_id, Reason])
-    end,
+    %% A cast: it queues the row and returns. The connector must never wait
+    %% for a database — if it did, a slow MySQL would hold an outlet in
+    %% `closing' and a dead one would hold it there for the timeout, which
+    %% is a component that cannot deliver power deciding whether a
+    %% connector may be reused (SCOPE §4). There is no error branch here
+    %% because there is no longer an error to branch on: the retry, the
+    %% queue and its cap all live in vs_station_db, which is the only
+    %% process that knows whether the write got through.
+    ok = (Data#data.db_mod):insert_session(Row),
     release(Data, completed),
     notify(Data, {session_closed, Row}),
     {keep_state, Data, [{state_timeout, 0, done}]};

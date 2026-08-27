@@ -11,12 +11,18 @@
 %%%     ├── vs_station_mgr     connector registry, aggregate state,
 %%%     │                            power budget (value only until M2)
 %%%     ├── vs_claim_client    the only process talking to the coordinator
-%%%     └── vs_station_db      (M2) sessions INSERT
+%%%     └── vs_station_db      the only process talking to MySQL (M2 step 3)
 %%%
 %%% `one_for_one': the children are independent. A crash of the manager
 %%% must not restart the connectors (it re-adopts them instead — see
 %%% vs_station_mgr), and a crash of the claim client must not take down
 %%% sessions in progress.
+%%%
+%%% `vs_station_db' is last, and being last costs nothing: it connects from
+%%% a `handle_continue', so a database that is down delays no sibling, and
+%%% the connectors above it only ever cast to it. The one thing its restart
+%%% does cost is the rows still queued in it — the declared loss window,
+%%% written up in scelte_di_progetto.md.
 %%%-------------------------------------------------------------------
 -module(vs_station_sup).
 -behaviour(supervisor).
@@ -61,7 +67,17 @@ init([]) ->
           restart  => permanent,
           shutdown => 5000,
           type     => worker,
-          modules  => [vs_claim_client]}
+          modules  => [vs_claim_client]},
+
+        %% After the claim client: it is the one this calls once a row is
+        %% written, and starting in this order means the wake-up towards
+        %% Java never finds a mailbox that is not there yet.
+        #{id       => vs_station_db,
+          start    => {vs_station_db, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker,
+          modules  => [vs_station_db]}
     ],
 
     {ok, {SupFlags, Children}}.

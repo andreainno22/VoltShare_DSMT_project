@@ -35,7 +35,16 @@ start_connector(Extra) ->
 stop_connector(Pid) ->
     unlink(Pid),
     exit(Pid, shutdown),
-    ok.
+    %% Drain what this connector emitted. Without it a `session_closed'
+    %% left by one test satisfies the next test's expect_event before that
+    %% connector has done anything — a failure that points at the wrong
+    %% test and moves when tests are reordered.
+    flush_events().
+
+flush_events() ->
+    receive {connector_event, _, _} -> flush_events()
+    after 0 -> ok
+    end.
 
 with_connector(Fun) -> with_connector(#{}, Fun).
 
@@ -223,7 +232,8 @@ owner_stops_session_and_row_is_written_test() ->
     end).
 
 %% The car has already charged. Losing the row must not lose the connector
-%% as well: the write is logged as an error and the machine carries on.
+%% as well: since M2 step 3 the write is a cast, so the connector cannot
+%% even find out — which is the point. It frees itself either way.
 failed_write_still_frees_the_connector_test() ->
     with_connector(fun(Pid) ->
         ok = plug(Pid, ?VEHICLE),
@@ -233,6 +243,60 @@ failed_write_still_frees_the_connector_test() ->
         ?assertEqual(free, state_of(Pid)),
         ?assertEqual([], vs_db_stub:rows())
     end).
+
+%% M2 step 3 — the decision the whole database step turns on, tested
+%% against the **real** database module with no database process running
+%% at all. `insert_session/1' is a cast, so it goes nowhere and returns
+%% immediately, and the connector walks out of `closing' at the speed of
+%% its own state machine.
+%%
+%% This is the shape of the failure that matters: a station whose writer
+%% is restarting, or whose MySQL is gone, must still free its outlets
+%% (SCOPE §4). A synchronous `insert_session/1' would not merely be slow
+%% here — a `gen_server:call' to a name nobody has registered exits, and
+%% the connector would go down with a physical outlet in hand.
+closing_does_not_wait_for_the_database_test() ->
+    ?assertEqual(undefined, whereis(vs_station_db)),
+    with_connector(#{db_mod => vs_station_db}, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        {Micros, _} = timer:tc(fun() ->
+                          vs_connector:unplugged(Pid, 12.0),
+                          wait_until(fun() -> state_of(Pid) =:= free end)
+                      end),
+        ?assert(Micros < 300000),
+        ?assert(erlang:is_process_alive(Pid))
+    end).
+
+%% The row carries every column `sessions' needs, built by the connector
+%% and read by nobody else on the way — vs_station_db turns exactly this
+%% map into the INSERT parameters, and its own tests assert the columns.
+the_written_row_carries_what_the_table_needs_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 7.5, power_kw => 50.0}),
+        vs_connector:unplugged(Pid, 7.5),
+        %% waiting on the row and not on the event: the mailbox may still
+        %% hold a `session_closed' from an earlier test, and that one would
+        %% satisfy expect_event without this connector having written
+        %% anything yet
+        wait_until(fun() -> vs_db_stub:rows() =/= [] end),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(?USER, maps:get(user_id, Row)),
+        ?assertEqual(3, maps:get(connector_id, Row)),   %% the fixture's outlet
+        ?assertEqual(7.5, maps:get(energy_kwh, Row)),
+        %% overstay is M4; 0 is a declared value, not a missing one
+        ?assertEqual(0, maps:get(overstay_seconds, Row)),
+        ?assert(is_integer(maps:get(station_id, Row))),
+        ?assert(maps:get(ended_at, Row) >= maps:get(started_at, Row))
+    end).
+
+wait_until(F) -> wait_until(F, 200).
+wait_until(_F, 0) -> erlang:error(timed_out_waiting);
+wait_until(F, N) ->
+    case F() of
+        true  -> ok;
+        false -> timer:sleep(10), wait_until(F, N - 1)
+    end.
 
 others_cannot_stop_a_session_test() ->
     with_connector(fun(Pid) ->

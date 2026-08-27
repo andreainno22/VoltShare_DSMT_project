@@ -868,3 +868,142 @@ qui, con il loro default, e sono anche opzioni di `vs_station_mgr:start_link/1` 
 | `TAPER_SOC_PCT` | `80` | sopra questo SoC la domanda segue il contatore invece dei cap |
 | `TAPER_MARGIN_KW` | `5` | quanto sopra il misurato si chiede, per poter risalire |
 | `MIN_CHARGE_KW` | `6` | già in ws-driver.md §10: sotto, sospeso invece che affamato |
+
+---
+
+## 13. La riga su `sessions` (`vs_station_db`) — M2-A passo 3
+
+Fino a qui `vs_station_db` era un modulo senza processo che scriveva la sessione nel log. Adesso
+scrive davvero. La parte interessante del passo non è l'INSERT — sono venti righe di SQL — ma
+**chi aspetta chi**.
+
+### 13.1 L'INSERT è un cast, e il connettore non aspetta mai il database
+
+`vs_connector:closing/3` chiamava `insert_session/1` **in linea, dentro il gen_statem**. Con
+uno stub dietro era un microsecondo; con MySQL dietro sarebbe stato un giro di rete dentro la
+macchina a stati che governa una presa fisica. Se il database è lento il connettore resta in
+`closing`; se è irraggiungibile ci resta per il timeout, e la stazione smette di liberare le
+prese — per il guasto di un componente che non serve a caricare le auto. È esattamente ciò che
+SCOPE §4 (autonomia della stazione) vieta, ed è anche la regola strutturale concordata con B:
+**i connettori non fanno chiamate remote.**
+
+Quindi `insert_session/1` è un cast: accoda e torna.
+
+```
+connettore closing(enter) --cast--> vs_station_db --INSERT--> MySQL
+                                          |
+                                          +--> vs_claim_client:session_closed/1 --> leader --> Java
+```
+
+Tre conseguenze, tutte volute:
+
+- il connettore torna `free` alla velocità della propria macchina a stati, qualunque cosa faccia
+  il database — **misurato: 12 µs con MySQL su, 44 µs con MySQL fermo**;
+- l'evento `session_closed` verso Java parte **dopo** l'INSERT e lo manda il claim client, mai il
+  connettore: la regola di confine si realizza da sé invece di essere una raccomandazione;
+- il `SessionId` che l'evento richiede (erlang-java.md §2.3) esiste solo dopo l'INSERT, quindi
+  quello è l'unico posto da cui la catena può partire. `insert_session/1` non lo restituisce più
+  a nessuno: al connettore non serve, e restituirlo vorrebbe dire farlo aspettare.
+
+**Il prezzo, dichiarato invece che nascosto.** Una riga ancora in coda quando il nodo muore è
+persa. La finestra è la durata di un INSERT più quello che c'è in coda davanti: millisecondi con
+MySQL sano, quanto dura il guasto quando non lo è. L'alternativa — un write-ahead su disco, o un
+INSERT sincrono con conferma — ricomprerebbe una sessione non fatturata in un guasto raro
+pagandola con l'autonomia della stazione in **ogni** guasto del database. È lo scambio sbagliato,
+ed è il punto del passo.
+
+### 13.2 Coda, ritenta, e il tetto che scarta la più vecchia
+
+Coda in memoria, ritentata ogni `DB_RETRY_MS` (5000). Oltre `DB_QUEUE_MAX` (100) righe si scarta
+la **più vecchia**, con un `logger:error` che riporta la riga intera: se il database è giù da
+otto minuti la sessione più utile da salvare è l'ultima, e quella riga di log è l'ultima copia
+che resta di quella che si butta.
+
+Niente deduplicazione e niente riordino. L'UPDATE di B è condizionato a `cost_cents IS NULL`
+(erlang-java.md §2.3), quindi una riga scritta due volte non fattura due volte: **at-least-once
+su una scrittura idempotente**, che è il modo di ottenere il comportamento "esattamente una
+volta" senza un canale che lo garantisca. All'orale si dice con queste parole.
+
+**Due fallimenti che si somigliano e non sono la stessa cosa.** Se il server *risponde* con un
+errore (una foreign key che non risolve, un valore fuori scala) la riga è sbagliata e lo sarà
+anche al prossimo tentativo: ritentarla per sempre incastrerebbe dietro di sé ogni sessione
+successiva, quindi si scarta lì con un log. Se invece la chiamata *esplode*, la connessione non
+c'è più e la riga non è mai arrivata: quella si tiene. La distinzione è una clausola sola e
+senza di essa la coda si sarebbe potuta bloccare su una riga difettosa.
+
+**Il difetto che l'E2E ha trovato e i test no.** Il timer del ritenta fa due lavori — svuotare la
+coda **e** riaprire la connessione — e nella prima stesura una coda vuota lo cancellava. Una
+stazione che aveva scritto tutto quello che aveva e poi perdeva MySQL si trovava con coda vuota e
+nessuna connessione: cancellava la propria riconnessione e non ne apriva più un'altra. MySQL
+tornava su e la stazione continuava a rifiutare ogni walk-in, perché `user_for_vehicle/1`
+rispondeva `no_connection` per sempre, senza un errore da nessuna parte che lo spiegasse. Le due
+clausole di `flush/1` sono ora nell'ordine opposto, e c'è un test che tiene il guasto più lungo
+del primo ritenta — senza quello il difetto è invisibile.
+
+### 13.3 I tempi: epoch ms dentro, DATETIME fuori, UTC in mezzo
+
+`sessions.started_at`/`ended_at` sono `DATETIME` e il connettore produce epoch in millisecondi.
+La conversione si fa **in Erlang, verso UTC** (`calendar:system_time_to_universal_time/2`) e non
+con `FROM_UNIXTIME()` in SQL: `FROM_UNIXTIME` lavora sul `time_zone` della sessione MySQL, che è
+una variabile d'ambiente del container di qualcun altro invece di una decisione presa da noi — la
+stessa classe di errore invisibile della discussione secondi-contro-millisecondi sul confine
+Java.
+
+*Verificato, e vale la pena averlo guardato:* il container MySQL gira con `time_zone = SYSTEM` e
+`NOW()` uguale a `UTC_TIMESTAMP()`. Cioè oggi `FROM_UNIXTIME` avrebbe dato lo stesso risultato —
+ed è esattamente il motivo per cui non la si usa: funzionerebbe finché nessuno cambia il fuso del
+container, e il giorno che qualcuno lo cambia le date sbagliano di un'ora senza che niente
+fallisca.
+
+UTC è anche quello che fa già B: `Db.java` apre la connessione con `serverTimezone=UTC` e
+`SessionDao` legge con `getTimestamp(...).toLocalDateTime()`. È una convenzione già in vigore
+dall'altra parte, quindi si rispetta e si verifica, non si concorda di nuovo.
+
+L'evento verso Java tiene invece i **millisecondi**, perché il contratto è esplicito che ogni
+cifra su quel confine è in millisecondi e `OverstaySeconds` è l'unica eccezione, con l'unità nel
+nome. Riga in DATETIME, evento in ms, dalla stessa mappa.
+
+### 13.4 Una connessione sola, e l'unica funzione sincrona
+
+Un pool sarebbe sovradimensionato per una stazione con quattro prese, e una connessione condivisa
+fra più processi vorrebbe un lock. Questo processo ne tiene **una** ed è l'unico che la tocca: la
+serializzazione diventa un fatto strutturale invece che una configurazione.
+
+`user_for_vehicle/1` è l'unico ingresso **sincrono**, e può permetterselo: sta sul percorso di un
+`plugged`, il chiamante è un processo socket e non un connettore, e senza la risposta non si può
+decidere se autorizzare un walk-in. Ha un timeout esplicito, quindi il caso peggiore è un walk-in
+rifiutato con una riga di log, mai un socket appeso.
+
+**La conseguenza da sapere, misurata:** con MySQL fermo un walk-in **non può iniziare** — la
+risoluzione veicolo→utente non ha risposta e il `plugged` viene rifiutato
+(`no account for vehicle 2 (no_connection)`). Le sessioni già in corso invece si chiudono
+normalmente e la loro riga si accoda. L'autonomia della stazione vale quindi per *finire* di
+caricare, non per *cominciare*: e va detto, perché il commento di D1 sostiene che
+`user_for_vehicle` sta alla stazione invece che al coordinatore proprio per non mettere una
+chiamata remota sul percorso del walk-in — ma MySQL è remoto quanto il coordinatore. Il beneficio
+reale di quella scelta è un altro, ed è comunque vero: `vehicles` è una tabella del back office
+che il coordinatore non tiene, quindi chiederla a lui vorrebbe dire farla replicare a un processo
+che non la possiede.
+
+### 13.5 Lo stub identità se ne va, e con lui un veicolo che non esisteva
+
+`user_for_vehicle/1` era lo stub-identità del passo 1: rispondeva `{ok, VehicleId}` e lo scriveva
+nel log. Adesso è `SELECT user_id FROM vehicles WHERE id = ?`, e un veicolo che la tabella non ha
+viene **rifiutato** invece che inventato.
+
+Conseguenza pratica per la demo: il seed ha solo i veicoli 1 e 2, quindi l'emulatore va lanciato
+con `--vehicle 1` o `--vehicle 2`. Il `--vehicle 88` degli esempi del passo 1 funzionava solo
+perché lo stub mentiva, e adesso produce
+`no account for vehicle 88` — che è la risposta giusta, non una regressione.
+
+### 13.6 Dove va nell'albero, e perché per ultimo
+
+`vs_station_db` è ora un figlio di `vs_station_sup`, in coda. Essere ultimo non costa niente:
+si connette da un `handle_continue`, quindi un database giù non ritarda nessun fratello, e i
+connettori sopra di lui gli mandano solo cast. Sta **dopo** `vs_claim_client` perché è quello che
+chiama quando una riga è scritta, e in quest'ordine la sveglia verso Java non trova mai una
+mailbox che non c'è ancora.
+
+L'unica cosa che il suo riavvio costa sono le righe ancora in coda dentro di lui: è la finestra
+di perdita di §13.1, e il `terminate/2` la scrive nel log riga per riga invece di lasciarla
+scoprire dopo.

@@ -9,7 +9,7 @@
 -module(vs_claim_stub).
 
 -export([set_reply/1, calls/0, reset/0, last_claim_id/0]).
--export([acquire/4, renew/2, release/2]).
+-export([acquire/4, renew/2, release/2, session_closed/1]).
 
 -define(REPLY, {?MODULE, reply}).
 -define(CALLS, {?MODULE, calls}).
@@ -50,4 +50,11 @@ renew(StationId, ClaimIds) ->
 
 release(ClaimId, Reason) ->
     record({release, ClaimId, Reason}),
+    ok.
+
+%% Since M2 step 3 the claim client is also the way out for the back
+%% office wake-up, sent by vs_station_db once the row is in MySQL. Landing
+%% it in the same call log lets a test assert the tuple field for field.
+session_closed(Event) ->
+    record({session_closed, Event}),
     ok.

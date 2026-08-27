@@ -1191,6 +1191,141 @@ Compilazione pulita da `_build` svuotato, `warnings_as_errors` attivo.
 
 ---
 
+## 7s. M2-A passo 3: la riga su `sessions` — 27 agosto
+
+Branch `a/m2-db`, da `a/m2-power` (`21ba127`). `vs_station_db` diventa un gen_server con una
+connessione `mysql-otp`; nuova `vs_claim_client:session_closed/1`; `vs_connector:closing/3`
+perde il `case` sull'esito della scrittura; `vs_station_sup` guadagna un figlio. Nuova
+dipendenza `{mysql, "1.8.0"}`, `rebar.lock` aggiornato. **`schema.sql` non toccato**: la
+tabella si usa com'è.
+
+Con questo, la catena è chiusa da capo a fondo per la prima volta: l'auto carica, la stazione
+scrive la riga, il coordinatore sveglia Java, Java la fattura. Fino a ieri la fatturazione
+girava su righe inserite a mano.
+
+### Una premessa del prompt era vecchia di due ore
+
+Il prompt dava la baseline a 217 test. Sono **219**: i due test aggiunti dal commit `21ba127`
+(le correzioni al passo 2), che il piano precede. Discrepanza spiegata per intero, non un
+mistero: si riparte da 219.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline `rebar3 eunit` (mai `--app`) | 27/08 | **219 test, 0 fallimenti** (non 217 — vedi sopra) |
+| `mysql-otp` 1.8.0 compila su OTP 29 | `{mysql, "1.8.0"}` in `rebar.config` + `rebar3 compile` | **verificata**: compila. Due warning nel sorgente della dipendenza (`catch` deprecato, `0.0` che non matcha `-0.0`), già coperti dall'`overrides` che toglie `warnings_as_errors` alle dipendenze |
+| Il nodo Erlang raggiunge MySQL | connessione dal container `station2` con le credenziali del compose | **verificata**: `SELECT 1` → `[[1]]`; `vehicles` → `[[1,1],[2,2]]`; `sessions` → 0 righe (quindi nessun residuo di `cc-probe` che disturbi — la quarta premessa NON VERIFICATA del piano, chiusa) |
+
+*Di passaggio, e vale la pena:* il container MySQL gira con `time_zone = SYSTEM` e
+`NOW() = UTC_TIMESTAMP()`. Cioè `FROM_UNIXTIME()` oggi avrebbe dato lo stesso risultato — ed è
+esattamente perché non la si usa: funzionerebbe finché nessuno cambia il fuso del container.
+
+### Verificato — girato davvero
+
+- **Suite: 244 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 219 di baseline + 25 nuovi:
+  23 su `vs_station_db` (l'orologio verso UTC compresa un'ora legale e un cambio d'ora, la riga
+  colonna per colonna, la tupla di `erlang-java.md` §2.3 campo per campo, la coda, il tetto, il
+  ritenta, il rifiuto del server contro la connessione caduta, la riconnessione, e i quattro
+  esiti di `user_for_vehicle/1`) e 2 su `vs_connector`. **Nessuno richiede MySQL**: la parte che
+  conta è il comportamento quando il database *non* risponde, e un test che avesse bisogno di un
+  database funzionante non potrebbe produrlo su richiesta.
+- **Sessione completa → una riga.** Emulatore su st. 2/conn 5, veicolo 2:
+  `final energy_kwh = 1.164`, riga `energy_kwh = 1.164` — **differenza 0.000**. Log stazione:
+  `session 1 written: connector 5, user 2, 1.164 kWh`.
+- **Le date, lette in SQL.** Emulatore `plugged` alle `15:04:52.237`, `unplugged` alle
+  `15:05:20.259` (il log di `cp.js` è in UTC, `toISOString`); riga
+  `started_at = 15:04:52`, `ended_at = 15:05:20`. **Coincidono al secondo, in UTC.** Confermato
+  da una seconda sessione: plugged `15:16:33.356` / unplugged `15:17:06.455` → riga
+  `15:16:33` / `15:17:06`.
+- **`cost_cents` NULL all'inserimento.** Non si riesce a *vederlo* nel giro normale, perché
+  B fattura in 38 ms (sotto); osservato fermando il back office: riga `[5, 1, 2, 7, …, 0.458, 0,
+  **null**]`. Al riavvio la spazzata periodica l'ha prezzata da sola
+  (`15:20:55 Billed 1 session(s)`, costo 19) — cioè la proprietà del contratto "perdere l'evento
+  ritarda una ricevuta di un intervallo e non perde niente", vista girare.
+- **La catena fino a Java, cronometrata.** Sessione finita alle `15:17:06.455`; back office:
+  `15:17:06.493 BillingService.sweep Billed 1 session(s)`. **38 ms**, che non è la spazzata da 60
+  secondi: è la sveglia `session_closed` che l'ha fatta partire prima. È anche la prova che la
+  tupla di §2.3 è nella forma giusta — un campo fuori posto non avrebbe dato errore da nessuna
+  parte, e questo è l'unico modo di accorgersene senza guardare una fattura.
+- **La prova che conta: MySQL fermo.** Sessione avviata con MySQL su, `docker stop mysql` a
+  sessione in corso, poi chiusura:
+
+  | | MySQL su | MySQL fermo |
+  |---|---|---|
+  | percorso di `closing`, dal cast `unplugged` al `free` | **12 µs** | **44 µs** |
+
+  Microsecondi in entrambi i casi: nessun ritardo misurabile, che è il punto dell'INSERT
+  asincrono. Connettore `free`, **1 riga in coda**. Al `docker start mysql` la riga è comparsa
+  **da sola entro ~1 s** dal momento in cui MySQL è tornato sano — dentro `DB_RETRY_MS` (5 s) —
+  con `session 3 written` nel log e nessun intervento.
+- **Una riga per sessione, mai due**: cinque sessioni, cinque righe, id da 1 a 5, nessun
+  duplicato — compresa quella passata dalla coda.
+- **`warnings_as_errors` attivo**: build pulita da `_build` svuotato.
+
+### Un difetto trovato dall'E2E, che i test non avevano preso
+
+Il timer del ritenta fa due lavori — svuotare la coda **e** riaprire la connessione — e una coda
+vuota lo cancellava. Una stazione che aveva scritto tutto e poi perdeva MySQL restava con coda
+vuota e nessuna connessione: **cancellava la propria riconnessione e non ne apriva più un'altra.**
+MySQL tornava su e la stazione continuava a rifiutare ogni walk-in, perché `user_for_vehicle/1`
+rispondeva `no_connection` per sempre — senza un errore da nessuna parte che lo spiegasse.
+
+Trovato perché dopo un `docker start mysql` la stazione andava avanti a rifiutare l'emulatore. Le
+due clausole di `flush/1` sono ora nell'ordine opposto. Il test che lo copre tiene il guasto più
+lungo del primo ritenta: scritto prima in una versione che *passava lo stesso* — la connessione
+riusciva al primo tentativo e il ramo difettoso non veniva mai attraversato — e reso capace di
+fallire prima di correggere. Senza quel passaggio sarebbe rimasto un test verde su un difetto
+vivo.
+
+### Non provato — e perché
+
+- **`history.jsp` non è stata aperta.** Due ostacoli, entrambi fuori dal mio controllo:
+  l'estensione Chrome non risulta connessa (`Browser extension is not connected`), e non ho la
+  password di `lore` né di `cc-probe` — gli utenti sono di B e le loro credenziali non stanno nel
+  repo. **La verifica del fuso è quindi fatta a metà**: le date coincidono al secondo lette in
+  SQL, ma nessuno ha ancora confermato che appaiano con la stessa ora nella pagina. È l'unica
+  metà che potrebbe nascondere un errore di un'ora, perché lì passa dal `getTimestamp` di B.
+- **Il tetto della coda non è stato provato E2E**: 100 righe richiedono cento sessioni. Coperto
+  da un test unitario con `queue_max => 3`.
+- **La riga persa alla morte del nodo** (la finestra dichiarata) non è stata provocata: servirebbe
+  un `docker kill` cronometrato fra il cast e l'INSERT. Il `terminate/2` che la scrive nel log
+  esiste e non è stato visto scattare.
+- **Il seed non distingue lo stub dalla SELECT vera** per i veicoli che ha: `vehicles` mappa 1→1
+  e 2→2, quindi identità e query danno lo stesso risultato. Quello che *distingue* è il veicolo
+  88 dell'esempio del passo 1, ora rifiutato (`no account for vehicle 88`) — ed è stato visto.
+- **`overstay_seconds` è sempre 0**: è M4, e il campo è scritto come valore dichiarato, non
+  mancante.
+
+### Catena dei chiamanti: quattro voci che il piano non aveva
+
+1. **`vs_cp_stub` è un secondo `db_mod`** che la tabella §6 non elenca: implementa
+   `user_for_vehicle/1` per i test di `vs_cp_proto`. Non implementa `insert_session/1`, quindi il
+   passaggio a cast non lo tocca — ma è un'implementazione in più da tenere allineata.
+2. **`{session_closed, Row}` esisteva già** come nome di evento del connettore verso il manager
+   (`vs_connector.erl:538`), ed è una cosa diversa dalla `vs_claim_client:session_closed/1` nuova
+   verso il coordinatore. Stesso nome, due direzioni, due righe di distanza nello stesso file.
+3. **La forma sul filo non è quella che sembra.** `vs_coord_srv` fa match su
+   `{session_closed, Event}` — una tupla a **due** elementi che ne avvolge una a nove — mentre
+   `station_stats`, che il piano indica come modello, viaggia piatta a cinque. Mandare i nove
+   campi piatti sarebbe caduto nel catch-all del coordinatore: un warning in un log che nessuno
+   guarda, e una ricevuta che non arriva mai. Verificato leggendo `vs_coord_srv:203-265` e
+   `vs_coord_bo:126`, non assunto dal nome.
+4. **`db_mod` è iniettato anche in `vs_cp_proto`** (`:86`), non solo nel connettore: due percorsi
+   indipendenti verso lo stesso modulo.
+
+### Una conseguenza di progetto da mettere agli atti
+
+Con MySQL fermo un walk-in **non può cominciare**: `user_for_vehicle/1` non ha risposta e il
+`plugged` viene rifiutato. Le sessioni già in corso si chiudono normalmente e le loro righe si
+accodano. L'autonomia della stazione vale quindi per *finire* di caricare, non per *cominciare*
+— e il commento di D1 (`user_for_vehicle` sta alla stazione «perché il walk-in deve funzionare
+mentre il sito è isolato») va letto con questo in mano: MySQL è remoto quanto il coordinatore. Il
+beneficio vero di quella scelta resta un altro e regge: `vehicles` è una tabella del back office
+che il coordinatore non possiede.
+
+---
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
@@ -1220,10 +1355,11 @@ dal funzionare, e senza di esso lo scenario 5 si mostra dai log invece che da un
 server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il suo
 `vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
 
-**M2-A**: canale colonnina (§7p) e allocazione della potenza (§7q) sono fatti; resta l'**INSERT
-su `sessions`**, il passo 3. Finché non c'è, la fatturazione gira su righe inserite a mano — il
-calcolo è verificato, il flusso completo no: la stazione chiude la sessione, la scrive nel log
-con il totale giusto, e nessuno la persiste.
+**M2-A è completo**: canale colonnina (§7p), allocazione della potenza (§7q) e INSERT su
+`sessions` (§7s). La fatturazione non gira più su righe inserite a mano: l'auto carica, la
+stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
+fine della sessione. Quello che resta di M2-A è la verifica del fuso in `history.jsp`, che
+richiede un browser e una password che non ho.
 
 ### Prima di M5
 
