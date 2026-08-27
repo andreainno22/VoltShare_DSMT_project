@@ -379,6 +379,56 @@ set_limit_is_stored_and_forwarded_test() ->
         ?assertEqual(60.0, maps:get(limit_kw, Session))
     end).
 
+%% M2 step 2 — `suspended' is derived from the limit, not stored: it is
+%% `charging' at zero, which is what ws-driver.md §5.1 says it means and
+%% what ws-chargepoint.md §5 puts on the wire. Nothing else about the
+%% connector changes, which is the point of deriving it rather than
+%% adding a sixth state: it goes back and forth with the allocation, and
+%% a real state would fire `enter' and `exit' every time it did.
+a_zero_limit_is_reported_as_suspended_test() ->
+    with_connector(fun(Pid) ->
+        Cp = fake_cp(),
+        ok = vs_connector:attach_cp(Pid, Cp),
+        ok = plug(Pid, ?VEHICLE),
+        ?assertMatch(#{command := set_limit}, expect_cmd(Cp)),   %% the D5 interim one
+        ?assertEqual(charging, state_of(Pid)),
+
+        vs_connector:set_limit(Pid, 0),
+        ?assertEqual(#{command => set_limit, limit_kw => 0.0}, expect_cmd(Cp)),
+        ?assertEqual(suspended, state_of(Pid)),
+        %% the session is alive, not ended: that is the whole difference
+        %% between suspended and closed
+        Session = maps:get(session, vs_connector:snapshot(Pid)),
+        ?assertEqual(?USER, maps:get(user_id, Session)),
+        ?assertEqual(0.0, maps:get(limit_kw, Session)),
+
+        %% and it comes back the same way it went, with no state change
+        vs_connector:set_limit(Pid, 40),
+        ?assertEqual(#{command => set_limit, limit_kw => 40.0}, expect_cmd(Cp)),
+        ?assertEqual(charging, state_of(Pid))
+    end).
+
+%% A car that never declared what it can take starts at min(rated, 0),
+%% which is zero — D5 says so in words, and the derived state is what
+%% makes it visible. §4.2 makes `max_kw' mandatory, so this is a
+%% misbehaving charge point being reported honestly, not a supported way
+%% to plug in.
+a_session_with_no_max_kw_starts_suspended_test() ->
+    with_connector(fun(Pid) ->
+        ok = vs_connector:plugged(Pid, #{user_id => ?USER, vehicle_id => ?VEHICLE}),
+        ?assertEqual(suspended, state_of(Pid))
+    end).
+
+%% The allocator needs the car's own ceiling to compute a demand, and it
+%% reads it off the snapshot. It was in the session record already; only
+%% the snapshot was missing it.
+the_snapshot_carries_what_the_car_can_take_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        Session = maps:get(session, vs_connector:snapshot(Pid)),
+        ?assertEqual(150, maps:get(max_kw, Session))
+    end).
+
 %% "Meaningful only while charging": a limit for a connector with nothing
 %% plugged in has nothing to limit, and nothing goes out on the wire.
 set_limit_outside_a_session_is_absorbed_test() ->

@@ -17,16 +17,21 @@
 %%% fixture
 %%%===================================================================
 
-start_station() ->
+%% The allocator's settings are options and not only environment
+%% variables so that a test can shorten the power tick instead of
+%% sleeping through five seconds of it — the same reason lease_seconds is
+%% an option.
+start_station(Extra) ->
     vs_claim_stub:reset(),
     vs_db_stub:reset(),
     {ok, Sup} = vs_connector_sup:start_link(),
-    {ok, Mgr} = vs_station_mgr:start_link(#{station_id    => 1,
-                                            site_power_kw => 350,
-                                            connectors    => ?CONNECTORS,
-                                            claim_mod     => vs_claim_stub,
-                                            db_mod        => vs_db_stub,
-                                            lease_seconds => 900}),
+    {ok, Mgr} = vs_station_mgr:start_link(
+                  maps:merge(#{station_id    => 1,
+                               site_power_kw => 350,
+                               connectors    => ?CONNECTORS,
+                               claim_mod     => vs_claim_stub,
+                               db_mod        => vs_db_stub,
+                               lease_seconds => 900}, Extra)),
     {Sup, Mgr}.
 
 stop_station({Sup, Mgr}) ->
@@ -42,7 +47,10 @@ stop_station({Sup, Mgr}) ->
     flush_messages().
 
 with_station(Fun) ->
-    Ctx = start_station(),
+    with_station(#{}, Fun).
+
+with_station(Extra, Fun) ->
+    Ctx = start_station(Extra),
     try Fun() after stop_station(Ctx) end.
 
 wait_until(F) -> wait_until(F, 100).
@@ -224,23 +232,154 @@ name_and_tariff_come_from_the_environment_test() ->
         os:unsetenv("TARIFF_CENTS_KWH")
     end.
 
-%% Until the allocation algorithm of M2, `allocated_kw' is the sum of
-%% what the connectors report drawing — a number the meters agree with,
-%% rather than one nobody computed.
-allocated_kw_is_the_sum_of_what_the_connectors_draw_test() ->
+%%%===================================================================
+%%% the power split (SCOPE §3.5) — M2 step 2
+%%%===================================================================
+
+%% Plug a car in, with everything §4.2 makes mandatory. `soc_pct' stays
+%% well under TAPER_SOC_PCT unless a test says otherwise, so the demand
+%% is the pair of ceilings and not the charging curve.
+plug(Pid, UserId, VehicleId, MaxKw) ->
+    ok = vs_connector:plugged(Pid, #{user_id => UserId, vehicle_id => VehicleId,
+                                     soc_pct => 22, battery_kwh => 58.0,
+                                     max_kw  => MaxKw}).
+
+limit_of(ConnId) ->
+    {ok, Pid} = vs_station_mgr:connector_pid(ConnId),
+    maps:get(limit_kw, maps:get(session, vs_connector:snapshot(Pid))).
+
+allocated() ->
+    maps:get(allocated_kw, vs_station_mgr:station_state()).
+
+near(Expected, Actual) -> abs(Expected - Actual) =< 0.001.
+
+%% The definition changed in M2 step 2: `allocated_kw' is the sum of the
+%% limits the manager granted, not of the power the meters report. The
+%% two numbers differ on purpose — a car may draw less than it is allowed
+%% and one that is tapering always does — and the granted figure is the
+%% one that answers "how much of this site is committed".
+%%
+%% This test is the rewrite of the M1 one, not a new test beside it: the
+%% field did not disappear, its definition moved.
+allocated_kw_is_the_sum_of_the_limits_granted_test() ->
     with_station(fun() ->
         {ok, Pid1} = vs_station_mgr:connector_pid(1),
         {ok, Pid2} = vs_station_mgr:connector_pid(2),
         {ok, _} = vs_connector:reserve(Pid1, ?USER, ?VEHICLE),
-        ok = vs_connector:plugged(Pid1, #{user_id => ?USER, vehicle_id => ?VEHICLE}),
-        vs_connector:meter(Pid1, #{power_kw => 120.5, energy_kwh => 3.0}),
+        plug(Pid1, ?USER, ?VEHICLE, 150),
         %% a walk-in on the other connector counts exactly the same
-        ok = vs_connector:plugged(Pid2, #{user_id => 77, vehicle_id => 5}),
+        plug(Pid2, 77, 5, 50),
+        %% 350 kW of budget for 200 of demand: everybody gets what they ask
+        wait_until(fun() -> near(200.0, allocated()) end),
+        ?assert(near(150.0, limit_of(1))),
+        ?assert(near(50.0, limit_of(2))),
+        %% and the meters are deliberately *not* what is being summed
+        vs_connector:meter(Pid1, #{power_kw => 120.5, energy_kwh => 3.0}),
         vs_connector:meter(Pid2, #{power_kw => 40.0, energy_kwh => 1.0}),
-        wait_until(fun() ->
-                           120.5 + 40.0 =:= maps:get(allocated_kw,
-                                                     vs_station_mgr:station_state())
-                   end),
-        ?assertEqual(160.5, maps:get(allocated_kw, vs_station_mgr:station_state()))
+        ?assert(near(200.0, allocated()))
     end).
+
+%% The invariant of the whole step, in one line: a site cannot hand out
+%% more than it has. Two cars asking for 200 kW on a 180 kW site — the
+%% hole M1 left open and this step closes.
+allocated_kw_never_exceeds_the_site_budget_test() ->
+    with_station(#{site_power_kw => 180}, fun() ->
+        {ok, Pid1} = vs_station_mgr:connector_pid(1),
+        {ok, Pid2} = vs_station_mgr:connector_pid(2),
+        plug(Pid1, ?USER, ?VEHICLE, 150),
+        plug(Pid2, 77, 5, 50),
+        wait_until(fun() -> near(180.0, allocated()) end),
+        ?assert(allocated() =< maps:get(site_power_kw, vs_station_mgr:station_state())),
+        %% the fair share with hand-back, on the real topology: the small
+        %% car cannot absorb its 90 kW half and returns 40 of it
+        ?assert(near(130.0, limit_of(1))),
+        ?assert(near(50.0, limit_of(2)))
+    end).
+
+%% A departure is a recomputation like an arrival: the power the leaving
+%% car was holding goes back to whoever is left, without a tick.
+a_departure_returns_its_power_to_the_others_test() ->
+    with_station(#{site_power_kw => 180}, fun() ->
+        {ok, Pid1} = vs_station_mgr:connector_pid(1),
+        {ok, Pid2} = vs_station_mgr:connector_pid(2),
+        plug(Pid1, ?USER, ?VEHICLE, 150),
+        plug(Pid2, 77, 5, 50),
+        wait_until(fun() -> near(130.0, limit_of(1)) end),
+        vs_connector:unplugged(Pid2, 4.0),
+        wait_until(fun() -> near(150.0, limit_of(1)) end),
+        ?assert(near(150.0, allocated()))
+    end).
+
+%% The tick exists for exactly one reason: a `meter' emits no event, so a
+%% car that starts tapering would otherwise keep its whole allocation
+%% until somebody arrived or left. Here the small connector's car goes
+%% over the taper threshold and drops to absorbing 10 kW, its demand
+%% falls to 15, and the tick is what hands the other car the difference.
+the_power_tick_is_what_notices_a_taper_test() ->
+    with_station(#{site_power_kw => 180, power_tick_ms => 50}, fun() ->
+        {ok, Pid1} = vs_station_mgr:connector_pid(1),
+        {ok, Pid2} = vs_station_mgr:connector_pid(2),
+        plug(Pid1, ?USER, ?VEHICLE, 150),
+        plug(Pid2, 77, 5, 50),
+        wait_until(fun() -> near(130.0, limit_of(1)) end),
+        %% no event comes out of this, by design
+        vs_connector:meter(Pid2, #{power_kw => 10.0, energy_kwh => 2.0, soc_pct => 90}),
+        wait_until(fun() -> near(15.0, limit_of(2)) end),
+        %% the other car climbs from 130 back to its own ceiling; the 15
+        %% kW the site no longer needs simply stays unallocated, because
+        %% nobody can absorb it
+        ?assert(near(150.0, limit_of(1))),
+        ?assert(near(165.0, allocated()))
+    end).
+
+%% Below the floor a session is suspended, not starved (SCOPE §3.5): it
+%% is given a limit of zero and reports itself `suspended', which is the
+%% derived state of ws-driver.md §5.1 and not a sixth state of the
+%% connector's machine. With the real budgets this is unreachable —
+%% 350/4 and 180/3 are both far above 6 kW — so the only way to show it
+%% is a site configured small, which is exactly what the demo would do.
+a_suspended_connector_reports_suspended_test() ->
+    with_station(#{site_power_kw => 8, min_charge_kw => 6}, fun() ->
+        {ok, Pid1} = vs_station_mgr:connector_pid(1),
+        {ok, Pid2} = vs_station_mgr:connector_pid(2),
+        plug(Pid1, ?USER, ?VEHICLE, 150),
+        plug(Pid2, 77, 5, 50),
+        %% 4 kW each is under the floor, so the later arrival is suspended
+        %% and the first one keeps the whole 8
+        wait_until(fun() -> near(+0.0, limit_of(2)) end),
+        ?assert(near(8.0, limit_of(1))),
+        State = vs_station_mgr:station_state(),
+        ?assertEqual(suspended, maps:get(state, connector_in(State, 2))),
+        %% the session is alive, not ended: it is charging at zero
+        ?assertEqual(charging, maps:get(state, connector_in(State, 1))),
+        ?assert(is_map(maps:get(session, connector_in(State, 2)))),
+        %% and the site is still within its budget
+        ?assert(near(8.0, allocated()))
+    end).
+
+%% `set_limit' is re-sent on every recomputation even at an unchanged
+%% value (ws-chargepoint.md §5). What must NOT happen is the recomputation
+%% producing an event of its own: that would be recompute → event →
+%% recompute, a loop at full speed rather than a slow leak. The tick runs
+%% here every 20 ms with a session up; if a set_limit notified, the
+%% manager's mailbox would never drain.
+the_recomputation_does_not_feed_itself_test() ->
+    with_station(#{power_tick_ms => 20}, fun() ->
+        {ok, Pid1} = vs_station_mgr:connector_pid(1),
+        plug(Pid1, ?USER, ?VEHICLE, 150),
+        wait_until(fun() -> near(150.0, limit_of(1)) end),
+        ok = vs_station_mgr:subscribe(),
+        %% drain whatever the arrival itself produced
+        flush_messages(),
+        timer:sleep(200),        %% ~10 ticks
+        Pushes = count_pushes(0),
+        ?assertEqual(0, Pushes),
+        %% and the manager is alive and still answering
+        ?assert(near(150.0, allocated()))
+    end).
+
+count_pushes(N) ->
+    receive {station_state, _} -> count_pushes(N + 1)
+    after 0 -> N
+    end.
 

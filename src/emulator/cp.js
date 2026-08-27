@@ -275,10 +275,23 @@ function plugged(why) {
 // ---------------------------------------------------------------- charging
 
 // §5: "0 means suspended: the session stays open and draws nothing."
+//
+// The repetition test is against `limit.target`, NOT against the value the
+// ramp happens to be passing through. §5 has the station re-send the limit
+// on every recomputation even when it is unchanged, so identical commands
+// arrive every tick; comparing them with the interpolated value would find
+// them different for as long as the ramp is running, restart it from where
+// it is with a fresh window, and stretch it by one tick each time. It still
+// converges, but the applied-limit time measured in the demo would be
+// longer than the hardware's real one — the emulator making the station
+// look worse than it is, which is the same sin as making it look better.
+//
+// A genuinely new value still ramps from `appliedLimit(now)`: the hardware
+// is where it is, not where it was told to go.
 function setLimit(kw, why) {
+  if (Math.abs(limit.target - kw) < 0.001) return;   // repeated, not changed
   const now = Date.now();
   const current = appliedLimit(now);
-  if (Math.abs(current - kw) < 0.001) return;      // repeated, not changed
   limit.from = current;
   limit.target = kw;
   limit.atMs = now;

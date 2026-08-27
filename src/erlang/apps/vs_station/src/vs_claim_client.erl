@@ -46,6 +46,9 @@
 -export([coordinator_reachable/0]).
 %% lifecycle
 -export([start_link/0, start_link/1]).
+%% pure, and exported so the lobby's three numbers can be tested on a map
+%% built by hand instead of on a whole station
+-export([count_stats/1]).
 %% gen_server
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, handle_continue/2]).
 
@@ -479,14 +482,22 @@ req_id() ->
 %% closing counts as charging: a session is still ending there. offline
 %% counts as nothing: not free, not usable — which is why the three
 %% numbers may add up to less than the connector total.
+%%
+%% `suspended' counts as charging too, and the clause has to be written
+%% out: it is what a charging session at a limit of zero reports since M2
+%% step 2, and without it the catch-all below would quietly drop it. The
+%% connector is neither free nor held — somebody's car is plugged into it
+%% and the session is alive — so a lobby that showed it as available
+%% would send the next driver to an outlet that is already taken.
 count_stats(#{connectors := Connectors}) ->
     lists:foldl(fun(C, {F, H, Ch}) ->
                         case maps:get(state, C, offline) of
-                            free     -> {F + 1, H, Ch};
-                            held     -> {F, H + 1, Ch};
-                            charging -> {F, H, Ch + 1};
-                            closing  -> {F, H, Ch + 1};
-                            _        -> {F, H, Ch}
+                            free      -> {F + 1, H, Ch};
+                            held      -> {F, H + 1, Ch};
+                            charging  -> {F, H, Ch + 1};
+                            suspended -> {F, H, Ch + 1};
+                            closing   -> {F, H, Ch + 1};
+                            _         -> {F, H, Ch}
                         end
                 end, {0, 0, 0}, Connectors);
 count_stats(_) ->

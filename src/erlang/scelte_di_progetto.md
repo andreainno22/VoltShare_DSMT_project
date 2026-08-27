@@ -656,3 +656,215 @@ Due scelte di modellazione che non sono decorazione:
   la riconciliazione di §6, e il modo in cui la si dimostra senza staccare niente a mano.
   Ogni altra reason termina la sessione con un `unplugged` che riporta il totale, perché qui
   non c'è nessuno che possa tirare fisicamente il cavo.
+
+---
+
+## 12. Il riparto della potenza (`vs_power`) — M2-A passo 2
+
+Il passo 1 aveva lasciato il *trasporto* completo e il *calcolo* dichiaratamente provvisorio
+(§11.6): un limite deciso una volta all'ingresso in `charging`, mai più toccato, che con due
+auto sulla stazione 2 sommava 150 + 50 = 200 kW su un sito da 180. Questo passo chiude quel
+buco. Le decisioni che seguono sono quelle da difendere all'orale.
+
+### 12.1 La politica: quota equa con travaso, non proporzionale né prenotati-prima
+
+SCOPE §3.5 chiede che la politica sia una decisione esplicita fra tre. È la quota equa con
+travaso — il max-min fair share dei libri di reti:
+
+> si parte da `budget / N`; chi non riesce ad assorbire la propria quota prende solo quello
+> che gli serve e **restituisce l'avanzo**, che viene ridiviso fra i rimanenti; si ripete
+> finché nessuno avanza più niente.
+
+Le tre ragioni, in ordine di peso:
+
+- **All'orale si difende in una riga.** "A ciascuno la stessa quota, e chi non la usa la
+  restituisce." Il proporzionale-alla-domanda va difeso come scelta *politica* — "le auto
+  grandi contano di più" — che è una posizione scomoda da tenere; i prenotati-prima
+  affamerebbero un walk-in fino alla sospensione, in contraddizione con §3.3, dove la
+  penalità toglie il prenotare, non il caricare.
+- **La resa non discrimina fra le prime due.** Il travaso è ciò che impedisce a un kW di
+  restare inutilizzato mentre qualcuno potrebbe assorbirlo, ed è il difetto della quota equa
+  *senza* travaso — l'unica variante davvero poco performante. Il proporzionale non eroga di
+  più: satura lo stesso budget, cambia solo chi prende cosa.
+- **È più semplice, non più complicato.** Un giro su una lista, una ventina di righe pure. Il
+  proporzionale sembra più semplice finché non si aggiungono i cap: appena una domanda satura
+  il proprio `max_kw` serve comunque il giro di ridistribuzione — lo stesso ciclo, con in più
+  una moltiplicazione da spiegare.
+
+### 12.2 `vs_power` è un modulo puro: nessun processo, nessuna env, nessun orologio
+
+`allocate(Budget, Sessioni, MinChargeKw) -> #{conn_id => kW}` e `demand_kw/3` sono funzioni
+dei loro argomenti e basta. Le soglie arrivano come parametri: le legge il manager, una volta,
+dall'ambiente. Costa una firma a tre argomenti invece che a due, e in cambio la parte del
+progetto che vale la pena mostrare si prova con una lista e un numero — i sei scenari attesi
+sono sei test da tre righe, senza stazione, senza ETS, senza `timer:sleep`.
+
+La divisione del lavoro è la stessa di sempre: il manager è il solo processo che conosce
+insieme il budget del sito e tutte le sessioni, e distribuisce con `vs_connector:set_limit/2`;
+il connettore continua a non sapere niente dei suoi vicini.
+
+### 12.3 La soglia del taper è sul SoC, non su "assorbe meno di quanto gli ho dato"
+
+`demand_i` non è `max_kw`: §3.5 vuole che il tick tenga conto della curva di carica. Sotto
+`TAPER_SOC_PCT` (80) la domanda è `min(rated_kw, max_kw)`; da lì in su è
+`min(rated_kw, max_kw, power_kw + TAPER_MARGIN_KW)`, con margine 5 kW.
+
+**La regola alternativa si morde la coda, ed è il motivo per cui non è quella.** "Chiedi
+quanto stai assorbendo, più un margine" sembra più diretta, ma il `meter` subito dopo il
+`plugged` riporta `power_kw = 0`: la domanda diventerebbe 0 + 5, e l'auto resterebbe strozzata
+a salire di 5 kW per tick — una sessione affamata da un algoritmo che si credeva prudente. La
+soglia sul SoC non ha questo lock-in, perché a inizio sessione il SoC è basso, e coincide con
+la fisica che l'emulatore già riproduce (taper sopra l'80%, §11.12).
+
+Il **margine** ha un compito preciso e uno solo: far risalire la domanda da sola se l'auto
+riprende ad assorbire. Senza, l'allocatore registrerebbe il minimo che ha visto e non lo
+lascerebbe più tornare indietro.
+
+**Il lock-in ha un gemello, e la soglia sul SoC da sola non lo chiude.** Trovato in revisione,
+non dai test, dopo che il passo era già scritto. Una sessione sospesa sta a `limit_kw = 0`,
+quindi il suo `meter` successivo riporta `power_kw = 0` — perché le abbiamo tolto la corrente,
+non perché la batteria sia piena. Sopra la soglia il ramo del taper leggeva quello zero e
+rispondeva 5 kW: sotto `MIN_CHARGE_KW`, quindi `demand`-bound, quindi la prima che `victim/1`
+sceglie. Sospesa di nuovo a ogni ricalcolo, **a qualunque budget, per sempre** — un'auto lasciata
+a zero su un sito vuoto.
+
+Perciò il ramo del taper chiede due cose invece di una: **sopra la soglia e con potenza
+concessa**, cioè `limit_kw =/= 0.0`. Un contatore letto mentre il limite è zero misura la
+decisione della stazione, non la curva dell'auto, e la lettura onesta di una sessione che non
+stiamo alimentando è che vuole tutto quello che può prendere.
+
+È lo stesso errore della regola scartata sopra — dedurre la domanda da un `power_kw` che non
+parla della batteria — rientrato da un'altra porta. La differenza fra i due casi è che il primo
+si vedeva a inizio sessione e questo solo dopo una sospensione, che con i budget veri non
+capita mai: per questo nessun test lo aveva preso. Adesso ce ne sono due, e il secondo è il
+ciclo completo (sospendi, gli altri se ne vanno, deve risalire), perché il test unitario sulla
+domanda da solo non descrive il difetto — descrive un numero.
+
+### 12.4 La sospensione: l'ultimo arrivato se manca il budget, chi non è aiutabile se manca la domanda
+
+§3.5 chiede una potenza minima sotto la quale una sessione è **sospesa** invece che affamata.
+Sospesa significa `set_limit 0`: la sessione resta aperta e non eroga, che è esattamente come
+la esprime ws-chargepoint.md §5.
+
+*Chi* viene sospeso dipende da cosa ha causato la fame, e sono due cose diverse:
+
+- **manca il budget** — la quota è sotto soglia perché ci sono troppe auto per il sito. Va
+  l'**ultimo arrivato** (`started_at` maggiore, id del connettore a rompere la parità sul
+  millisecondo). Stabile per costruzione: `started_at` non cambia nel tempo, quindi l'insieme
+  dei sospesi non oscilla fra un tick e l'altro finché nessuno arriva o parte. Una regola
+  basata sul SoC cambierebbe idea da sola a ogni lettura del contatore.
+- **manca la domanda** — la sessione chiede da sola meno della soglia (`max_kw` piccolo, o
+  taper a fine carica). Sospendere qualcun altro non può aiutarla: nessun budget liberato
+  alza una sessione sopra quello che sta chiedendo. Quindi va lei, indipendentemente da
+  quando è arrivata.
+
+Il secondo caso è un **raffinamento della regola del piano**, deciso prima di scrivere il
+codice. Con la regola letterale ("sempre l'ultimo arrivato") domande di 3 e 50 kW su un budget
+di 180 sospendono prima la 50, lasciano la 3 ancora sotto soglia, sospendono anche quella, e
+il sito finisce per non allocare niente con 180 kW liberi: la parte sbagliata punita, e poi
+tutte. I sei scenari attesi del piano sono identici sotto le due letture; cambia solo questo
+angolo. La proprietà che ne esce — **nessuna allocazione sta fra 0 e `MIN_CHARGE_KW` esclusi**
+— è un test, non un commento.
+
+**Con i budget veri la sospensione non è raggiungibile**, e va detto invece di lasciar credere
+che il caso sia stato visto girare: 350/4 = 87.5 e 180/3 = 60 sono entrambi molto sopra i 6 kW.
+Resta dimostrata da test unitari con budget forzato; per mostrarla nella demo serve un
+`SITE_POWER_KW` ridotto via ambiente, non una modifica al codice.
+
+### 12.5 `allocated_kw` cambia significato: allocato, non erogato
+
+Fino a M1 era la somma dei `power_kw` misurati — un numero su cui i contatori erano d'accordo,
+in mancanza di qualcuno che allocasse davvero. Adesso qualcuno alloca, e il campo dice quello:
+**la somma dei limiti concessi**.
+
+La conseguenza da accettare: la pagina mostra un numero più alto di quanto le auto stanno
+realmente prendendo, e la differenza è tutta quando un'auto è in taper o in rampa. È la
+lettura giusta per chi guarda quanto sito è impegnato — l'alternativa direbbe che il sito è
+libero mentre ogni presa è occupata. In cambio si ottiene l'invariante del passo, vera per
+costruzione e non per fortuna: `allocated_kw =< site_power_kw`.
+
+Il valore si legge dall'allocazione **memorizzata** nel manager, non risommando gli snapshot:
+`station_state` e `subscribe` restano letture pure, e una `build_state` che ricalcolasse
+sarebbe una lettura con un effetto collaterale su ogni connettore.
+
+### 12.6 `suspended` è derivato nello snapshot, non un sesto stato del `gen_statem`
+
+`build_snapshot` riporta `suspended` per uno stato `charging` con `limit_kw =:= 0.0`. Al
+contrario di `out_of_service` (§11.3, dove lo stato vero era la scelta giusta), qui non cambia
+**nessuna** risposta del connettore: l'autorizzazione è la stessa, la sessione è viva, gli
+eventi che accetta sono gli stessi. Cambia solo quanto scorre.
+
+Uno stato vero oscillerebbe avanti e indietro a ogni ricalcolo che attraversa la soglia, con
+`enter`/`exit` a raffica per un valore che è cambiato; un valore derivato non può oscillare
+perché non c'è niente che oscilli. `wire_connector_state/1` lo lascia passare con la clausola
+`Other -> Other` e l'enum di ws-driver.md §5.1 lo contiene già: nessun contratto si tocca.
+
+**Il tranello, ed è quello che si sbaglierebbe.** Il manager rilegge gli snapshot per costruire
+il riparto, e dopo questa modifica vede `suspended` dove prima vedeva `charging`. Un filtro su
+`state =:= charging` toglierebbe la sessione dal riparto **nel momento stesso in cui la
+sospende**: l'allocatore smetterebbe di vederla, non le riassegnerebbe mai niente, e la fame
+diventerebbe permanente invece di durare un tick. `vs_power:demands/3` accetta entrambi gli
+stati, ed è la ragione per cui c'è un test che si chiama
+`a_suspended_session_still_takes_part_test`.
+
+Stesso motivo, dall'altra parte: `vs_claim_client:count_stats/1` ha adesso una clausola
+`suspended` esplicita. Senza, il catch-all esistente l'avrebbe fatta sparire dalle tre
+statistiche mandate al coordinatore, e la lobby avrebbe mostrato come disponibile una presa
+con dentro la macchina di qualcuno.
+
+### 12.7 Il ricalcolo non deve poter innescare se stesso
+
+`charging(cast, {set_limit, _})` **non emette `notify`**, e non deve iniziare a farlo. Se lo
+facesse, ogni `set_limit` produrrebbe un `connector_event`, che farebbe ricalcolare, che
+manderebbe un `set_limit`: un ciclo a piena velocità, non una perdita lenta. Il limite arriva
+comunque alla pagina con la rilettura periodica da 5 s del canale driver.
+
+Due momenti di ricalcolo, che sono i due di §3.5:
+
+- **ogni `connector_event`** — arrivi, partenze, cambi di stato. Il gancio esisteva già e
+  faceva `broadcast`; adesso ricalcola e poi trasmette. **L'ordine non è casuale**: i cast di
+  `set_limit` partono prima che `build_state` rilegga i connettori, e fra due processi l'ordine
+  dei messaggi è garantito — quindi ogni connettore ha già applicato il suo limite quando
+  risponde alla `snapshot`, e lo stato che i sottoscrittori ricevono porta i valori nuovi,
+  `suspended` compreso.
+- **un tick `POWER_TICK_MS`** (5000, allineato a `METER_INTERVAL_S`) — l'unica cosa che può
+  accorgersi del taper, perché una lettura `meter` non produce eventi di proposito: una per
+  connettore ogni 5 s inonderebbe ogni pagina aperta di un cambiamento che non c'è stato.
+  Il tick **non fa broadcast**: `vs_driver_ws` rilegge lo stato per conto suo sul proprio
+  `STATE_TICK_MS`, quindi un cambio dovuto al taper arriva alla pagina entro gli stessi cinque
+  secondi, e spingere da tutte e due le parti raddoppierebbe il traffico per dirlo due volte.
+
+`set_limit` va a **tutte** le sessioni attive a ogni ricalcolo, anche a valore invariato: è
+ws-chargepoint.md §5 alla lettera — idempotenza per ripetizione, non diffing — e significa che
+una colonnina che ha perso un frame torna giusta entro un tick invece di restare su un limite
+vecchio per sempre.
+
+*Effetto collaterale osservato nell'E2E, lato emulatore — poi corretto.* `cp.js` confrontava il
+limite in arrivo con quello **interpolato** in quel momento invece che con il proprio bersaglio,
+quindi non riconosceva come ripetizione proprio i comandi che §5 impone di ripetere: la rampa
+ripartiva dal punto corrente con una finestra nuova, e si allungava a ogni tick. Convergeva, ma
+il tempo di applicazione misurato nella demo sarebbe stato più lungo di quello vero —
+l'emulatore che fa sembrare la stazione peggiore di quanto è, che è lo stesso peccato del
+farla sembrare migliore.
+
+Il confronto è ora con `limit.target`. Una ripetizione vera esce subito; un valore diverso
+riparte da `appliedLimit(now)`, che resta il punto di partenza giusto perché l'hardware è dov'è,
+non dove gli era stato detto di arrivare. Misurato dopo la correzione: `20 → 150` e poi quattro
+`set_limit 20` a un secondo l'uno dall'altro producono **una sola** riga di log, e il contatore a
++3.4 s legge 36.7 kW — esattamente l'interpolazione da un'unica partenza, cioè la prova che la
+rampa non è ripartita.
+
+### 12.8 Le variabili nuove non entrano nei contratti
+
+`MIN_CHARGE_KW` era già in ws-driver.md §10 e resta lì. `POWER_TICK_MS`, `TAPER_SOC_PCT` e
+`TAPER_MARGIN_KW` sono interne alla stazione: nessun'altra parte del sistema le osserva, e
+metterle in un contratto vorrebbe dire chiedere agli altri di conoscerle. Sono documentate
+qui, con il loro default, e sono anche opzioni di `vs_station_mgr:start_link/1` — come
+`lease_seconds` — perché altrimenti provare il tick vorrebbe dire dormire cinque secondi.
+
+| Variabile | Default | Significato |
+|---|---|---|
+| `POWER_TICK_MS` | `5000` | periodo del ricalcolo periodico, quello che vede il taper |
+| `TAPER_SOC_PCT` | `80` | sopra questo SoC la domanda segue il contatore invece dei cap |
+| `TAPER_MARGIN_KW` | `5` | quanto sopra il misurato si chiede, per poter risalire |
+| `MIN_CHARGE_KW` | `6` | già in ws-driver.md §10: sotto, sospeso invece che affamato |

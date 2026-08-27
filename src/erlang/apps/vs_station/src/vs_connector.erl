@@ -670,7 +670,7 @@ handle_common(info, Info, State, Data) ->
 build_snapshot(State, Data = #data{hold = Hold, session = S}) ->
     Base = #{connector_id => Data#data.conn_id,
              rated_kw     => Data#data.rated_kw,
-             state        => State,
+             state        => reported_state(State, S),
              held_by      => case Hold of
                                  #hold{user_id = U} -> U;
                                  _ -> undefined
@@ -690,10 +690,32 @@ build_snapshot(State, Data = #data{hold = Hold, session = S}) ->
                                 started_at => S#session.started_at,
                                 energy_kwh => S#session.energy_kwh,
                                 soc_pct    => S#session.soc_pct,
+                                %% what the car can take, for the
+                                %% allocator's demand (SCOPE §3.5); it was
+                                %% in #session already and only the
+                                %% snapshot was missing it
+                                max_kw     => S#session.max_kw,
                                 %% for the `boot' ack of §3.1, which hands
                                 %% the charge point the limit in force
                                 limit_kw   => S#session.limit_kw}}
     end.
+
+%% M2 step 2 — `suspended' is derived here, and is deliberately **not** a
+%% sixth state of the machine: it is `charging' at a limit of zero, which
+%% is how ws-driver.md §5.1 defines it and how ws-chargepoint.md §5
+%% expresses it on the wire ("0 means suspended: the session stays open
+%% and draws nothing").
+%%
+%% Unlike `out_of_service' (D2), nothing about the connector's *behaviour*
+%% changes: the authorisation is the same, the session is alive, the
+%% events it answers are the same — only how much flows. A real state
+%% would enter and leave on every recomputation that crossed the floor,
+%% firing `enter' and `exit' callbacks for a value that changed; a derived
+%% one cannot oscillate because there is nothing to oscillate.
+reported_state(charging, #session{limit_kw = Limit}) when Limit =:= +0.0 ->
+    suspended;
+reported_state(State, _Session) ->
+    State.
 
 %% §6 — reconciliation. `energy_kwh' is seeded from the payload because a
 %% charge point that reconnects after a station restart reports the total

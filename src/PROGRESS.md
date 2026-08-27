@@ -979,6 +979,218 @@ stato, un connettore guasto avrebbe fatto crashare il client dei claim.
 
 ---
 
+## 7q. M2-A passo 2: il riparto della potenza — 27 agosto
+
+Branch `a/m2-power`, da `a/m2-chargepoint`. Nuovo `vs_power` (modulo puro) più i suoi test;
+modificati `vs_station_mgr` (ricalcolo, tick, `allocated_kw`), `vs_connector`
+(`build_snapshot`: `suspended` derivato e `max_kw` nello snapshot) e
+`vs_claim_client:count_stats/1`. **Nessun contratto toccato**, `ws-driver.md` e
+`ws-chargepoint.md` compresi: `suspended` era già nell'enum di §5.1 e `MIN_CHARGE_KW` già in
+§10.
+
+Prima di questo passo il limite era quello interinale di D5 — `min(rated_kw, max_kw)`, deciso
+una volta all'ingresso in `charging` e mai più toccato. Con due auto sulla stazione 2 la somma
+faceva 150 + 50 = 200 kW su un sito da 180: il buco che il passo 1 dichiarava e che questo
+chiude.
+
+### Una premessa del piano era falsa, ed è stata corretta prima di iniziare
+
+Il piano diceva «base: `a/m2-chargepoint` (passo 1 committato)». **Non lo era**: l'ultimo
+commit del branch era il merge di M1, e tutto il passo 1 stava nel working tree, non
+versionato. Il contenuto era giusto — la baseline ha dato i 180 test attesi — ma il passo 2
+sarebbe nato mescolato al passo 1 in un albero sporco, senza uno stato a cui tornare. Il passo
+1 è stato committato (`b9ee35e`) su richiesta esplicita, e `a/m2-power` parte da lì.
+
+### Le tre premesse che il piano dichiarava NON VERIFICATE — ora misurate
+
+| Premessa | Misura | Esito |
+|---|---|---|
+| Baseline 180 test, 0 fallimenti | `rebar3 eunit` (senza `--app`), 27/08 | **verificata**: 180/0 esatti |
+| L'emulatore applica un `set_limit` che **scende** a sessione in corso | una sola auto in carica a 150 kW su st. 2/conn 5, `vs_connector:set_limit(Pid, 20)` a mano via rpc | **verificata**: comando a `13:15:11.3`; `meter` a +4.3 s → 37.7 kW (rampa a metà, interpolazione esatta), `meter` a +9.3 s → **20 kW**. Dentro `LIMIT_APPLY_SECONDS` (5 s) più un intervallo di contatore |
+| Due emulatori concorrenti sulla stessa stazione | conn 5 (150 kW) e conn 6 (50 kW) in carica insieme su st. 2 | **verificata**: nessun 4409, nessun socket rimpiazzato, nessun frame incrociato. Ognuno tiene il proprio limite e la propria sequenza di `request_id`; conn 5 è rimasto a 20 kW mentre conn 6 saliva a 50 |
+
+La seconda e la terza sono esattamente ciò che il passo 2 mette sotto sforzo per la prima
+volta: se l'emulatore non avesse obbedito a un limite in discesa, l'allocatore non avrebbe
+avuto modo di funzionare e il difetto sarebbe stato lì.
+
+### Verificato — girato davvero
+
+- **Suite: 217 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 180 di baseline, **+37 netti**:
+  28 su `vs_power` (i sei scenari attesi, quattro proprietà su uno sweep deterministico di 112
+  casi, gli angoli della sospensione, e `demand_kw`/`demands`), 6 su `vs_station_mgr`
+  (allocazione, invariante, partenza, tick/taper, sospensione, il non-ciclo — sei, ma uno
+  **sostituisce** il test M1 di `allocated_kw`, quindi +5 su quel file), 3 su
+  `vs_connector` (limite zero → `suspended`, `plugged` senza `max_kw`, `max_kw` nello
+  snapshot), 1 su `vs_claim_client` (`suspended` conta come `charging`).
+- **I sei scenari del piano §8 escono esatti**, confronto con tolleranza dichiarata (0.001), non
+  con `=:=`:
+
+  | Scenario | Domande (kW) | Budget | Atteso | Osservato |
+  |---|---|---|---|---|
+  | St. 2, una 150 | 150 | 180 | 150 | **150** |
+  | St. 2, 150 + 50 | 150, 50 | 180 | 130, 50 | **130, 50** |
+  | St. 2, tre auto | 150, 50, 50 | 180 | 80, 50, 50 | **80, 50, 50** |
+  | St. 1, quattro auto | 150, 150, 150, 50 | 350 | 100, 100, 100, 50 | **100, 100, 100, 50** |
+  | St. 1, taper | 150, 150, 45, 50 | 350 | 127.5, 127.5, 45, 50 | **127.5, 127.5, 45, 50** |
+  | Sospensione (budget forzato) | 50, 50, 50 | 15 | 7.5, 7.5, 0 | **7.5, 7.5, 0** |
+
+- **E2E sul compose, stazione 2 (budget 180), tre fasi:**
+
+  | Momento | Atteso | Osservato | Ritardo |
+  |---|---|---|---|
+  | Una 150 kW sul conn 5 | limite 150, `allocated_kw` 150 | **150.0 / 150.0** | — |
+  | Arriva una 50 kW sul conn 6 | limiti 130 e 50, `allocated_kw` 180 | **130.0 e 50.0 / 180.0** | `plugged` a `13:34:28.627`, nuovo limite al conn 5 a `13:34:28.632` — **5 ms** |
+  | La seconda se ne va (`stop_session` → `unplugged`) | il primo torna a 150 | **150.0 / 150.0** | stop a `13:34:48.317`, nuovo limite a `13:34:48.319` — **2 ms** |
+
+  I contatori si sono assestati sui valori concessi esatti (130 e 50 kW), dopo la rampa
+  `LIMIT_APPLY_SECONDS`. Il riparto è **guidato dagli eventi**: nessuna delle due transizioni
+  ha aspettato il tick, che serve solo al taper.
+- **`allocated_kw =< site_power_kw`** è un test dell'invariante, non un'osservazione: il campo
+  è la somma dell'allocazione memorizzata, quindi vale per costruzione.
+- **Il ricalcolo non si autoalimenta**: un test tiene il tick a 20 ms con una sessione viva e
+  verifica che in 200 ms (≈10 ricalcoli) arrivino **zero** push ai sottoscrittori.
+  `charging(cast, {set_limit,_})` non emette `notify`, e il test è lì perché smetta di essere
+  vero rumorosamente se qualcuno gliela aggiunge.
+- **`warnings_as_errors` attivo**: build pulita da `_build` svuotato.
+
+### Non provato — e perché
+
+- **`station.jsp` non è stato aperto in Chrome.** L'E2E è stato letto da `station_state` via
+  rpc, non dalla pagina. Manca quindi la conferma visiva che `allocated_kw` che cambia e uno
+  stato `suspended` arrivino fino al browser — la catena è verificata per struttura
+  (`wire_connector_state/1` ha la clausola passante, `station.js:99` legge `allocated_kw`), non
+  per osservazione. È lo stesso buco del passo 1.
+- **La sospensione non è stata vista girare sul compose, e non può esserlo con i budget veri**:
+  350/4 = 87.5 e 180/3 = 60, entrambi molto sopra i 6 kW di `MIN_CHARGE_KW`. È coperta da test
+  unitari e da un test del manager con `site_power_kw` forzato a 8; per mostrarla nella demo
+  serve un `SITE_POWER_KW` ridotto via ambiente. Scritto qui invece di lasciar credere che il
+  caso sia stato osservato.
+- **Il taper non è stato osservato E2E**: portare un'auto sopra l'80% di SoC richiede minuti di
+  carica reale. È coperto dal test del manager (`the_power_tick_is_what_notices_a_taper_test`,
+  con tick a 50 ms) e dai test di `demand_kw`, ma nessuna auto vera è arrivata all'80% con un
+  vicino che ne raccogliesse l'avanzo.
+- **Tre auto insieme sulla stessa stazione** non sono state provate sul compose: l'E2E ne ha
+  usate due. Lo scenario a tre è un test unitario (80/50/50), non un'osservazione.
+- **La stazione 1 non è stata toccata**: l'E2E è tutto su st. 2. Gli scenari a quattro auto e
+  con il taper sono aritmetica verificata, non un compose osservato.
+- **`vs_station_db` resta lo stub del passo 1**: le sessioni non finiscono ancora su MySQL, e il
+  passo 2 non lo cambia (fuori perimetro).
+
+### Catena dei chiamanti: quattro voci che il piano non aveva
+
+La tabella §7 del piano elencava cinque funzioni. La ricerca per struttura ne ha aggiunte
+quattro, e una era una trappola vera:
+
+1. **`vs_cp_proto:limit_kw/2`** chiama `snapshot/1` per l'ack del `boot`. Innocuo — legge
+   `session.limit_kw`, non `state` — ma è un consumatore reale che il piano non aveva.
+2. **`vs_driver_ws:state_tick`** rilegge `station_state()` su un proprio timer da 5 s. È la
+   ragione per cui il power tick **non** fa broadcast: la pagina vede il taper lo stesso, e
+   spingere da entrambe le parti raddoppierebbe il traffico.
+3. **`allocated_kw` non è letto "solo da `wire_state` e `station.js`"**: lo leggono anche
+   `vs_driver_stub.erl:120` e tre asserzioni nei test.
+4. **La trappola.** Il piano non prevedeva l'interazione fra `suspended` derivato e il
+   ricalcolo: dopo la derivazione il manager vede `suspended` dove vedeva `charging`, e un
+   filtro su `state =:= charging` avrebbe tolto la sessione dal riparto **nell'istante in cui
+   la sospende** — fame permanente invece che di un tick. `vs_power:demands/3` accetta
+   entrambi gli stati e ha un test dedicato.
+
+### Una regola del piano raffinata, con conferma esplicita prima di scrivere
+
+La sospensione letterale del piano — «finché una quota è sotto soglia, sospendi quella con
+`started_at` maggiore» — sbaglia bersaglio quando la fame nasce dalla *domanda* invece che dal
+*budget*. Domande di 3 e 50 kW su 180 di budget: la 3 prende 3 (sotto soglia) → si sospende la
+50 perché è la più recente → resta la 3 da sola, ancora sotto soglia → si sospende anche quella
+→ zero allocato con 180 kW liberi.
+
+Il raffinamento, approvato prima di toccare il codice: se la quota sotto soglia coincide con la
+domanda della sessione stessa, quella sessione non può essere alzata togliendo nessun altro, e
+va lei. «L'ultimo arrivato» resta la regola dove è stata progettata, cioè sotto pressione di
+budget. **I sei numeri attesi sono identici sotto le due letture** — cambia solo quell'angolo —
+e la proprietà «nessuna allocazione fra 0 e `MIN_CHARGE_KW` esclusi» diventa esattamente vera.
+
+### Un difetto dell'emulatore, trovato dall'E2E — e poi corretto
+
+`cp.js` confrontava il limite in arrivo con quello **interpolato** in quel momento invece che
+con il proprio bersaglio, quindi una ripetizione dello stesso valore mentre la rampa è a metà la
+faceva ripartire dal punto in cui era. Con `set_limit` re-inviato a ogni tick — che è
+ws-chargepoint.md §5 alla lettera — succedeva a ogni ricalcolo: convergeva (i contatori avevano
+chiuso su 130 e 150 kW esatti) ma allungava la rampa, e il tempo di applicazione misurato nella
+demo sarebbe stato più lungo di quello vero.
+
+Segnalato alla fine del passo 2 e **corretto subito dopo**, insieme al lock-in del taper (§7r):
+il confronto è ora con `limit.target`. Verificato dopo la correzione: `20 → 150` seguito da
+quattro `set_limit 20` a un secondo l'uno dall'altro produce **una sola** riga di log, e il
+contatore a +3.4 s legge 36.7 kW — l'interpolazione esatta da un'unica partenza, cioè la prova
+che la rampa non è ripartita.
+
+---
+
+## 7r. Due correzioni al passo 2, prima di committare — 27 agosto
+
+Sempre su `a/m2-power`, prima del commit. Due difetti trovati **in revisione, nessuno dei due
+dai test**: è il dato interessante di questa voce, perché entrambi vivono in un angolo che i
+budget veri non raggiungono mai e che quindi nessuno scenario eseguito aveva toccato.
+Perimetro: `vs_power.erl`, `vs_power_tests.erl`, `src/emulator/cp.js`. L'algoritmo di riparto
+(`fair_share/2`, `allocate/4`, `starved/3`, `victim/1`) **non è stato toccato**.
+
+### Difetto 1 — la sospensione era permanente sopra la soglia del taper
+
+Il gemello del lock-in che la soglia sul SoC doveva evitare, rientrato attraverso `power_kw`:
+
+```
+sospesa → limit_kw 0 → il CP applica 0 → meter riporta power_kw = 0
+        → demand = min(Ceiling, 0 + TAPER_MARGIN_KW) = 5
+        → 5 < MIN_CHARGE_KW (6), e Got >= demand ⇒ è `demand'-bound
+        → victim/1 la preferisce a chiunque ⇒ sospesa di nuovo, per sempre
+```
+
+Un consumo misurato **mentre la sessione è a zero** non dice niente sulla curva della batteria:
+dice che le abbiamo tolto la corrente. La correzione è in `demand_kw/3` — il ramo del taper
+chiede due cose, sopra la soglia **e** `limit_kw =/= 0.0` — e sta in `scelte_di_progetto.md`
+§12.3 con il perché.
+
+**I due test nuovi sono stati eseguiti prima della correzione, e come falliscono è il dato:**
+
+| Test | Prima | Dopo |
+|---|---|---|
+| `a_suspended_session_above_the_threshold_asks_for_its_ceiling_test` | `expected: 150.0 / got: **5.0**` | passa |
+| `a_session_suspended_above_the_threshold_comes_back_test` | la sospesa resta a **0.0** col budget interamente libero | risale a 12.0 |
+
+Il secondo è il ciclo completo — tre sessioni, budget stretto, una sospesa a SoC 85; poi le
+altre due se ne vanno e al ricalcolo successivo la sospesa deve risalire. Il primo da solo non
+basta: descrive un numero, non il difetto. `a_suspended_session_still_takes_part_test` (SoC 22,
+copre l'altro lock-in, quello di `is_live/1`) continua a passare e resta separato: i due si
+somigliano e non vanno fusi.
+
+*Conseguenza sui test esistenti.* L'helper `snapshot/4` dei test fissava `limit_kw => 0.0`,
+quindi ogni test del taper descriveva uno stato impossibile — 40 kW che scorrono con un limite
+di zero. Adesso l'helper usa il proprio `Ceiling` come limite e c'è `snapshot/5` per chi vuole
+una sessione davvero sospesa. Nessun numero atteso è cambiato: i 28 test preesistenti passavano
+già prima della correzione con il nuovo helper.
+
+### Difetto 2 — `setLimit` dell'emulatore faceva ripartire la rampa
+
+Descritto in §7q e corretto qui: il confronto è ora con `limit.target` invece che con il valore
+interpolato. Verifica eseguita su una stazione usa-e-getta con `SITE_POWER_KW=20`, così che le
+ripetizioni identiche siano quelle che il contratto stesso produce a ogni tick:
+
+- `limit 20 -> 150` a `14:11:23.055`, poi quattro `set_limit 20` a un secondo l'uno dall'altro;
+- il log mostra **una sola** riga `limit 71.7 -> 20` (`14:11:25.045`) — le tre ripetizioni non
+  producono niente, e nemmeno i tick della stazione;
+- contatore a +3.4 s: **36.7 kW**, che è `71.7 + (20 − 71.7) × 3.385/5` esatto — la rampa è
+  partita una volta sola;
+- primo contatore dopo la finestra di 5 s: **20 kW**.
+
+La partenza da 71.7 e non da 150 è la parte giusta del comportamento: un valore davvero nuovo
+riparte da dove l'hardware è, non da dove gli era stato detto di arrivare.
+
+### Suite
+
+**219 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`): 217 del passo 2 più i due nuovi.
+Compilazione pulita da `_build` svuotato, `warnings_as_errors` attivo.
+
+---
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
@@ -1008,8 +1220,10 @@ dal funzionare, e senza di esso lo scenario 5 si mostra dai log invece che da un
 server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il suo
 `vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
 
-**M2-A**: canale colonnina, allocazione della potenza, INSERT su `sessions`. Finché non c'è, la
-fatturazione gira su righe inserite a mano — il calcolo è verificato, il flusso completo no.
+**M2-A**: canale colonnina (§7p) e allocazione della potenza (§7q) sono fatti; resta l'**INSERT
+su `sessions`**, il passo 3. Finché non c'è, la fatturazione gira su righe inserite a mano — il
+calcolo è verificato, il flusso completo no: la stazione chiude la sessione, la scrive nel log
+con il totale giusto, e nessuno la persiste.
 
 ### Prima di M5
 
