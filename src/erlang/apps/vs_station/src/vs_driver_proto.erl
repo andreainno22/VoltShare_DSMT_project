@@ -378,6 +378,12 @@ refusal_frame(ReqId, Refusal, ConnId) ->
 refusal(already_held, ConnId) ->
     {<<"ALREADY_HELD">>, bin(["connector ", integer_to_list(ConnId),
                               " is held by another driver"])};
+%% The second row of §4.1, and the reason it is worth its own clause: the
+%% code is the same NO_CLAIM, but the sentence is what changes the
+%% driver's next move — cancel the other reservation, instead of walking
+%% down the row of connectors trying each one.
+refusal(vehicle_committed, _ConnId) ->
+    {<<"NO_CLAIM">>, <<"your vehicle already holds a reservation elsewhere">>};
 refusal(no_claim, _ConnId) ->
     {<<"NO_CLAIM">>, <<"reservations are unavailable right now">>};
 refusal(suspended, _ConnId) ->

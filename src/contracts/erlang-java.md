@@ -93,8 +93,16 @@ first announcement it uses the first entry of `COORD_NODES`.
 {session_closed, SessionId :: integer(), UserId :: integer(),
                  StationId :: integer(), ConnId :: integer(),
                  EnergyKwh :: float(), OverstaySeconds :: integer(),
-                 StartedAt :: integer(), EndedAt :: integer()}   %% epoch seconds
+                 StartedAt :: epoch_ms(), EndedAt :: epoch_ms()}
 ```
+
+**Milliseconds, like everything else on this boundary.** An earlier draft said epoch *seconds*
+here, and A was right to push back: `GrantedAt`, `ExpiresAt`, `NewExpiresAt` and `expires_at` are
+all milliseconds, all of them from `vs_time:epoch_ms/0`. One message changing unit in the middle
+of eight fields that do not is precisely the invisible error this contract keeps warning about —
+a factor of 1000 breaks no type, fails no test, and shows up as a date in 1970 on a page nobody
+looks at straight away. `OverstaySeconds` keeps its unit in its name, which is why it is allowed
+to be seconds.
 
 The station sends this to the coordinator after inserting the row into `sessions`; the
 coordinator forwards it here untouched (`vs_coord_srv:session_closed/1`).
@@ -115,9 +123,14 @@ idempotent write**, which is how effectively-once behaviour is obtained without 
 exactly-once channel.
 
 `OverstaySeconds` is the **billable** overstay: the station has already subtracted its
-`OVERSTAY_GRACE_SECONDS`. The grace period is configured on the station and nowhere else, so
-the back office never subtracts it a second time. Pending A's confirmation — see
-`nota-per-A-M2.md` §2.
+`OVERSTAY_GRACE_SECONDS`. The grace period is configured on the station and nowhere else, so the
+back office never subtracts it a second time. **Confirmed by A on 26/08** — the same semantics
+also apply to the `overstay_seconds` field of the live `session` frame in `ws-driver.md` §5.2, so
+the name means one thing on both channels.
+
+The price of that overstay is **not** here: it is `stations.tariff_cents_min_overstay`, per
+station, exactly like the energy tariff. The event carries what happened; what it costs is
+decided at settlement from the station's own row.
 
 ### 2.4 From M4 — declared, not yet implemented
 

@@ -14,6 +14,8 @@ ws://<station-host>:8080/ws/driver?station_id=<id>
 
 The URL is not built by the browser: it comes from `stations.ws_url` in the database, is rendered into the page by `StationPageServlet`, and reaches the JavaScript as the constant `WS_URL` (jwt.md §2). A station never assumes it knows its own public address.
 
+**The query string is the client's half.** `stations.ws_url` is what the station announced about itself — `ws://host:9101/ws/driver` — and carries no query string, while the handler closes `4400` when `station_id` is missing from it, and again when it names a station this node does not serve. `js/ws.js` appends `?station_id=` from the `STATION` constant already on the page. The split is deliberate: the station publishes an address, the page says which station it believes it is talking to, and a page pointed at the wrong one is a bug that shows itself instead of being quietly absorbed.
+
 One connection per open page. A driver with two tabs has two connections and receives every push twice, which is harmless: pushes are complete snapshots (§7.1).
 
 Frames are **text**, one JSON object per frame. Binary frames are rejected with close code `4400`.
@@ -96,8 +98,6 @@ Refusals — the mapping from the coordinator's answer to what the driver sees:
 | unreachable, timeout, no leader | `NO_CLAIM` | reservations are unavailable right now |
 
 The last row is the deliberate one: with no coordinator the station refuses **new reservations** and keeps everything already running (claim.md §4). Availability is sacrificed exactly where safety demands it and nowhere else.
-
-> **M1 note.** The first two rows are indistinguishable at the station's own boundary: `vs_connector:refusal()` uses one atom, `already_held`, both for "this connector is not free" and for the coordinator's "that vehicle is committed elsewhere". M1 therefore answers `ALREADY_HELD` in both cases. Telling them apart needs a new refusal atom in the connector state machine, which is deferred rather than forgotten.
 
 ### 4.2 `cancel_reservation`
 

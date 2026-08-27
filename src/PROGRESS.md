@@ -12,7 +12,7 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 | Milestone | A (stazione, emulatore, viste live) | B (coordinatore, back office, pagine) |
 |---|---|---|
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
-| **M1** percorso base | 🟡 stazione **e canale driver** pronti (manager, connettori, claim client, mock del coordinatore, `vs_jwt` + `vs_driver_proto` + `vs_driver_ws` — **96 test lato A**); manca `station.jsp` (passo 4) | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
+| **M1** percorso base | ✅ **chiusa e verificata in Docker il 27/08**: 7 container, token emesso da Tomcat e verificato dalla stazione, `reserve` fino al coordinatore vero e ritorno, dedup provata dentro `vs_coord_srv`, lease che libera da solo, riconnessione dopo `stop station1`. Resta fuori solo la resa visiva in un browser vero (estensione non disponibile): la logica del rendering è provata con un DOM minimale, non i pixel | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
 | **M2** sessione e potenza | ⬜ canale colonnina, potenza, INSERT sessione, `session.jsp` | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
 | **M3** tolleranza ai guasti | ⬜ rinnovo contro il nuovo leader, revoca, riconnessione client | ✅ **elezione, quorum, ricostruzione** — failover provato in Docker (§7m) |
 | **M4** regole di dominio | ⬜ | ⬜ |
@@ -36,12 +36,23 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | Ponte JInterface fra Java ed Erlang | ✅ **verificato il 25/08** — `vs_coord_bo` → `ErlangBridge` end-to-end: coordinatore vero su `vs@NINJA2218`, Java come nodo nascosto, due stazioni ricevute con tutti i campi corretti. Test `ErlangBridgeIT` |
 | `vs_station` M1 (connettori, manager, claim client): test EUnit | ✅ verificato — **48 test, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 7 manager + 10 client + 9 vs_common) |
 | `vs_station` M1 passo 3 (canale driver): test EUnit | ✅ verificato — **96 test lato A, 0 fallimenti** su OTP 29.0.5 (macchina A, 24/08: 22 connettore + 10 manager + 13 client + 11 `vs_jwt` + 31 `vs_driver_proto` + 9 vs_common) |
-| **Suite completa su `main`** | ✅ **132 test, 0 fallimenti** — misurati il 25/08, non stimati: `vs_common` 9 + `vs_station` 87 + `vs_coord` 36 (16 claim + 11 failover + 9 quorum). È il numero da citare |
+| **Suite completa su `main`** | ✅ **132 test, 0 fallimenti** — misurati il 25/08, non stimati: `vs_common` 9 + `vs_station` 87 + `vs_coord` 36 (16 claim + 11 failover + 9 quorum). Rimisurati il 26/08 su `main`: **ancora 132** |
+| **Suite dopo il passo 4 (branch `a/m1-passo4`)** | ✅ **133 test, 0 fallimenti** — misurati il 26/08: il +1 è il test che tiene separati i due rifiuti di §4.1 (`already_held` vs `vehicle_committed`) |
+| Attenzione alla misura per applicazione | ⚠️ `rebar3 eunit --app vs_coord` risponde **25**, non 36: rebar3 accoppia i moduli di test ai moduli sorgente e `vs_coord_failover.erl` non esiste, quindi gli 11 test di failover vengono **saltati in silenzio**. Il totale è giusto solo lanciando `rebar3 eunit` senza `--app` |
 | Failover con tre coordinatori | ✅ **eseguito il 25/08** in Docker — due leader uccisi di fila, minoranza sospesa, claim riadottato con lo stesso `granted_at` (§7m) |
 | Canale driver contro il contratto (`ws-driver.md`) | ✅ verificato nei test — handshake coi tre token di `sample-tokens.md`, at-most-once dimostrato contando le chiamate al connettore, tabella dei rifiuti §4.1/§6, traduzione `offline` → `out_of_service`, `coordinator_reachable` end-to-end |
 | `vs_claim_client` ↔ `vs_mock_coord` sul contratto vero | ✅ verificato nei test — claim, eco del `GrantedAt` nel renew, release, revoca end-to-end, `station_stats` |
 | Docker compose (macchina A) | ✅ **eseguito** — 7 container su, coord1 (mock) riceve `station_up` da entrambe le stazioni (4 e 3 connettori) |
+| **Passo 4 end-to-end in Docker (27/08)** | ✅ **7 container**; `/js/ws.js` e `/js/station.js` serviti 200 da Tomcat senza toccare `web.xml`; `WS_URL` reso nella pagina è **`ws://localhost:9101/ws/driver`**, senza query string — conferma che appenderla è compito del client; 4 connettori su station1 e 3 su station2; `reserve` acked e `held`/`held_by_me` al `state` **successivo**; lease di 60 s che libera il connettore da solo a t=+59 s, 0 s dopo la scadenza annunciata; `stop station1` → chiusura **1001**, backoff, e ripopolamento **senza ricaricare** 17 s dopo |
+| Parte 0 vista dall'utente, col coordinatore vero | ✅ **27/08** — prenotato il connettore 1 di station1, poi tentato station2 con lo stesso veicolo: `NO_CLAIM` + *"your vehicle already holds a reservation elsewhere"*, **non** *"held by another driver"* |
+| Click dopo una chiusura fatale | ✅ **chiuso il 27/08** — era il limite dichiarato nel report del 26: la griglia restava cliccabile dopo un `4401`/`4408` e l'azione si accodava per sempre, congelando il pulsante in silenzio. Ora `send()` rifiuta all'istante (7 ms) con *"your session has expired — reload the page"*. Scenario ordinario, non limite: il token dura 60 min e la scadenza si controlla solo al `join` |
+| `station.js` eseguito | 🟡 **27/08** — 23 controlli verdi contro frame veri con un DOM minimale in Node: griglia, pillola di stato, intestazione riscritta, regole dei pulsanti (Reserve/Cancel/Stop e **nessun pulsante** su `out_of_service`, `suspended` e sessioni altrui), conto alla rovescia da `expires_at` che scende da solo, messaggio del server accanto al connettore, avviso `coordinator_reachable`. **Non è un browser**: prova la logica, non i pixel |
 | Compose sull'immagine Debian 29.0.5 | 🟡 build verde; il giro completo era stato fatto con l'immagine 386, da ripetere dopo il merge |
+| Client del canale driver (`js/ws.js`) contro una stazione vera | ✅ **misurato il 26/08** — `ws.js` eseguito non modificato contro un nodo `vs_station` reale: handshake, primo `state` con 4 connettori, `reserve` acked e connettore `held` **al `state` successivo**, ritentativo del frame perso con lo **stesso** `request_id` (2 trasmissioni, 1 id, 5015 ms, **una** prenotazione), 4401 e 4400 che fermano il client senza loop. 22 controlli verdi |
+| ① Giro in container con le dipendenze | ✅ **chiusa il 27/08** — `/app/lib` contiene `cowboy cowlib jose jsx ranch`, e le cinque versioni nell'immagine coincidono **esattamente** con `rebar.lock` (cowboy 2.18.0, cowlib 2.19.0, jose 1.11.12, jsx 3.1.0, ranch 2.2.1): il lock è onorato dentro il container |
+| ② Dedup attraverso il **coordinatore vero** | ✅ **chiusa il 27/08** — buttato via il primo frame, il client ha ritrasmesso lo **stesso** `request_id`; `vs_coord_srv:claims()` sul leader `vs@coord3` mostra **un solo** claim. P7 dimostrata sul sistema intero, non più solo nei test |
+| ③ Novanta secondi di inattività senza scollegarsi | ✅ **chiusa il 27/08** — **101 secondi** senza inviare nulla: socket sempre aperto, `["connecting","online"]` e nessuna riconnessione, 23 push di stato ricevuti. Il `pong` automatico tiene davvero fermo l'`idle_timeout` (60 s) di cowboy. Misurato con un client Node, che risponde ai ping esattamente come un browser |
+| ④ JWT in transito (B firma con `JwtUtil`, A verifica con `vs_jwt`) | ✅ **chiusa il 27/08** — registrato un utente vero da Tomcat, letto il `TOKEN` dalla pagina renderizzata (`sub:"1"`, `vehicle_id:1`, `iss:voltshare-backoffice`, 60 min) e usato per il `join`: accettato. È l'ultimo pezzo del confine fra le due metà, ed era l'unico mai provato |
 
 **Prerequisiti ancora da installare:** solo Docker Desktop. Erlang/OTP 29 (erts 17.0.5) + rebar3 3.27, JDK 17 e Maven 3.9.9 ci sono e funzionano.
 
@@ -166,7 +177,8 @@ Applicazione web Java su Tomcat 10.1, modello MVC del lab 08: servlet come contr
 | `stations.jsp` | B | ✅ con avviso quando il cluster è irraggiungibile |
 | `station-unavailable.jsp`, `error.jsp`, `index.jsp` | B | ✅ |
 | `css/app.css` | B | ✅ deliberatamente spartano |
-| `station.jsp` | **A** | 🟡 scheletro con le tre variabili del contratto, da completare |
+| `station.jsp` | **A** | ✅ completata: griglia dei connettori, pulsanti per stato, conto alla rovescia da `expires_at`, avviso `coordinator_reachable`; stili nella pagina, `app.css` non toccato |
+| `js/ws.js`, `js/station.js` | **A** | ✅ scritti — trasporto e rendering separati (scelte §10) |
 | `session.jsp`, `js/*` | **A** | ⬜ |
 
 ---
@@ -479,8 +491,11 @@ Da verificare in quel momento, perché è il vero punto di contatto fra le due m
 - **Client browser del canale driver (A)**: `js/ws.js`, `js/station.js`, `station.jsp` finita. È l'unico pezzo che separa la demo di M1 dal funzionare end-to-end (§7j).
 - **JWT B→A mai verificato in transito**: da provare al primo `join` reale.
 - La lista stazioni si aggiorna con `<meta http-equiv="refresh">` a 15 secondi: scelta deliberata, da dichiarare nella relazione.
-- **PR formale su `claim.md`** (`GrantedAt` in `acquire`, rinnovo a cinque campi): regolarizza modifiche già concordate e implementate da entrambi. Il codice è allineato, resta l'atto formale.
-- Il coordinatore di M1 è **sempre leader** e non ha quorum: `mode` esiste già nello stato ma vale sempre `serving`. Elezione e maggioranza sono M3.
+- ~~Il coordinatore è sempre leader e non ha quorum~~ **chiuso il 25/08** (§7m): elezione bully, quorum di maggioranza e ricostruzione, failover provato in Docker.
+- **PR su `claim.md` per `session_closed`** stazione → coordinatore: la modifica **non è stata fatta**, apposta, per poterla proporre prima del codice invece che dopo. È la PR che sostituisce quella "retroattiva" proposta da A — vedi sotto.
+- **Le clausole legacy del `renew`** e l'inversione di copertura dei test (§7l): in attesa della risposta di A sulla variante col catch-all.
+- **Overstay: chi sottrae la tolleranza** (`nota-per-A-M2.md` §2). Da decidere prima che A implementi M4, perché l'errore sarebbe invisibile.
+- La **potenza** (M2-A) non è ancora allocata: le sessioni non esistono, quindi la fatturazione gira su righe inserite a mano. Il calcolo è verificato, il flusso completo no.
 
 ---
 
@@ -763,35 +778,156 @@ percorso dell'erogazione.
 
 ---
 
+## 7o. A trova un bug nella fatturazione — 26 agosto
+
+`risposta-per-B-M2.md` accetta entrambe le richieste di M2 e, in fondo, sotto *"non c'entra con le
+tue domande"*, segnala un difetto reale nel codice di B. Risposta in `risposta-per-A-M2.md`.
+
+### La tariffa di overstay stava in due posti
+
+`schema.sql` — contratto congelato — definisce `stations.tariff_cents_min_overstay`, cioè una
+tariffa **per stazione**. Verifica sul repository:
+
+```
+$ grep -rn "tariff_cents_min_overstay" --include=*.java --include=*.erl --include=*.sql .
+contracts/schema.sql:55:    tariff_cents_min_overstay INT  NOT NULL DEFAULT 50
+```
+
+**Una sola occorrenza: la riga che la definisce.** Nessuno la leggeva.
+
+`BillingService` usava invece `Env.getInt("OVERSTAY_CENTS_MIN", 50)`, un valore **globale**. Quindi
+nella stessa formula un addendo era per stazione (l'energia, letta dal join) e l'altro per
+deployment. Entrambi valevano 50, perciò nessun test poteva accorgersene.
+
+L'errore vero non è stato dimenticare la colonna: è stato **inventare una configurazione** per un
+prezzo che il contratto aveva già deciso dove vivesse, metterla nel compose come se fosse la
+fonte, e scriverci sopra dei test che la usavano. Tre strati che si confermavano a vicenda.
+
+### Correzione
+
+- `SessionDao` seleziona `st.tariff_cents_min_overstay`; `Unbilled` lo porta.
+- `BillingService` lo usa; `OVERSTAY_CENTS_MIN` **eliminata**, non degradata a default — finché
+  resta è una seconda fonte per lo stesso prezzo, e quella che vince in silenzio. Tolta anche dal
+  compose, con una riga che dice perché non c'è.
+- `history.jsp` non cita più una cifra globale: con la tariffa per stazione quella frase era falsa
+  per metà delle righe di una pagina che elenca sessioni di siti diversi. Effetto che A non aveva
+  menzionato e che discende dalla stessa causa.
+- Nuovo test `overstayIsPricedByTheStationsOwnRate`, **con due tariffe diverse** (50 e 80): con una
+  sola la regressione è invisibile, che è il motivo per cui dieci test precedenti non l'avevano
+  vista.
+
+**Verificato in Docker.** Due sessioni identiche — 10 kWh, 5 minuti di overstay — su stazioni con
+overstay a 50 e a 80:
+
+| Sessione | Stazione | Energia | Overstay | Totale |
+|---|---|---|---|---|
+| 5 | Pisa Centro | 10 × 45 = 450 | 5 × 50 = 250 | **700** |
+| 6 | Livorno Port | 10 × 42 = 420 | 5 × 80 = 400 | **820** |
+
+Al primo tentativo Livorno usciva 670, cioè 420 + 5 × **50**: il container girava l'immagine
+precedente perché il build era stato interrotto. Vale la pena annotarlo — un fix che sembra non
+funzionare, quando il codice è giusto, quasi sempre è un'immagine non ricostruita.
+
+### Le altre due decisioni
+
+**`overstay_seconds` è il netto**: A conferma, la stazione sottrae `OVERSTAY_GRACE_SECONDS`.
+Tolta la riserva *pending* da `erlang-java.md` §2.3. A allinea anche il campo omonimo nel frame
+`session` di `ws-driver.md`, così il nome significa una cosa sola su entrambi i canali. Da notare
+il modo in cui ha preso la decisione: dichiarando **cosa si perde** — con il netto non si può più
+sapere a posteriori quanto restano attaccate le auto, e un cambio di tolleranza rende le righe
+vecchie incomparabili.
+
+**`StartedAt` / `EndedAt` passano a millisecondi.** Il contratto diceva "epoch seconds" mentre ogni
+altro campo del confine è in millisecondi (`GrantedAt`, `ExpiresAt`, `NewExpiresAt`, `expires_at`).
+A ha ragione e l'argomento è lo stesso che B usa altrove: un fattore 1000 non rompe nessun tipo,
+non fallisce nessun test, e si manifesta come una data nel 1970. `OverstaySeconds` resta in secondi
+perché **se lo porta nel nome**.
+
+### Nota di metodo
+
+Due volte in due giorni A ha trovato qualcosa di sostanziale leggendo codice di B: prima
+l'inversione della copertura dei test sul `renew` (§7l), ora questa. In entrambi i casi il difetto
+era invisibile a chi l'aveva scritto perché *coerente con sé stesso* — 50 = 50, e cinque test che
+esercitano la forma sbagliata. È l'argomento più concreto a favore delle PR incrociate, e vale la
+pena dirlo nella relazione invece che rivendicare solo il risultato.
+
+---
+
+## 7n. Il metodo dei branch, finalmente applicato — 25 agosto
+
+Le due milestone di oggi sono entrate su `main` **passando da una PR**, non da un push diretto:
+
+| PR | Contenuto | Merge |
+|---|---|---|
+| #1 `b/m2-billing` | deploy (EPMD), M2-B, documentazione | `75012f5` |
+| #2 `b/m3-failover` | M3-B: elezione, quorum, ricostruzione | `ecdd323` |
+
+Vale la pena annotarlo perchè è il punto di metodo che A aveva sollevato (§7l) e che B aveva
+violato il 24: la regola dei branch e delle PR esisteva da M0 ma non era mai stata usata.
+
+**Sulla PR "retroattiva" che A proponeva.** Non è realizzabile come la immaginava: i due diff su
+`claim.md` sono già dentro `main` (`b830682`, `f14f852`), e non si apre una PR su ciò che è già
+stato mergiato. Si potrebbe fabbricare un branch dal commit precedente, ma sarebbe una messinscena,
+e all'orale una traccia costruita a posteriori vale meno di zero.
+
+La risposta migliore è l'opposto: **la prossima modifica a `claim.md` non è ancora stata fatta.**
+Il messaggio `session_closed` stazione → coordinatore è stato deliberatamente lasciato fuori dal
+contratto proprio per poterlo proporre nel modo giusto — PR prima del codice, A come reviewer.
+Nel merito dimostra la stessa cosa, e in più è vera.
+
+---
+
 ## 9. Prossimo passo
 
-M1-B e M2-B sono chiuse e verificate (§7i, §7k). Quello che resta a B è la milestone su cui il
-progetto viene giudicato: **il coordinatore smette di essere singolo**.
+Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
+già tutto ciò su cui viene giudicato: coordinazione, tolleranza ai guasti, e la dimostrazione
+che P2 sopravvive a un failover.
 
-Oggi `vs_coord_srv` ha già `mode` nello stato, ma vale sempre `serving`: c'è un solo
-coordinatore, è sempre leader, e nessuno verifica di essere in maggioranza. M3 riempie proprio
-quel vuoto, secondo `piano.md` §6.1:
+### Per B — M4, regole di dominio
 
-1. **`vs_coord_election`** — bully: heartbeat 1 s, leader dato per morto dopo 3 battiti mancati,
-   messaggi `election` / `answer` / `leader`. Vince l'id più alto.
-2. **`vs_coord_membership`** — vista dei coordinatori vivi. Senza maggioranza (2 su 3) il nodo
-   passa a `suspended` e **rifiuta tutto**: è ciò che impedisce a due leader separati da una
-   partizione di concedere lo stesso veicolo due volte.
-3. **`vs_coord_rebuild`** — dopo la vittoria il nuovo leader interroga le stazioni con
-   `who_do_you_hold`, ricostruisce la tabella dei claim, e solo allora passa a `serving`. È qui
-   che si vede il principio già scritto in `DESIGN-NOTES`: il coordinatore è un **indice, non il
-   proprietario** dello stato, e per questo può ricostruirsi chiedendo invece di replicare un log.
-4. **`coord2` e `coord3` nel compose** — sono già scritti e commentati nel file, con `COORD_ID`
-   come priorità.
+E' la milestone più leggera delle quattro, ed è quasi tutta Java:
 
-Da A, in parallelo: rinnovo dei claim contro il nuovo leader, gestione di `{not_serving, Leader}`,
-revoca. Il contratto per farlo esiste già e la stazione lo implementa da M1.
+1. **`PenaltyService`** — N=2 no-show consecutivi sospendono per K=1 giorno. Il contatore è
+   **solo di B** (`schema.sql`): A lo segnala con `{no_show, UserId, StationId, ConnId}`, mai con
+   una UPDATE. La sospensione si propaga al coordinatore con `{user_suspended, UserId, Until}`,
+   che `vs_coord_srv` già riceve e già applica in `check_can_grant`.
+2. **Notifiche** — `notifications` e `notifications.jsp`, più `{notify, UserId, Kind, Text}` sul
+   ponte.
+3. **`profile.jsp`** — anagrafica, veicolo, stato della penalità.
 
-**La prova di accettazione** (scenario 5 della demo): si uccide il container del leader mentre
-una sessione è in corso; l'elezione avviene, il nuovo leader ricostruisce dalle stazioni, le
-prenotazioni riprendono da sole — e le sessioni di ricarica **non si fermano**, perché il
-coordinatore non è nel percorso dell'erogazione. Quest'ultimo punto è il più convincente da
-mostrare al docente e va provato esplicitamente.
+La concorrenza qui è già risolta: la sospensione è una decisione presa in un posto solo e letta
+dal coordinatore, che è lo stesso schema del claim. Non introduce un secondo oggetto conteso —
+scelta deliberata, documentata in `DESIGN-NOTES` §4b.
 
-Resta fuori M1: il client browser di A (§7j). Non blocca M3 — il failover si dimostra dai log e
-dallo stato dei nodi — ma senza quello la demo dal browser non esiste, quindi va sollecitato.
+### Quello che manca davvero, e non è di B
+
+**Il client browser del canale driver** (§7j). E' l'unico pezzo che separa la demo *dal browser*
+dal funzionare, e senza di esso lo scenario 5 si mostra dai log invece che da una pagina. Il lato
+server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il suo
+`vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
+
+**M2-A**: canale colonnina, allocazione della potenza, INSERT su `sessions`. Finché non c'è, la
+fatturazione gira su righe inserite a mano — il calcolo è verificato, il flusso completo no.
+
+### Prima di M5
+
+Il deploy dichiarato in `SCOPE.md` §6 — **sette nodi**: tre coordinatori, due stazioni, Tomcat,
+MySQL — da oggi è **esattamente quello che gira**, sette container nel compose. Fino a ieri erano
+cinque, con un solo coordinatore: il documento descriveva l'obiettivo, ora descrive il fatto.
+
+**Sul deploy multi-host — ridimensionato dopo una verifica.** Avevo annotato che mancava il deploy
+su più macchine, trattandolo come un buco. Controllando il `docker-compose.yml` di BlackNet — il
+progetto di riferimento valutato 30 e lode — risulta che **loro non l'hanno fatto**: singolo host,
+rete bridge di default, nomi nodo agganciati agli hostname dei container, esattamente il nostro
+schema. Il requisito del corso dice *"deployata su più **nodi**"*, non su più host, e di nodi ne
+abbiamo sette veri. "Tipicamente cloud" è un esempio, non un obbligo.
+
+Resta un motivo **solo** per volerlo, e non è il requisito: su una macchina sola non si può
+produrre una **partizione di rete vera**. Il quorum è progettato per le partizioni, non solo per i
+crash, quindi oggi la minoranza che si sospende si mostra con `docker kill` invece che staccando
+il Wi-Fi. Miglioramento della demo, non un buco — e da valutare solo se avanza tempo.
+
+Se lo si fa, la conseguenza tecnica è una sola e va saputa prima: `-sname` non basta più. I nomi
+corti funzionano solo dentro lo stesso dominio DNS, e `Dockerfile.erlang` dice *"long names would
+buy nothing here"* — vero su un host, falso su due. Servirebbe `-name` con FQDN o IP, e con esso
+cambiano `COORD_NODES` e `JINTERFACE_NODE` su tutti i nodi.

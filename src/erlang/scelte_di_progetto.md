@@ -349,7 +349,9 @@ Due cose che sembrano ridondanti e non lo sono.
 
 Il canale driver è **di proprietà di A** (intestazione di `ws-driver.md`): la limitazione si dichiara nel contratto stesso, senza PR. Va dichiarata e non taciuta — un contratto che descrive azioni che il server non implementa è peggio di un contratto che dice quando arriveranno. Un test (`the_waiting_list_is_out_of_m1`) fissa il perimetro: chi implementerà la coda troverà quel test a dirgli di tornare a cancellarlo.
 
-**Limite noto e dichiarato**: `ws-driver.md` §4.1 distingue "il connettore non è libero" (`ALREADY_HELD`) da "il tuo veicolo ha già una prenotazione altrove" (`NO_CLAIM`), ma il tipo `vs_connector:refusal()` usa l'atomo `already_held` per **entrambi** — il connettore occupato e il rifiuto `already_held` che arriva dal coordinatore attraverso `map_refusal/1`. Al confine col driver le due righe sono indistinguibili, e M1 risponde `ALREADY_HELD` in tutti e due i casi. Separarle vuole un atomo nuovo in `vs_connector`, cioè toccare la macchina a stati: rimandato, non dimenticato.
+**Le due righe di §4.1 restano distinte, perché nascono in due posti distinti.** `already_held` lo solleva `vs_connector` stesso (`held/3`, `charging/3`): *questo connettore* è preso, il prossimo forse no. `vehicle_committed` arriva invece dal **coordinatore** — nel suo vocabolario `already_held` parla del *veicolo*, perché i claim sono per veicolo — e `vs_claim_client:map_refusal/1` lo rinomina in entrata proprio per non far collidere due fatti diversi sulla stessa parola. Il connettore non matcha né l'uno né l'altro: rimbalza ciò che `claim_mod` ha risposto, quindi la distinzione costa una parola nella dichiarazione `-type refusal()` e nessun ramo.
+
+Non è cosmetica: a un driver a cui si dice "connettore occupato" prova quello accanto, e lì fallisce identicamente, perché il problema non era il connettore ma la sua auto prenotata altrove. Il messaggio giusto — *"your vehicle already holds a reservation elsewhere"*, testuale dalla colonna "Meaning shown" di §4.1 — lo manda invece a cancellare l'altra prenotazione. Era l'unico punto del sistema in cui la pagina diceva al driver una cosa falsa.
 
 ### 9.10 Le dipendenze, il lock e `warnings_as_errors`
 
@@ -360,3 +362,75 @@ Prime dipendenze esterne del progetto: `cowboy 2.18.0`, `jsx 3.1.0`, `jose 1.11.
 `rebar.lock` si committa (la riga in `.gitignore` è stata tolta) e il `Dockerfile.erlang` lo copia accanto a `rebar.config`: senza, due macchine e il container possono risolvere versioni diverse — esattamente la classe di problema per cui esisteva il pin di OTP 29.0.5. `vs_station.app.src` elenca le tre app fra le `applications`, altrimenti `application:ensure_all_started(vs_station)` le lascia ferme e il listener parte su una libreria non avviata.
 
 Misurato per inciso: su OTP 29 `jose` sceglie da solo `jose_json_otp`, cioè il modulo `json` della OTP, **non** `jsx`. Nessuna conseguenza — `jsx` resta il codec del nostro filo, `jose` usa quello che preferisce per i suoi — ma va scritto perché la nota di progetto assumeva il contrario.
+
+---
+
+## 10. Il client del canale driver (`ws.js`, `station.js`) — M1 passo 4
+
+### 10.1 Due file: trasporto e rendering
+
+`js/ws.js` è il **trasporto**: connessione, `?station_id=`, handshake, generazione dei `request_id`, timeout e ritentativo, backoff, smistamento dei frame. `js/station.js` è il **rendering**: prende un payload `state` e disegna la griglia. Nessuna libreria, nessun bundler.
+
+**Perché il taglio.** Il trasporto è identico per ogni pagina che parla il contratto del driver — la vista stazione, la vista sessione di M2, e i driver emulati del generatore di carico, che `ws-driver.md` nomina esplicitamente in intestazione. Il rendering è l'unica parte che cambia da una pagina all'altra. In un file solo, la seconda pagina lo copierebbe: è la stessa ragione per cui il protocollo lato Erlang sta in `vs_driver_proto` e non dentro l'handler di cowboy (§9.1).
+
+### 10.2 Il client non tiene stato — ed è il punto da difendere all'orale
+
+§7.1: il client rende `state` e nient'altro. Ogni frame ridisegna la griglia intera. L'`ack` di una `reserve` **non colora niente**: il connettore diventa `held` quando lo dice il `state` che arriva subito dopo. Il gestore dell'`ack` in `station.js` è deliberatamente vuoto, con un commento che spiega perché.
+
+Sembra uno spreco — perché non colorare la casella che so di aver appena prenotato? Perché un client che applica delta ha un modello suo, e un modello suo può divergere dal server dopo **un solo frame perso**: è esattamente il guasto per cui P6 esiste. Il payload sono quattro connettori: mandarlo intero non costa nulla e chiude un'intera classe di bug.
+
+Le uniche due cose che sopravvivono fra un frame e l'altro non sono un modello della stazione: la **scadenza scritta sul nodo DOM** (perché il conto alla rovescia possa battere ogni secondo senza chiedere niente al server), riancorata a ogni frame; e l'**ultimo errore** che il server ha mandato per un connettore, che è una risposta indirizzata a questo utente, non un fatto sulla stazione.
+
+### 10.3 Il ritentativo con lo stesso `request_id` è metà della dimostrazione di P7
+
+§7.2 esiste perché un WebSocket può perdere un frame in silenzio. La cache dei `request_id` lato stazione (§9.3) serve a questo — ma **senza un client che ritenta, è codice che nessuno esercita**, e l'at-most-once resta una tabella in un file di test.
+
+Regola implementata: `crypto.randomUUID()` una volta per **azione dell'utente**, non per invio; timeout di 5 s per tentativo; due ritentativi con lo **stesso** id; poi errore visibile. Misurato contro un nodo stazione vero, buttando via il primo frame: due trasmissioni, **un solo** `request_id`, 5015 ms di attesa, e **una sola** prenotazione sul connettore.
+
+**La cache è per connessione**, non per pagina (§2: *"keeps, per connection"*). Alla chiusura del socket ogni `request_id` in volo muore con lui, quindi nessuno può essere rigiocato sulla connessione successiva: la nuova cache è vuota e il comando verrebbe eseguito una seconda volta. Le promesse pendenti vengono perciò **rifiutate** alla chiusura, e l'utente decide se richiedere — cosa comunque sicura, perché §7.1 fa del `state` successivo la verità in entrambi i casi.
+
+### 10.4 Riconnessione selettiva: il codice di chiusura decide
+
+§7.5 chiede backoff esponenziale da 500 ms fino a 10 s con un `join` nuovo. Ma riconnettere ha senso solo dove serve:
+
+| Chiusura | Cosa fa il client |
+|---|---|
+| `1001` (stazione che si spegne), `1006` (rete), altro | riconnette col backoff |
+| `4401` / `4408` | **si ferma**: il token sta nella pagina (`jwt.md` §2), rimandarlo manderebbe lo stesso identico token. Messaggio e invito a ricaricare |
+| `4400` | **si ferma**: è un bug nostro, e un loop lo nasconderebbe |
+
+Il backoff si azzera su un **`join` riuscito**, non su una `open` TCP: una stazione che accetta il socket e poi lo chiude `4401` non ci ha dato una connessione funzionante, e azzerare sulla `open` la ritenterebbe a piena velocità per sempre.
+
+**Una corsa misurata, e la riga che la chiude.** La `join` non parte dentro `onopen` ma dopo un giro di event loop (`setTimeout(…, 0)`). La stazione rifiuta uno `station_id` sbagliato nel suo primo atto (chiusura `4400`), quindi il frame di chiusura è spesso già nel buffer di ricezione quando scatta `open`. Scrivere sul socket in quell'istante fa perdere alla scrittura la corsa con la lettura: il peer è già andato, la connessione si resetta, e la chiusura arriva come un `1006` nudo **con il 4400 buttato via** — cioè proprio il loop di riconnessione che §7.5 vieta per il 4400. Osservato: `["connecting","reconnecting","connecting","reconnecting",…]` all'infinito. Con lo yield: `["connecting","refused"]` e codice 4400. Una riga, e la regola torna a valere.
+
+La misura è stata fatta con un client Node, che usa la stessa classe `WebSocket` del browser; che un browser vero si comporti identicamente è coerente col fatto che la corsa è a livello TCP/WebSocket e non nell'API, ma **non è stato osservato in un browser** — l'estensione non era disponibile. È l'unica cosa del passo 4 che resta da guardare con gli occhi.
+
+**Dopo una chiusura fatale il canale è finito, e `send()` lo dice subito.** Non è un caso limite: il token dura 60 minuti e la scadenza si controlla **solo** al `join` (`jwt.md` §1), quindi qualunque sessione più lunga del token finisce lì — con la griglia ancora disegnata dall'ultimo snapshot e non più viva. Accodare l'azione lascerebbe il pulsante disabilitato per sempre senza dire niente; `send()` rifiuta invece all'istante (misurato: 7 ms) con la frase che il driver può usare, *"your session has expired — reload the page"*. Trovato dalla verifica, non dalla lettura.
+
+### 10.5 `?station_id=` lo appende il client
+
+`stations.ws_url` è quello che la stazione ha annunciato di sé e che il coordinatore ha memorizzato — `ws://localhost:9101/ws/driver`, **senza query string** — mentre `vs_driver_ws` chiude `4400` se `station_id` manca o nomina un'altra stazione. Appenderlo è quindi compito del client, ed è commentato nel punto in cui avviene: è il dettaglio che, al passo successivo, nessuno ricorda.
+
+### 10.6 Il conto alla rovescia si legge, non si calcola
+
+L'`ack` di `reserve` porta `expires_at` in millisecondi epoch. Il client mostra il tempo restante **da quello**, mai da un `Date.now() + lease` calcolato in proprio: §4.1 lo dice, e la ragione è che l'orologio del browser non è quello della stazione. Il valore viene parcheggiato sul nodo (`data-expires-at`), così la ripittura al secondo non ha bisogno di nient'altro che del DOM — e viene riancorato a ogni `state`, quindi non può restare indietro.
+
+### 10.7 Quello che non si può fare non si disegna
+
+Il pulsante `Reserve` compare solo su `free`, `Cancel` solo se `held_by_me`, `Stop` solo su `charging` con `mine`. Niente pulsanti grigi: un pulsante disabilitato dice comunque *"questa è una cosa che potresti avere"*, mentre un pulsante assente dice la verità, cioè che quel connettore è affare di qualcun altro. `held_by_me` e `mine` non li calcola la pagina — arrivano già decisi dal server (§7.3, §9.5).
+
+### 10.8 `textContent`, mai `innerHTML`
+
+`name` arriva dall'ambiente della stazione e attraversa il coordinatore; `message` degli errori arriva dal server. Nessuno dei due è ostile oggi, ma una pagina che costruisce HTML da stringhe ricevute è una pagina che aspetta solo il giorno in cui una di quelle stringhe cambia sorgente. Tutti i nodi si costruiscono con `createElement`.
+
+### 10.9 Nessun codice per il ping, e un commento che lo dice
+
+La stazione manda un `ping` insieme a ogni tick di stato (§9.8). Il browser risponde `pong` da solo, sotto l'API JavaScript — RFC 6455 §5.5.2 lo rende obbligatorio e la WebSocket API non espone alcun aggancio. Quel pong è traffico in entrata, ed è ciò che impedisce a `WS_IDLE_TIMEOUT_MS` di chiudere una pagina che ha fatto `join` e sta solo guardando. **Non c'è niente da scrivere**, e il commento esiste perché è la prima cosa che qualcuno verrà a cercare.
+
+### 10.10 Gli stili stanno nella pagina, non in `app.css`
+
+`css/app.css` e `page.tag` sono di B e sono condivisi da tutte le viste. `app.css` definisce già `.connectors` come griglia e i colori come variabili su `:root`; le caselle dei connettori sono nuove e appartengono alla pagina di A. Un blocco `<style>` dentro `station.jsp`, che usa solo le variabili già dichiarate, tiene la proprietà pulita e non tocca un file condiviso per una funzionalità di uno solo.
+
+### 10.11 Cosa la pagina non fa
+
+Niente lista d'attesa (§4.4) e niente riquadro di sessione (§5.2, richiede il canale colonnina di M2), coerentemente con §9.9. Il campo `waitlist` arriva come costante dichiarata e viene semplicemente ignorato dal rendering.
