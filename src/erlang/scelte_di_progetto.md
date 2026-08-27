@@ -403,6 +403,8 @@ Il backoff si azzera su un **`join` riuscito**, non su una `open` TCP: una stazi
 
 **Una corsa misurata, e la riga che la chiude.** La `join` non parte dentro `onopen` ma dopo un giro di event loop (`setTimeout(…, 0)`). La stazione rifiuta uno `station_id` sbagliato nel suo primo atto (chiusura `4400`), quindi il frame di chiusura è spesso già nel buffer di ricezione quando scatta `open`. Scrivere sul socket in quell'istante fa perdere alla scrittura la corsa con la lettura: il peer è già andato, la connessione si resetta, e la chiusura arriva come un `1006` nudo **con il 4400 buttato via** — cioè proprio il loop di riconnessione che §7.5 vieta per il 4400. Osservato: `["connecting","reconnecting","connecting","reconnecting",…]` all'infinito. Con lo yield: `["connecting","refused"]` e codice 4400. Una riga, e la regola torna a valere.
 
+La misura è stata fatta con un client Node, che usa la stessa classe `WebSocket` del browser; che un browser vero si comporti identicamente è coerente col fatto che la corsa è a livello TCP/WebSocket e non nell'API, ma **non è stato osservato in un browser** — l'estensione non era disponibile. È l'unica cosa del passo 4 che resta da guardare con gli occhi.
+
 ### 10.5 `?station_id=` lo appende il client
 
 `stations.ws_url` è quello che la stazione ha annunciato di sé e che il coordinatore ha memorizzato — `ws://localhost:9101/ws/driver`, **senza query string** — mentre `vs_driver_ws` chiude `4400` se `station_id` manca o nomina un'altra stazione. Appenderlo è quindi compito del client, ed è commentato nel punto in cui avviene: è il dettaglio che, al passo successivo, nessuno ricorda.
