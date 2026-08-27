@@ -57,8 +57,9 @@ public class HistoryServlet extends HttpServlet {
             req.setAttribute("sessions", history);
             req.setAttribute("totalEuro", String.format("%.2f", totalCents / 100.0));
             req.setAttribute("totalKwh", String.format("%.2f", totalKwh));
-            req.setAttribute("overstayCentsMin",
-                    BillingService.getInstance().getOverstayCentsPerMinute());
+            // No global overstay rate is passed any more: it is set per station
+            // (stations.tariff_cents_min_overstay), so a single figure on a page listing
+            // sessions from several sites would be wrong for some of them.
             req.getRequestDispatcher("/WEB-INF/views/history.jsp").forward(req, res);
 
         } catch (SQLException e) {

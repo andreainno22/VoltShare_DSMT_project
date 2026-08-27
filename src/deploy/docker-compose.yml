@@ -191,7 +191,11 @@ services:
       # Billing (M2). The sweep is what actually prices sessions; the
       # session_closed event only makes it run sooner, so shortening the
       # interval is how the demo shows a cost appear without waiting.
-      OVERSTAY_CENTS_MIN: ${OVERSTAY_CENTS_MIN:-50}
+      #
+      # There is deliberately no OVERSTAY_CENTS_MIN here. Both tariffs are
+      # per station and live in `stations` (schema.sql); an environment
+      # variable next to them would be a second source for the same price,
+      # and the one that silently won.
       BILLING_SWEEP_SECONDS: ${BILLING_SWEEP_SECONDS:-60}
       DB_HOST: mysql
       DB_PORT: "3306"

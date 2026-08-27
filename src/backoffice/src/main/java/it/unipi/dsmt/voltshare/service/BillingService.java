@@ -53,7 +53,6 @@ public final class BillingService {
     private static final int BATCH = 200;
 
     private final SessionDao sessions = new SessionDao();
-    private final int overstayCentsPerMinute = Env.getInt("OVERSTAY_CENTS_MIN", 50);
     private final int sweepSeconds = Env.getInt("BILLING_SWEEP_SECONDS", 60);
 
     private ScheduledExecutorService scheduler;
@@ -82,8 +81,7 @@ public final class BillingService {
         });
         // The first run is immediate: it settles anything closed while this node was down.
         scheduler.scheduleWithFixedDelay(this::sweepQuietly, 0, sweepSeconds, TimeUnit.SECONDS);
-        LOG.log(Level.INFO, "Billing sweep every {0} s, overstay {1} cents/min",
-                new Object[]{sweepSeconds, overstayCentsPerMinute});
+        LOG.log(Level.INFO, "Billing sweep every {0} s", sweepSeconds);
     }
 
     public synchronized void stop() {
@@ -111,8 +109,10 @@ public final class BillingService {
         List<SessionDao.Unbilled> pending = sessions.findUnbilled(BATCH);
         int billed = 0;
         for (SessionDao.Unbilled s : pending) {
+            // Both rates come from the station's own row: they are the price at settlement,
+            // and overstay is priced per station exactly like energy is.
             int cents = cost(s.energyKwh(), s.tariffCentsKwh(),
-                    s.overstaySeconds(), overstayCentsPerMinute);
+                    s.overstaySeconds(), s.overstayCentsPerMinute());
             if (sessions.markBilled(s.id(), cents)) {
                 billed++;
             }
@@ -172,8 +172,8 @@ public final class BillingService {
         return energyCents + (int) (minutes * overstayCentsPerMinute);
     }
 
-    /** Exposed so the history page can explain the charge it is showing. */
-    public int getOverstayCentsPerMinute() {
-        return overstayCentsPerMinute;
+    /** How often the sweep runs, for the shell and the logs. */
+    public int getSweepSeconds() {
+        return sweepSeconds;
     }
 }
