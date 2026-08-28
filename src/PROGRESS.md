@@ -778,6 +778,65 @@ percorso dell'erogazione.
 
 ---
 
+## 7za. Le sospensioni non sopravvivevano a un riavvio — 28 agosto
+
+Nella sua nota A accennava a *"una review della PR #5: la più importante riguarda le sospensioni
+dopo un riavvio"*. Quella review non è mai arrivata — su GitHub c'è solo quella automatica di
+Copilot, su un altro punto. Ma **l'indizio era giusto**, e cercandolo sono usciti due buchi veri.
+
+### Il buco
+
+`pushAllSuspensions()` veniva chiamato solo quando il **nome** del leader cambiava:
+
+```java
+boolean changed = !a.atomValue().equals(leaderNode);
+if (changed) { PenaltyService.getInstance().pushAllSuspensions(); }
+```
+
+Due modi per non farlo scattare:
+
+1. **un coordinatore che si riavvia e rivince** torna con la mappa delle sospensioni **vuota**,
+   annuncia lo stesso nome di prima, e per il back office "non è cambiato niente". Serve a tempo
+   indeterminato lasciando prenotare utenti sospesi;
+2. **il back office che si riavvia** parte con `leaderNode` = primo elemento di `COORD_NODES`. Se
+   il leader è proprio quello, il primo annuncio non è un cambiamento. E peggio: `{leader, _}`
+   veniva inviato **una volta sola**, alla vittoria dell'elezione — quindi un back office
+   partito dopo non ne sentiva nessuno, e su un cluster sano l'elezione successiva non arriva mai.
+
+Il secondo è il caso più realistico ed è esattamente quello che A chiamava "dopo un riavvio".
+
+### Correzione, su entrambi i lati
+
+- **Java**: si spinge a **ogni** annuncio, non solo quando il nome cambia. L'annuncio non
+  significa "è cambiato il leader", significa *"ho appena cominciato a servire e la mia tabella è
+  quel che sono riuscito a ricostruire"* — cioè precisamente il momento in cui le sospensioni
+  vanno ripetute. È idempotente e costa una manciata di messaggi.
+- **Erlang**: il republish periodico manda anche `{leader, node()}`. Un back office partito tardi
+  converge da solo entro 30 secondi, invece di aspettare un'elezione che non verrà.
+
+### Verifica
+
+```
+docker compose restart backoffice          # nessuna elezione nei coordinatori
+backoffice | Coordinator leader is now vs@coord3
+backoffice | Re-sent 1 suspension(s) to the new leader
+
+utente sospeso, dopo il restart : {error, <<"r-c">>, suspended}
+```
+
+Il back office ha ripreso da solo, senza che nessuno rieleggesse nulla. Prima sarebbe rimasto in
+silenzio.
+
+### Perché è il tipo di difetto che sfugge
+
+La condizione `changed` sembrava un'ottimizzazione ovvia — evitare un push inutile. Ma stava
+confondendo **due domande diverse**: "chi è il leader?" e "il leader sa quel che deve sapere?".
+Un processo riavviato ha lo stesso nome e una memoria vuota, e il nome è ciò che stavamo
+guardando. Vale la pena raccontarlo all'orale insieme al rebuild: sono lo stesso problema —
+uno stato che il cluster non possiede — risolto una volta chiedendo e una volta ripetendo.
+
+---
+
 ## 7z. M4-B: penalità, notifiche, profilo — 28 agosto
 
 Fatta e verificata end-to-end contro il cluster vero.

@@ -217,18 +217,36 @@ public final class ErlangBridge {
         BillingService.getInstance().requestSweep();
     }
 
+    /**
+     * A coordinator has announced that it is serving.
+     *
+     * <p>The suspensions are re-sent on <b>every</b> announcement, not only when the node name
+     * changes. That looked like a pointless repetition and was in fact a hole:
+     *
+     * <ul>
+     *   <li>a coordinator that crashes and is restarted comes back with an <em>empty</em>
+     *       suspension map, wins the election again, and announces the same node name. Comparing
+     *       names, nothing "changed" — so nothing was pushed, and it served indefinitely
+     *       letting suspended drivers reserve;</li>
+     *   <li>the same on the other side: a back office that restarts while the leader is the
+     *       first entry of COORD_NODES starts out already believing that name, so the first
+     *       announcement it hears is not a change either.</li>
+     * </ul>
+     *
+     * <p>What the announcement really means is "I have just started serving and my table is
+     * whatever I could rebuild" — which is exactly when the suspensions have to be repeated,
+     * regardless of who is speaking. The push is idempotent and a handful of messages, so
+     * repeating it costs nothing next to the failure it prevents.
+     */
     private void onLeader(OtpErlangObject value) {
         if (value instanceof OtpErlangAtom a) {
-            boolean changed = !a.atomValue().equals(leaderNode);
             leaderNode = a.atomValue();
             LOG.log(Level.INFO, "Coordinator leader is now {0}", leaderNode);
-            if (changed) {
-                // A new leader knows nothing about suspensions. It can rebuild the claims by
-                // asking the stations, because the stations hold them; nobody in the cluster
-                // holds the suspensions, so they have to be pushed from here or a suspended
-                // driver would be able to reserve again after every failover.
-                PenaltyService.getInstance().pushAllSuspensions();
-            }
+
+            // Claims are rebuilt by asking the stations, which hold them. Nobody in the
+            // cluster holds the suspensions — they live only in MySQL — so they can only
+            // arrive from here.
+            PenaltyService.getInstance().pushAllSuspensions();
         }
     }
 

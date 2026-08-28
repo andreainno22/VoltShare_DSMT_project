@@ -161,6 +161,16 @@ handle_cast(_Msg, State) ->
 %% table is empty and republishing it would blank the lobby.
 handle_info(republish, State = #state{serving = true}) ->
     erlang:send_after(?REPUBLISH_INTERVAL_MS, self(), republish),
+    %% The leader announcement rides along with the station list.
+    %%
+    %% Without it, `{leader, _}' is sent exactly once, on winning an election. A back office
+    %% that starts later never hears one and keeps addressing whichever node happens to be
+    %% first in COORD_NODES — which is also the moment it would have pushed the suspensions.
+    %% Both would then wait for the next election, which on a healthy cluster never comes.
+    %%
+    %% Repeating it every 30 s makes a restarted back office converge on its own, and costs
+    %% one extra message per interval.
+    send(State, {leader, node()}),
     {noreply, send_stations(State#state.last, State)};
 
 handle_info(republish, State) ->
