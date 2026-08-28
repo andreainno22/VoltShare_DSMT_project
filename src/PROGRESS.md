@@ -778,6 +778,77 @@ percorso dell'erogazione.
 
 ---
 
+## 7p. M1 di A è chiusa, e undici nostri test non venivano eseguiti — 27 agosto
+
+`nota-per-B-pendenze.md`. **Il client browser è arrivato**: `station.jsp`, `js/ws.js`,
+`js/station.js` su `main`, e con essi il JWT ha attraversato per la prima volta il confine fra le
+due metà — firmato da `JwtUtil`, letto dalla pagina renderizzata, verificato da `vs_jwt`.
+
+### ① Undici test di M3 saltati in silenzio
+
+Verificato, ed è esattamente come dice A:
+
+```
+rebar3 eunit --app=vs_coord   →  25 test
+rebar3 eunit                  → 133 test  (di cui 36 di vs_coord)
+```
+
+rebar3 accoppia un modulo di test a un sorgente con lo stesso stem. `vs_coord_failover.erl` **non
+esiste** — il modulo si chiama `vs_coord_election` — quindi `vs_coord_failover_tests` veniva
+**scartato senza un avviso**. Erano gli undici test di elezione, quorum e ricostruzione: la parte
+che vale l'esame.
+
+Il difetto era già visibile il 25: avevo notato *"solo 16, il nuovo modulo non è stato raccolto"*,
+avevo aggirato l'ostacolo con `--module=` e **non avevo cercato la causa**. Il numero in `PROGRESS`
+era giusto perché misurato con `rebar3 eunit` senza flag, quindi nulla segnalava il problema. È il
+motivo per cui vale la pena trattare una stranezza come un difetto invece che come un attrito.
+
+Correzione — rinominati i moduli perché si aggancino a un sorgente vero:
+
+- i 5 test di adozione → `vs_coord_rebuild_tests` (accoppiato a `vs_coord_rebuild.erl`);
+- i 6 test sui modi (standby, suspended, rebuilding) → dentro `vs_coord_srv_tests`, che è il server
+  a cui appartengono;
+- `vs_coord_failover_tests.erl` eliminato.
+
+Ora `--app=vs_coord` ne conta **36** invece di 25, e la suite intera resta 133.
+
+### ② A ritira la segnalazione sul `monitor_nodes`, e ha ragione a ritirarla
+
+Aveva scritto che `{nodedown, Node}` non arrivava mai perché nessuno si iscriveva. Falso: il suo
+grep cercava `monitor_nodes` al plurale, mentre `vs_coord_srv` usa `erlang:monitor_node/2`, che è
+l'API per **un nodo specifico** — la scelta giusta, perché sorveglia le stazioni annunciate invece
+di farsi svegliare da ogni nodo del cluster. `claim.md` riga 154 lo diceva già a parole.
+
+Ha rifatto la prova sui container: `docker compose stop station1` → due secondi dopo, claim a zero
+e stazioni a uno. Nessuna correzione da fare da parte nostra.
+
+Vale la pena notare la simmetria: in due giorni A ha trovato due difetti veri nel nostro codice e
+una volta si è corretto da solo. Il valore delle PR incrociate sta anche in questo — non solo nel
+trovare, ma nel poter smentire un sospetto guardando il codice invece di ricordarselo.
+
+### ③ La partizione si può fare su un host solo
+
+Nell'annotare il ridimensionamento del multi-host avevamo scritto che l'unico motivo residuo per
+volerlo era la **partizione vera**, impossibile su una macchina. A fa notare che l'argomento non
+regge:
+
+```bash
+docker network disconnect voltshare coord3   # resta vivo, ma isolato
+docker network connect    voltshare coord3
+```
+
+`docker kill` è un **crash**; il quorum esiste per l'altro scenario, un nodo che *resta vivo* e non
+vede più gli altri. Disconnettere l'interfaccia lo riproduce esattamente, su un host solo. Se
+funziona, al multi-host non resta nemmeno quel motivo — **e la demo guadagna lo scenario più
+difficile da mostrare.** Da provare al prossimo avvio di Docker.
+
+### ④ e ⑤
+
+C'è un utente `cc-probe` nel MySQL condiviso, creato da A per firmare un token vero: comparirà
+nella lobby e nello storico, si cancella se dà fastidio in demo. E A aspetta la PR su `claim.md`.
+
+---
+
 ## 7o. A trova un bug nella fatturazione — 26 agosto
 
 `risposta-per-B-M2.md` accetta entrambe le richieste di M2 e, in fondo, sotto *"non c'entra con le

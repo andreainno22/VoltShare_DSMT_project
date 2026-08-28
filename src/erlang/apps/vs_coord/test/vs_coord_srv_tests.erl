@@ -10,6 +10,8 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(STATION_1, 1).
+%% A coordinator that is not this node, for the standby redirects (M3).
+-define(OTHER_COORD, 'vs@coord3').
 -define(STATION_2, 2).
 -define(VEHICLE, 88).
 -define(USER, 12).
@@ -25,6 +27,10 @@
 setup() ->
     os:putenv("LEASE_SECONDS", "900"),
     os:putenv("CLAIM_GRACE_SECONDS", "0"),
+    %% There are no station nodes in a local test VM, so a rebuild has nobody to
+    %% ask and waits out its window (vs_coord_rebuild:collect/3). Long enough
+    %% here that the role tests can observe `rebuilding' and drive it by hand.
+    os:putenv("COORD_REBUILD_TIMEOUT_MS", "3000"),
     {ok, Pid} = vs_coord_srv:start_link(),
     announce(?STATION_1, 'vs@station1'),
     announce(?STATION_2, 'vs@station2'),
@@ -44,7 +50,8 @@ cleanup(Pid) ->
         error(coordinator_did_not_stop)
     end,
     os:unsetenv("LEASE_SECONDS"),
-    os:unsetenv("CLAIM_GRACE_SECONDS").
+    os:unsetenv("CLAIM_GRACE_SECONDS"),
+    os:unsetenv("COORD_REBUILD_TIMEOUT_MS").
 
 %% The coordinator refuses claims for stations it has never heard of, so the
 %% tests have to announce them first — exactly as a real station does on boot.
@@ -271,6 +278,121 @@ stations_test_() ->
         fun stats_update_the_counters/1,
         fun a_dead_node_takes_its_claims_with_it/1
     ]).
+
+%%%===================================================================
+%%% M3 — what this server does when it is not the one in charge
+%%%===================================================================
+%%
+%% The claim rules above assume a coordinator that serves. These cover the other
+%% three modes, which is where P2 is actually defended: every one of them is
+%% about refusing something.
+%%
+%% They live in this file, not in one of their own, because rebar3 pairs a test
+%% module to a source module of the same stem — a `vs_coord_failover_tests' with
+%% no `vs_coord_failover.erl' behind it is skipped by `--app', silently and
+%% without a warning. Spotted by A on 26/08, after it had hidden eleven M3 tests
+%% for a day.
+
+roles_test_() ->
+    claim_fixture([
+        fun standby_redirects_claims_to_the_leader/1,
+        fun standby_redirects_renewals_too/1,
+        fun standby_forgets_the_claim_table/1,
+        fun suspended_names_no_leader/1,
+        fun suspended_refuses_even_though_it_was_leader/1,
+        fun rebuilding_refuses_but_still_adopts/1
+    ]).
+
+%% Casts are asynchronous; a synchronous call flushes the mailbox ahead of it.
+sync() ->
+    vs_coord_srv:mode().
+
+%% A station asking the wrong coordinator must be told where to go, not simply
+%% refused: it retries on the named node and the driver never sees the failure
+%% (claim.md §4).
+standby_redirects_claims_to_the_leader(_) ->
+    fun() ->
+        vs_coord_srv:become_follower(?OTHER_COORD),
+        ?assertEqual(standby, sync()),
+        ?assertEqual({not_serving, ?OTHER_COORD},
+                     vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3)),
+        ?assertEqual([], vs_coord_srv:claims(), "a follower grants nothing")
+    end.
+
+%% Renewals matter more than claims here: a renewal is how a leader ADOPTS a
+%% claim. Answering one while in standby would build a table this node has no
+%% right to hold, and would tell the station its claims are safe on a node that
+%% is not deciding anything.
+standby_redirects_renewals_too(_) ->
+    fun() ->
+        vs_coord_srv:become_follower(?OTHER_COORD),
+        ?assertEqual(standby, sync()),
+        Now = vs_time:now_ms(),
+        ?assertEqual({not_serving, ?OTHER_COORD},
+                     vs_coord_srv:renew(?STATION_1,
+                                        [{<<"c-1">>, ?VEHICLE, 3, ?USER, Now}])),
+        ?assertEqual([], vs_coord_srv:claims(),
+                     "a redirected renewal must not be adopted")
+    end.
+
+%% Being deposed drops the table. Keeping it would leave the follower answering
+%% about reservations it no longer tracks, and would poison its own rebuild if
+%% it were elected later.
+standby_forgets_the_claim_table(_) ->
+    fun() ->
+        {ok, _, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        ?assertEqual(1, length(vs_coord_srv:claims())),
+        vs_coord_srv:become_follower(?OTHER_COORD),
+        ?assertEqual(standby, sync()),
+        ?assertEqual([], vs_coord_srv:claims())
+    end.
+
+%% Out of quorum we do not name a leader even if we remember one: it may be on
+%% the other side of the partition, and sending the station there is worse than
+%% admitting we do not know.
+suspended_names_no_leader(_) ->
+    fun() ->
+        vs_coord_srv:become_follower(?OTHER_COORD),
+        vs_coord_srv:suspend(),
+        ?assertEqual(suspended, sync()),
+        ?assertEqual({not_serving, undefined},
+                     vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3)),
+        ?assertEqual({not_serving, undefined},
+                     vs_coord_srv:renew(?STATION_1, [{<<"c-1">>, ?VEHICLE, 3, ?USER, 1}]))
+    end.
+
+%% The case the quorum rule exists for: this node WAS the leader, then lost
+%% sight of the majority. It must stop granting even though nobody deposed it —
+%% otherwise a partition yields two leaders and the same vehicle twice.
+suspended_refuses_even_though_it_was_leader(_) ->
+    fun() ->
+        {ok, _, _, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        ?assertEqual(serving, sync()),
+        vs_coord_srv:suspend(),
+        ?assertEqual(suspended, sync()),
+        ?assertMatch({not_serving, undefined},
+                     vs_coord_srv:claim(<<"r-2">>, 99, ?USER, ?STATION_1, 2)),
+        ?assertEqual([], vs_coord_srv:claims(),
+                     "a suspended coordinator holds nothing it could serve from")
+    end.
+
+%% Rebuilding is the one refusal that is NOT a redirect: this node is the
+%% leader, so there is nowhere better to send the station. But renewals are
+%% still accepted, because they are a source of adoptions — that is how the
+%% table fills up even if the rebuild query reaches nobody.
+rebuilding_refuses_but_still_adopts(_) ->
+    fun() ->
+        vs_coord_srv:become_leader(),
+        ?assertEqual(rebuilding, sync()),
+        ?assertMatch({error, <<"r-1">>, rebuilding},
+                     vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3)),
+        Now = vs_time:now_ms(),
+        {renewed, Ok, [], _} =
+            vs_coord_srv:renew(?STATION_1, [{<<"c-old">>, ?VEHICLE, 3, ?USER, Now - 60000}]),
+        ?assertEqual([<<"c-old">>], Ok),
+        ?assertEqual(1, length(vs_coord_srv:claims()),
+                     "a renewal during the rebuild is adopted, not refused")
+    end.
 
 announced_stations_are_listed(_) ->
     fun() ->
