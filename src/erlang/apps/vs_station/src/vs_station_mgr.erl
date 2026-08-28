@@ -55,6 +55,18 @@
                 %% that turns kWh into money (schema.sql, ownership rules).
                 tariff_cents_kwh :: non_neg_integer(),
                 child_opts    :: map(),
+                %% M2 step 2 — the allocator's settings, read from the
+                %% environment once here rather than inside vs_power, which
+                %% stays a function of its arguments.
+                power_tick_ms   :: pos_integer(),
+                min_charge_kw   :: number(),
+                taper_soc_pct   :: number(),
+                taper_margin_kw :: number(),
+                %% The last allocation this process computed and sent out:
+                %% conn_id → kW. It is what `allocated_kw' reports, so the
+                %% field says what was *granted*, not what the meters
+                %% happen to be reading back (see build_state/1).
+                alloc    = #{} :: #{pos_integer() => float()},
                 monitors = #{} :: #{reference() =>
                                         {connector, pos_integer()} | {subscriber, pid()}},
                 subs     = #{} :: #{pid() => reference()}}).
@@ -154,7 +166,18 @@ init(Opts) ->
                 name             = Name,
                 site_power_kw    = SiteKw,
                 tariff_cents_kwh = Tariff,
-                child_opts       = ChildOpts},
+                child_opts       = ChildOpts,
+                power_tick_ms    = maps:get(power_tick_ms, Opts,
+                                            vs_env:get_int("POWER_TICK_MS", 5000)),
+                %% Already a documented variable of ws-driver.md §10; the
+                %% other two are station-internal and are documented in
+                %% scelte_di_progetto.md, not in a contract.
+                min_charge_kw    = maps:get(min_charge_kw, Opts,
+                                            vs_env:get_int("MIN_CHARGE_KW", 6)),
+                taper_soc_pct    = maps:get(taper_soc_pct, Opts,
+                                            vs_env:get_int("TAPER_SOC_PCT", 80)),
+                taper_margin_kw  = maps:get(taper_margin_kw, Opts,
+                                            vs_env:get_int("TAPER_MARGIN_KW", 5))},
      {continue, start_connectors}}.
 
 handle_continue(start_connectors, State0) ->
@@ -176,6 +199,11 @@ handle_continue(start_connectors, State0) ->
                                S
                        end
                end, State1, Missing),
+    %% The tick is armed after the connectors exist, so the first one
+    %% cannot fire against an empty registry. Nothing is charging at boot,
+    %% so there is no first allocation to make here: the `plugged' that
+    %% starts one is itself a connector_event, and that recomputes.
+    _ = schedule_power_tick(State2),
     {noreply, State2}.
 
 handle_call(station_state, _From, State) ->
@@ -241,15 +269,35 @@ handle_info({connector_event, ConnId, {connector_up, Pid}}, State0) ->
         {unchanged, State} ->
             {noreply, State};
         {changed, State} ->
-            broadcast(State),
-            {noreply, State}
+            State1 = reallocate(State),
+            broadcast(State1),
+            {noreply, State1}
     end;
 
 %% Any other connector event may have changed the observable state, so the
 %% subscribers get a fresh complete push (P6). No diffing on purpose.
+%%
+%% This is also one of the two moments the power is re-split (SCOPE §3.5:
+%% "on every arrival, every departure"): arrivals and departures are
+%% connector events, and this clause is where they all pass. Recomputing
+%% *before* broadcasting is not incidental — see reallocate/1.
 handle_info({connector_event, _ConnId, _Event}, State) ->
-    broadcast(State),
-    {noreply, State};
+    State1 = reallocate(State),
+    broadcast(State1),
+    {noreply, State1};
+
+%% The other moment: the periodic re-split of §3.5. It is the only thing
+%% that can notice a taper, because a `meter' reading deliberately emits
+%% no event — one per connector every METER_INTERVAL_S would flood every
+%% open page with a change that never happened.
+%%
+%% No broadcast here, on purpose. A page that is watching re-reads the
+%% whole state on its own STATE_TICK_MS timer (vs_driver_ws), so a
+%% taper-driven change reaches it within the same five seconds anyway,
+%% and pushing from both ends would double the traffic to say it twice.
+handle_info(power_tick, State) ->
+    _ = schedule_power_tick(State),
+    {noreply, reallocate(State)};
 
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #state{monitors = Mons,
                                                                   subs = Subs}) ->
@@ -262,7 +310,9 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #state{monitors = Mon
                 [{ConnId, RatedKw, _}] -> ets:insert(?TAB, {ConnId, RatedKw, undefined});
                 [] -> ok
             end,
-            State1 = State#state{monitors = Mons1},
+            %% A connector that died is a departure like any other: its
+            %% share goes back into the split for the ones still alive.
+            State1 = reallocate(State#state{monitors = Mons1}),
             broadcast(State1),
             {noreply, State1};
         {{subscriber, Pid}, Mons1} ->
@@ -335,24 +385,33 @@ demonitor_connector(ConnId, Mons) ->
 %% fields that are not the manager's to know: `coordinator_reachable'
 %% belongs to the claim client, and `held_by_me'/`mine' depend on which
 %% driver is looking. Both are added by vs_driver_proto:wire_state/3.
-build_state(#state{station_id = StationId, name = Name, site_power_kw = SiteKw,
-                   tariff_cents_kwh = Tariff}) ->
-    Connectors = [connector_entry(Row) || Row <- lists:keysort(1, ets:tab2list(?TAB))],
+build_state(State = #state{station_id = StationId, name = Name,
+                           site_power_kw = SiteKw, tariff_cents_kwh = Tariff}) ->
     #{station_id       => StationId,
       name             => Name,
       site_power_kw    => SiteKw,
-      %% What the site is handing out right now. Until M2 it is the sum
-      %% of what the connectors report drawing, not the result of an
-      %% allocation: there is nothing allocating yet, and a number the
-      %% meters agree with is better than a number nobody computed.
-      allocated_kw     => allocated_kw(Connectors),
+      allocated_kw     => allocated_kw(State),
       tariff_cents_kwh => Tariff,
-      connectors       => Connectors}.
+      connectors       => connector_entries()}.
 
-%% An `offline' entry carries three keys only, so the default is not
-%% decoration: a connector whose process is gone draws nothing.
-allocated_kw(Connectors) ->
-    lists:sum([maps:get(power_kw, C, 0) || C <- Connectors]).
+%% What the site has **granted**, which since M2 step 2 is a different
+%% number from what the meters read back — the cars may well be drawing
+%% less than they were allowed, and a car that is tapering always is.
+%% "Allocated" now means allocated: the field is the sum of the limits
+%% this process handed out, so `allocated_kw =< site_power_kw' holds by
+%% construction rather than by luck.
+%%
+%% Read from the stored allocation and not from the connectors, so that
+%% `station_state' and `subscribe' stay pure reads. A build that had to
+%% recompute would be a read with a side effect on every connector.
+%% Always a float, empty allocation included: the key has been a float
+%% since M1 and a page that formats it should not have to cope with the
+%% one case where it is an integer.
+allocated_kw(#state{alloc = Alloc}) ->
+    float(lists:sum(maps:values(Alloc))).
+
+connector_entries() ->
+    [connector_entry(Row) || Row <- lists:keysort(1, ets:tab2list(?TAB))].
 
 connector_entry({ConnId, RatedKw, undefined}) ->
     #{connector_id => ConnId, rated_kw => RatedKw, state => offline};
@@ -362,6 +421,42 @@ connector_entry({ConnId, RatedKw, Pid}) ->
     catch
         _:_ -> #{connector_id => ConnId, rated_kw => RatedKw, state => offline}
     end.
+
+%%%===================================================================
+%%% the power split (SCOPE §3.5)
+%%%===================================================================
+
+schedule_power_tick(#state{power_tick_ms = Ms}) ->
+    erlang:send_after(Ms, self(), power_tick).
+
+%% Read the connectors, split the budget, tell everybody, remember what
+%% was granted. The manager is the only process that knows both the site
+%% budget and every session at once; the connectors go on knowing nothing
+%% about their neighbours.
+%%
+%% `set_limit' goes to **every** live session on every recomputation, at
+%% an unchanged value too. That is ws-chargepoint.md §5 as written —
+%% idempotence by repetition rather than diff tracking — and it means a
+%% charge point that missed a frame is right again within one tick
+%% instead of sitting on a stale limit forever.
+%%
+%% The order here is what makes the push that follows correct. The casts
+%% go out first and `build_state' reads the connectors afterwards; message
+%% order between two processes is preserved, so each connector handles its
+%% `set_limit' before it answers the `snapshot' call, and the state the
+%% subscribers receive already carries the new limits — `suspended'
+%% included, which is derived from exactly that field.
+reallocate(State = #state{site_power_kw = Budget, min_charge_kw = MinKw,
+                          taper_soc_pct = TaperSoc, taper_margin_kw = Margin}) ->
+    Demands = vs_power:demands(connector_entries(), TaperSoc, Margin),
+    Alloc   = vs_power:allocate(Budget, Demands, MinKw),
+    maps:foreach(fun(ConnId, Kw) ->
+                         case lookup_pid(ConnId) of
+                             {ok, Pid} -> vs_connector:set_limit(Pid, Kw);
+                             _         -> ok      %% died between the two reads
+                         end
+                 end, Alloc),
+    State#state{alloc = Alloc}.
 
 broadcast(#state{subs = Subs}) when map_size(Subs) =:= 0 ->
     ok;

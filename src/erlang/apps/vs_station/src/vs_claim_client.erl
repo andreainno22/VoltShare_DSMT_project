@@ -44,8 +44,13 @@
 -export([acquire/4, release/2]).
 %% dirty read — for the driver WebSocket processes (see below)
 -export([coordinator_reachable/0]).
+%% from vs_station_db, after the row is in MySQL
+-export([session_closed/1]).
 %% lifecycle
 -export([start_link/0, start_link/1]).
+%% pure, and exported so the lobby's three numbers can be tested on a map
+%% built by hand instead of on a whole station
+-export([count_stats/1]).
 %% gen_server
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, handle_continue/2]).
 
@@ -123,6 +128,19 @@ coordinator_reachable() ->
     catch
         error:badarg -> true       %% the claim client is not up yet
     end.
+
+%% @doc A session row has been written; wake the back office up
+%% (erlang-java.md §2.3). Called by `vs_station_db' **after** the INSERT,
+%% never by a connector: the event carries the row's id, which does not
+%% exist until the row does.
+%%
+%% A cast, and delivery is best-effort by design. Java does not read the
+%% payload — it prices sessions by sweeping `cost_cents IS NULL' every 60
+%% seconds and this only makes the sweep run sooner — so losing the event
+%% delays a receipt by one interval and loses nothing.
+-spec session_closed(tuple()) -> ok.
+session_closed(Event) ->
+    gen_server:cast(?MODULE, {session_closed, Event}).
 
 %%%===================================================================
 %%% lifecycle
@@ -208,6 +226,19 @@ handle_call(_Other, _From, State) ->
 
 handle_cast({leader_hint, Node}, State) ->
     {noreply, State#state{leader = Node}};
+
+%% Same shape as `station_stats' below: the cast to the leader goes out
+%% from a throwaway process, so a coordinator that is slow, or a node that
+%% is not there, can never hold up the one process that renews claims.
+%%
+%% The message is `{session_closed, Event}' — the two-element wrapper
+%% `vs_coord_srv:handle_cast/2' matches, with the nine-field tuple of
+%% erlang-java.md §2.3 inside it. Sending the nine fields flat would fall
+%% into the coordinator's catch-all instead, which is a warning in a log
+%% nobody is reading and a receipt that never arrives.
+handle_cast({session_closed, Event}, State = #state{leader = Leader}) ->
+    _ = spawn(fun() -> gen_server:cast({?SRV, Leader}, {session_closed, Event}) end),
+    {noreply, State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -479,14 +510,22 @@ req_id() ->
 %% closing counts as charging: a session is still ending there. offline
 %% counts as nothing: not free, not usable — which is why the three
 %% numbers may add up to less than the connector total.
+%%
+%% `suspended' counts as charging too, and the clause has to be written
+%% out: it is what a charging session at a limit of zero reports since M2
+%% step 2, and without it the catch-all below would quietly drop it. The
+%% connector is neither free nor held — somebody's car is plugged into it
+%% and the session is alive — so a lobby that showed it as available
+%% would send the next driver to an outlet that is already taken.
 count_stats(#{connectors := Connectors}) ->
     lists:foldl(fun(C, {F, H, Ch}) ->
                         case maps:get(state, C, offline) of
-                            free     -> {F + 1, H, Ch};
-                            held     -> {F, H + 1, Ch};
-                            charging -> {F, H, Ch + 1};
-                            closing  -> {F, H, Ch + 1};
-                            _        -> {F, H, Ch}
+                            free      -> {F + 1, H, Ch};
+                            held      -> {F, H + 1, Ch};
+                            charging  -> {F, H, Ch + 1};
+                            suspended -> {F, H, Ch + 1};
+                            closing   -> {F, H, Ch + 1};
+                            _         -> {F, H, Ch}
                         end
                 end, {0, 0, 0}, Connectors);
 count_stats(_) ->

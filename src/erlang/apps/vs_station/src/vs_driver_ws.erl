@@ -10,7 +10,9 @@
 %%% One process per open page. It holds no reservation and no session:
 %%% those live in the connector processes and survive the browser being
 %%% closed, which is exactly why ws-driver.md §7.5 can put reconnection
-%%% entirely on the client and keep no server-side session.
+%%% entirely on the client and keep no server-side session. The one thing
+%%% it does remember is the last `session' frame it sent, and only so that
+%%% the final `closed' of §5.2 can be recognised — see `push/2'.
 %%%
 %%% ## Why the socket is pinged
 %%%
@@ -95,7 +97,9 @@ websocket_init({open, Session}) ->
     %% §3: a socket that never joins is not a socket, it is a leak.
     _ = erlang:send_after(join_timeout_ms(), self(), join_timeout),
     _ = erlang:send_after(state_tick_ms(), self(), state_tick),
-    {[], #{session => Session, last_state => Seed}}.
+    %% `last_session' starts empty, so a socket whose driver is not
+    %% charging sends nothing at all until he is (§5.2, and `push/2').
+    {[], #{session => Session, last_state => Seed, last_session => undefined}}.
 
 %% §1: "Frames are text, one JSON object per frame. Binary frames are
 %% rejected with close code 4400."
@@ -119,7 +123,8 @@ websocket_handle(_Frame, State) ->
 %% An event-driven push: something actually changed. §7.1 — a complete
 %% snapshot every time, never a delta.
 websocket_info({station_state, Map}, State) ->
-    {push_state(Map, State), State#{last_state := {ok, Map}}};
+    {Frames, State1} = push(Map, State),
+    {Frames, State1#{last_state := {ok, Map}}};
 
 %% The heartbeat of §5.1, and the reason it is not redundant with the
 %% pushes above: meter readings reach the connector as casts that change
@@ -131,14 +136,14 @@ websocket_info(state_tick, State = #{last_state := Last}) ->
     Current = try {ok, vs_station_mgr:station_state()}
               catch exit:_ -> Last          %% manager restarting: repeat the last one
               end,
-    Frames = case Current of
-                 {ok, Map} -> push_state(Map, State);
-                 error     -> []
-             end,
+    {Frames, State1} = case Current of
+                           {ok, Map} -> push(Map, State);
+                           error     -> {[], State}
+                       end,
     %% Rides with the tick rather than on a timer of its own: one timer,
     %% and the pong that comes back is what keeps cowboy's idle timeout
     %% from hanging up on a page that is only watching.
-    {Frames ++ [ping], State#{last_state := Current}};
+    {Frames ++ [ping], State1#{last_state := Current}};
 
 %% §3: "4401 — ... or no join within JOIN_TIMEOUT_MS (5 s)."
 websocket_info(join_timeout, State = #{session := Session}) ->
@@ -167,16 +172,38 @@ terminate(_Reason, _Req, _State) ->
 %%% internal
 %%%===================================================================
 
-push_state(Map, #{session := Session}) ->
+%% One snapshot in, both server-initiated frames out.
+%%
+%% The `session' of §5.2 rides with the `state' of §5.1 — same tick, same
+%% pushes, same send — rather than on a timer of its own. A second timer
+%% would be a second wake-up per socket and, worse, two frames describing
+%% two different instants of the same station: the page would show a power
+%% read at one moment next to an energy read at another. `SESSION_TICK_MS'
+%% is declared in §10 with the same default as `STATE_TICK_MS' precisely
+%% so that one timer can serve both.
+%%
+%% `last_session' is the one thing this process remembers. §5.2 asks for a
+%% final frame when the session ends, and the only way a socket learns of
+%% the end is that the session it was reporting is no longer in the
+%% snapshot; `vs_driver_proto:session_push/3' is what turns that
+%% disappearance into the `closed' frame. Note that the tick above repeats
+%% the *previous* snapshot while the manager is restarting, so a manager
+%% that blinks cannot fake the end of somebody's charge.
+push(Map, State = #{session := Session, last_session := LastSession}) ->
     case maps:get(authenticated, Session) of
         true ->
             %% Translated per connection: `held_by_me' and `mine' depend
             %% on who is watching (§5.1), so the same manager snapshot
-            %% becomes a different frame on every socket.
-            text_frames([vs_driver_proto:state_frame(Map, Session)]);
+            %% becomes a different frame on every socket. §5.2 goes
+            %% further and produces nothing at all for a driver who is not
+            %% the owner of a running session.
+            {SessionFrames, LastSession1} =
+                vs_driver_proto:session_push(Map, Session, LastSession),
+            {text_frames([vs_driver_proto:state_frame(Map, Session) | SessionFrames]),
+             State#{last_session := LastSession1}};
         false ->
             %% Before `join' there is nobody to compute an identity for.
-            []
+            {[], State}
     end.
 
 text_frames(Frames) ->

@@ -5,8 +5,9 @@
 %%% Everything that decides something lives here: envelope validation,
 %%% the handshake, the at-most-once cache, the dispatch of the three
 %%% actions, and the translation of the manager's state into the wire
-%%% snapshot of §5.1. `vs_driver_ws' keeps only the callbacks — it reads
-%%% frames off a socket and hands them to `handle_text/2'.
+%%% snapshot of §5.1 and the live session of §5.2. `vs_driver_ws' keeps
+%%% only the callbacks — it reads frames off a socket and hands them to
+%%% `handle_text/2'.
 %%%
 %%% **Why the split.** A cowboy handler cannot be exercised from EUnit
 %%% without starting a listener and a WebSocket client, and a client
@@ -41,6 +42,7 @@
 -module(vs_driver_proto).
 
 -export([new/1, handle_text/2, state_frame/2, wire_state/3,
+         session_frame/2, session_push/3,
          coordinator_reachable/1]).
 
 -type frame()      :: map().
@@ -471,6 +473,151 @@ wire_connector_state(Other)    -> Other.
 %% missing key and never the word.
 null_if_undefined(undefined) -> null;
 null_if_undefined(Value)     -> Value.
+
+%%%===================================================================
+%%% §5.2 — the live session
+%%%===================================================================
+
+%% @doc The `session' frame for the driver on the other end of this
+%% socket, or `undefined' when that driver has no session running.
+%%
+%% Everything it needs is already in the snapshot the socket receives for
+%% the `state' frame: the driver's session is the connector entry whose
+%% `session' sub-map carries his `user_id'. **No subscription of its own
+%% and no call to the manager** — one `lists:search' over data that was
+%% passing through anyway. Like `wire_state/3' it is a function of a map
+%% and an identity and nothing else, which is what lets the whole of §5.2
+%% be exercised in EUnit on maps built by hand.
+%%
+%% Nothing is sent to a driver who is not charging. §5.2 addresses "the
+%% owner of a running session", and a frame of zeroes would be worse than
+%% silence: the page could not tell "you have no session" from "your
+%% session is stopped".
+-spec session_frame(map(), session()) -> frame() | undefined.
+session_frame(StateMap, #{user_id := UserId}) when is_integer(UserId) ->
+    case lists:search(fun(C) -> owned_by(C, UserId) end,
+                      maps:get(connectors, StateMap, [])) of
+        {value, Connector} ->
+            #{type       => session,
+              request_id => null,                   %% §5: server-initiated
+              payload    => session_payload(Connector)};
+        false ->
+            undefined
+    end;
+%% Before `join' there is no identity to look for. Not an error: the
+%% transport asks on every tick, and the ticks of a socket that has not
+%% joined yet land here.
+session_frame(_StateMap, _Session) ->
+    undefined.
+
+%% §7.3 again: the owner is read from the snapshot and compared with the
+%% identity the token bound, never with anything the client sent. A
+%% connector with no session has no `session' key at all, so the default
+%% has to be a map rather than `undefined'.
+owned_by(Connector, UserId) ->
+    maps:get(user_id, maps:get(session, Connector, #{}), undefined) =:= UserId.
+
+%% A connector snapshot → the §5.2 payload. `power_kw' sits at the top of
+%% the snapshot and the rest inside its `session' sub-map — the shape
+%% `vs_connector:build_snapshot/2' builds, read here rather than reshaped
+%% by the caller, exactly as `vs_power:demand_kw/3' does.
+session_payload(Connector) ->
+    Session = maps:get(session, Connector, #{}),
+    PowerKw = maps:get(power_kw, Connector, 0),
+    SocPct  = maps:get(soc_pct, Session, 0),
+    #{connector_id     => maps:get(connector_id, Connector, 0),
+      phase            => phase(maps:get(state, Connector, charging), SocPct),
+      power_kw         => PowerKw,
+      energy_kwh       => maps:get(energy_kwh, Session, 0),
+      soc_pct          => SocPct,
+      eta_seconds      => eta_seconds(maps:get(battery_kwh, Session, 0),
+                                      SocPct, PowerKw),
+      started_at       => maps:get(started_at, Session, 0),
+      %% M4. §5.2 declares the field, so it travels as a zero rather than
+      %% as a missing key — the same reason `waitlist' is a constant in
+      %% §5.1 — and the semantics (net of the grace period) are already
+      %% agreed with B.
+      overstay_seconds => 0}.
+
+%% §5.2's enum is `charging | suspended | complete | overstay | closed'.
+%% Three of the five are producible from a snapshot: `closed' is not
+%% derived at all — it is what `session_push/3' sends once the session has
+%% left the snapshot — and `overstay' waits for M4.
+%%
+%% `suspended' is read off the connector's reported state, where M2 step 2
+%% already derives it from a limit of zero. It is deliberately **not**
+%% derived from a power near zero, and that is §5.2's own reason: zero
+%% power is ambiguous between a starved allocation and a deep taper, and
+%% the two mean opposite things to whoever is waiting for the car.
+%%
+%% `complete' wins over `suspended' on purpose. A full battery is finished
+%% whatever the allocator did with the last few kilowatts, and telling a
+%% driver that his full car is "paused" would be a worse answer than none.
+%% If `soc_pct' never reaches 100 the phase stays `charging': the station
+%% does not know that a car has stopped asking, and saying so is better
+%% than simulating it.
+phase(_State, SocPct) when is_number(SocPct), SocPct >= 100 -> complete;
+phase(suspended, _SocPct)                                   -> suspended;
+phase(_State, _SocPct)                                      -> charging.
+
+%% §5.2 — how long the rest of the battery takes at the power flowing
+%% right now, in seconds.
+%%
+%% Deliberately raw. The contract: it "is advisory and may jump when
+%% another car arrives and the allocation is recomputed — that jump is the
+%% visible proof of P5 and should not be smoothed away". So no moving
+%% average, no floor and no memory of the previous value: the number the
+%% driver sees is the one the current allocation implies, and it jumps
+%% because the allocation did.
+%%
+%% `null' rather than an enormous number when nothing is flowing: an
+%% estimate that does not exist is not an estimate of infinity. The atom
+%% has to be `null' and not `undefined' — jsx renders the latter as the
+%% string "undefined", the same trap `expires_at' has in §5.1.
+%%
+%% A battery whose size is unknown gets the same answer, and the case is
+%% real: ws-chargepoint.md §4.2 makes `max_kw' mandatory in a way it does
+%% not make `battery_kwh', so a charge point may legitimately never send
+%% it and `vs_cp_proto' reads a missing one as 0.0. Running the formula
+%% anyway would print "0 seconds" — "ready now" — over a car that has just
+%% been plugged in.
+eta_seconds(BatteryKwh, SocPct, PowerKw)
+  when is_number(BatteryKwh), BatteryKwh > 0,
+       is_number(SocPct),
+       is_number(PowerKw), PowerKw > 0 ->
+    RemainingKwh = BatteryKwh * max(0, 100 - SocPct) / 100,
+    round(RemainingKwh / PowerKw * 3600);
+eta_seconds(_BatteryKwh, _SocPct, _PowerKw) ->
+    null.
+
+%% @doc The session frames to send alongside a `state', and the frame to
+%% remember for the next round.
+%%
+%% §5.2 asks for one more send "when it ends", and a socket has no other
+%% way of noticing the end: the session it was reporting is simply not in
+%% the next snapshot. So the last frame sent is carried along — the one
+%% piece of state this channel keeps, and it earns it — and becomes a
+%% `closed' with the values it had when the session disappears. Without
+%% it the page would stop being updated and never learn that it was over,
+%% which is the one thing it cannot work out for itself.
+%%
+%% The transition lives here rather than in the transport for the reason
+%% the whole module exists: it is a decision, and a decision is testable
+%% in EUnit only when no socket is involved.
+-spec session_push(map(), session(), frame() | undefined) ->
+          {[frame()], frame() | undefined}.
+session_push(StateMap, Session, Last) ->
+    case {session_frame(StateMap, Session), Last} of
+        {undefined, undefined} -> {[], undefined};
+        {undefined, LastFrame} -> {[closed_frame(LastFrame)], undefined};
+        {Frame, _Last}         -> {[Frame], Frame}
+    end.
+
+%% The values of the last frame with the phase that says it is over, so
+%% the page shows the energy and the duration of the session that has just
+%% ended instead of freezing on the last live reading.
+closed_frame(Frame = #{payload := Payload}) ->
+    Frame#{payload := Payload#{phase := closed}}.
 
 %%%===================================================================
 %%% collaborators

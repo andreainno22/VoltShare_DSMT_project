@@ -551,3 +551,229 @@ coordinator_reachable_comes_from_the_claim_client_test() ->
     %% a module that is not there at all: optimistic, never an exception
     NoClient = S#{claim_mod := vs_no_such_module},
     ?assertEqual(true, vs_driver_proto:coordinator_reachable(NoClient)).
+
+%%%===================================================================
+%%% §5.2 — the live session
+%%%===================================================================
+%%%
+%%% Same discipline as §5.1 above and for the same reason: the frame is a
+%%% function of a manager state map and an identity, so the whole of the
+%%% contract is asserted on maps built by hand — no manager, no connectors
+%%% and no socket. The session is written out as the one key the function
+%%% actually reads, which is also the cheapest way of saying what it
+%%% depends on.
+
+%% A station holding the given connector, with a free one and an offline
+%% one on either side so that the search has to find the right entry.
+station_with(Connector) ->
+    #{station_id => 1, name => <<"Pisa Centro">>, site_power_kw => 350,
+      allocated_kw => 150.0, tariff_cents_kwh => 45,
+      connectors => [#{connector_id => 1, rated_kw => 150, state => free,
+                       held_by => undefined, expires_at => undefined,
+                       power_kw => 0.0},
+                     Connector,
+                     #{connector_id => 4, rated_kw => 50, state => offline}]}.
+
+%% A charging connector of ?USER's, exactly as `vs_connector:build_snapshot/2'
+%% shapes it. `Overrides' replaces keys at the top; `session' inside it
+%% replaces keys of the sub-map rather than the whole of it.
+charging(Overrides) ->
+    Session = maps:merge(#{user_id => ?USER, vehicle_id => ?VEHICLE,
+                           started_at => 1755790000000, energy_kwh => 12.317,
+                           soc_pct => 58, battery_kwh => 58.0,
+                           max_kw => 150, limit_kw => 150.0},
+                         maps:get(session, Overrides, #{})),
+    Base = maps:merge(#{connector_id => 2, rated_kw => 150, state => charging,
+                        held_by => undefined, expires_at => undefined,
+                        power_kw => 89.4},
+                      maps:remove(session, Overrides)),
+    Base#{session => Session}.
+
+%% Everything `session_frame/2' reads of a session, and nothing else.
+driver(UserId) -> #{user_id => UserId}.
+
+payload_of(#{payload := P}) -> P.
+
+%% §5.2, field by field. `overstay_seconds' is declared and zero rather
+%% than missing: M4 will fill it in, and until then the page renders the
+%% shape it always will.
+the_session_frame_carries_every_field_of_the_contract_test() ->
+    Frame = vs_driver_proto:session_frame(station_with(charging(#{})), driver(?USER)),
+    ?assertEqual(session, maps:get(type, Frame)),
+    %% §5: server-initiated frames carry a null correlation id
+    ?assertEqual(null, maps:get(request_id, Frame)),
+    P = payload_of(Frame),
+    ?assertEqual(2, maps:get(connector_id, P)),
+    ?assertEqual(charging, maps:get(phase, P)),
+    ?assertEqual(89.4, maps:get(power_kw, P)),
+    ?assertEqual(12.317, maps:get(energy_kwh, P)),
+    ?assertEqual(58, maps:get(soc_pct, P)),
+    ?assertEqual(1755790000000, maps:get(started_at, P)),
+    ?assertEqual(0, maps:get(overstay_seconds, P)),
+    %% 58 kWh x 42 % = 24.36 kWh left, at 89.4 kW
+    ?assertEqual(981, maps:get(eta_seconds, P)),
+    %% exactly the eight fields of the contract, no more
+    ?assertEqual(lists:sort([connector_id, phase, power_kw, energy_kwh, soc_pct,
+                             eta_seconds, started_at, overstay_seconds]),
+                 lists:sort(maps:keys(P))).
+
+%% "Sent ... to the owner of a running session". A driver who is not
+%% charging receives nothing at all — not a frame of zeroes, which the page
+%% could not tell from a session standing still.
+a_driver_without_a_session_gets_no_frame_test() ->
+    Station = station_with(charging(#{})),
+    ?assertEqual(undefined, vs_driver_proto:session_frame(Station, driver(77))),
+    %% and neither does a socket that has not joined yet
+    ?assertEqual(undefined, vs_driver_proto:session_frame(Station, driver(undefined))),
+    %% nor anybody at all on a station where nothing is charging
+    Idle = #{station_id => 1,
+             connectors => [#{connector_id => 1, rated_kw => 150, state => free,
+                              held_by => undefined, expires_at => undefined,
+                              power_kw => 0.0}]},
+    ?assertEqual(undefined, vs_driver_proto:session_frame(Idle, driver(?USER))).
+
+%% §7.3: the owner is matched on the identity the token bound. Two sessions
+%% on the same station, and each driver sees his own.
+the_frame_belongs_to_the_owner_of_the_session_test() ->
+    Station = #{station_id => 1,
+                connectors => [charging(#{connector_id => 2,
+                                          session => #{user_id => 77,
+                                                       soc_pct => 30}}),
+                               charging(#{connector_id => 3, power_kw => 43.0})]},
+    Mine   = payload_of(vs_driver_proto:session_frame(Station, driver(?USER))),
+    Theirs = payload_of(vs_driver_proto:session_frame(Station, driver(77))),
+    ?assertEqual(3, maps:get(connector_id, Mine)),
+    ?assertEqual(43.0, maps:get(power_kw, Mine)),
+    ?assertEqual(2, maps:get(connector_id, Theirs)),
+    ?assertEqual(30, maps:get(soc_pct, Theirs)).
+
+%% M2 step 2 derives `suspended' in the connector's snapshot from a limit of
+%% zero; §5.2 shows it to the driver under the same name. This is the only
+%% place where the power split becomes visible to whoever is charging.
+the_phase_is_suspended_when_the_connector_is_test() ->
+    Frame = vs_driver_proto:session_frame(
+              station_with(charging(#{state => suspended, power_kw => 0.0,
+                                      session => #{limit_kw => 0.0}})),
+              driver(?USER)),
+    P = payload_of(Frame),
+    ?assertEqual(suspended, maps:get(phase, P)),
+    %% no power flowing, so there is no estimate to give
+    ?assertEqual(null, maps:get(eta_seconds, P)).
+
+%% The rule §5.2 is explicit about: `complete' comes from the state of
+%% charge, never from a power near zero, which is ambiguous between a
+%% suspension and a deep taper.
+the_phase_is_complete_from_the_soc_and_never_from_the_power_test() ->
+    Tapering = payload_of(vs_driver_proto:session_frame(
+                            station_with(charging(#{power_kw => 0.4,
+                                                    session => #{soc_pct => 94}})),
+                            driver(?USER))),
+    ?assertEqual(charging, maps:get(phase, Tapering)),
+    Full = payload_of(vs_driver_proto:session_frame(
+                        station_with(charging(#{power_kw => 0.4,
+                                                session => #{soc_pct => 100}})),
+                        driver(?USER))),
+    ?assertEqual(complete, maps:get(phase, Full)),
+    %% and a full battery is finished whatever the allocator did with the
+    %% last few kilowatts: `complete' wins over `suspended'
+    Both = payload_of(vs_driver_proto:session_frame(
+                        station_with(charging(#{state => suspended, power_kw => 0.0,
+                                                session => #{soc_pct => 100}})),
+                        driver(?USER))),
+    ?assertEqual(complete, maps:get(phase, Both)).
+
+%% "It is advisory and may jump when another car arrives and the allocation
+%% is recomputed — that jump is the visible proof of P5 and should not be
+%% smoothed away." The same session, the same battery, the same state of
+%% charge: only the allocation changed, and the estimate follows it at once
+%% and by the full amount.
+the_eta_jumps_with_the_allocation_test() ->
+    Alone  = payload_of(vs_driver_proto:session_frame(
+                          station_with(charging(#{power_kw => 150.0})), driver(?USER))),
+    Shared = payload_of(vs_driver_proto:session_frame(
+                          station_with(charging(#{power_kw => 100.0})), driver(?USER))),
+    ?assertEqual(585, maps:get(eta_seconds, Alone)),
+    ?assertEqual(877, maps:get(eta_seconds, Shared)).
+
+%% An estimate that does not exist is not an estimate of infinity, and it
+%% must travel as the atom `null': jsx renders `undefined' as the string
+%% "undefined" (the trap `expires_at' has in §5.1).
+the_eta_is_null_when_there_is_nothing_to_divide_by_test() ->
+    NoPower = payload_of(vs_driver_proto:session_frame(
+                           station_with(charging(#{power_kw => 0.0})), driver(?USER))),
+    ?assertEqual(null, maps:get(eta_seconds, NoPower)),
+    %% a battery of unknown size, which ws-chargepoint.md §4.2 permits in a
+    %% way it does not permit a missing `max_kw': running the formula anyway
+    %% would print "0 seconds" over a car that has just been plugged in
+    NoBattery = payload_of(vs_driver_proto:session_frame(
+                             station_with(charging(#{session => #{battery_kwh => 0.0}})),
+                             driver(?USER))),
+    ?assertEqual(null, maps:get(eta_seconds, NoBattery)),
+    %% a meter that reports past full does not produce a negative estimate
+    Past = payload_of(vs_driver_proto:session_frame(
+                        station_with(charging(#{session => #{soc_pct => 103}})),
+                        driver(?USER))),
+    ?assertEqual(0, maps:get(eta_seconds, Past)).
+
+%% §5.2: "and once more when it ends". The socket notices the end because
+%% the session is no longer in the snapshot, and answers with the values it
+%% had — so the page shows the total of the charge that has just finished
+%% instead of freezing on the last live reading.
+the_session_ends_with_a_closed_frame_test() ->
+    Live = station_with(charging(#{})),
+    Gone = station_with(#{connector_id => 2, rated_kw => 150, state => free,
+                          held_by => undefined, expires_at => undefined,
+                          power_kw => 0.0}),
+    {[Frame], Last} = vs_driver_proto:session_push(Live, driver(?USER), undefined),
+    ?assertEqual(charging, maps:get(phase, payload_of(Frame))),
+    {[Closed], Last1} = vs_driver_proto:session_push(Gone, driver(?USER), Last),
+    P = payload_of(Closed),
+    ?assertEqual(closed, maps:get(phase, P)),
+    ?assertEqual(12.317, maps:get(energy_kwh, P)),
+    ?assertEqual(2, maps:get(connector_id, P)),
+    ?assertEqual(1755790000000, maps:get(started_at, P)),
+    %% said once, then silence: the session is over and there is nothing
+    %% left to report about it
+    ?assertEqual(undefined, Last1),
+    ?assertEqual({[], undefined},
+                 vs_driver_proto:session_push(Gone, driver(?USER), Last1)).
+
+%% The other half of the same rule: a driver who never had a session is
+%% never told that one ended, because none did.
+a_driver_who_never_charged_is_never_told_it_is_over_test() ->
+    Idle = #{station_id => 1, connectors => []},
+    ?assertEqual({[], undefined},
+                 vs_driver_proto:session_push(Idle, driver(?USER), undefined)),
+    %% and a live session is remembered, which is what makes the end
+    %% recognisable one tick later
+    {[Frame], Last} = vs_driver_proto:session_push(station_with(charging(#{})),
+                                                   driver(?USER), undefined),
+    ?assertEqual(Frame, Last).
+
+%% The frame travels as JSON. `null' has to survive as a JSON null and the
+%% phase as a string; an atom reaching the page as the word "undefined"
+%% would be a bug none of the tests above can see.
+the_session_frame_survives_the_json_codec_test() ->
+    Frame = vs_driver_proto:session_frame(
+              station_with(charging(#{state => suspended, power_kw => 0.0})),
+              driver(?USER)),
+    Decoded = jsx:decode(jsx:encode(Frame)),
+    ?assertEqual(<<"session">>, maps:get(<<"type">>, Decoded)),
+    ?assertEqual(null, maps:get(<<"request_id">>, Decoded)),
+    P = maps:get(<<"payload">>, Decoded),
+    ?assertEqual(<<"suspended">>, maps:get(<<"phase">>, P)),
+    ?assertEqual(null, maps:get(<<"eta_seconds">>, P)),
+    ?assertEqual(0, maps:get(<<"overstay_seconds">>, P)),
+    ?assertEqual(1755790000000, maps:get(<<"started_at">>, P)).
+
+%% The addition to `vs_connector:build_snapshot/2' is for §5.2 alone:
+%% `wire_connector' reads the keys it names, so the battery size does not
+%% leak into the §5.1 connector entry, whose shape is fixed.
+the_battery_size_does_not_leak_into_the_state_frame_test() ->
+    Wire = vs_driver_proto:wire_state(station_with(charging(#{})), ?USER, true),
+    [_Free, Mine, _Offline] = maps:get(connectors, Wire),
+    ?assertEqual(lists:sort([connector_id, rated_kw, state, held_by_me, mine,
+                             expires_at, power_kw]),
+                 lists:sort(maps:keys(Mine))),
+    %% and it is still the same session, seen from §5.1
+    ?assertEqual({false, true}, {maps:get(held_by_me, Mine), maps:get(mine, Mine)}).
