@@ -154,6 +154,71 @@ reservation elsewhere"*. Se la seconda prenotazione la si tenta sulla **stessa**
 primo caso in cui ci si imbatte, verificato dal browser — "altrove" è impreciso: la prenotazione è
 lì, due connettori più in là. Non fuorviante, ma stona. È tuo, quindi lo segnalo e basta.
 
-Aspetto la tua review della PR #5, in particolare la cosa sulle sospensioni dopo un riavvio.
+---
+
+## La tua review della PR #5 non è mai arrivata — ma l'indizio bastava
+
+Su GitHub la PR #5 ha una sola review, ed è quella **automatica di Copilot**, su un punto diverso
+(l'istante della sospensione con i nanosecondi: reale, corretto, vedi in fondo). Le tue «due cose
+serie e tre minori» non ci sono. Se le hai scritte da qualche parte mandamele, perché una l'ho
+trovata seguendo la tua sola frase e non è detto che le altre siano innocue.
+
+**Quella che hai indovinato: le sospensioni non sopravvivevano a un riavvio.** Erano due buchi.
+
+`pushAllSuspensions()` scattava solo quando cambiava il **nome** del leader:
+
+```java
+boolean changed = !a.atomValue().equals(leaderNode);
+if (changed) { pushAllSuspensions(); }
+```
+
+1. Un coordinatore che si riavvia e **rivince** torna con la mappa delle sospensioni vuota e
+   annuncia lo stesso nome: per il back office non è cambiato niente. Serve a tempo indeterminato
+   lasciando prenotare utenti sospesi.
+2. Il back office che si riavvia parte già credendo al primo nodo di `COORD_NODES`, quindi il
+   primo annuncio non è un cambiamento. E `{leader, _}` veniva inviato **una volta sola**, alla
+   vittoria: un back office partito dopo non ne sentiva nessuno, e su un cluster sano l'elezione
+   successiva non arriva mai.
+
+Corretto su entrambi i lati. In Java si spinge a **ogni** annuncio: quel messaggio non significa
+"è cambiato il leader", significa *"ho appena cominciato a servire e la mia tabella è quel che ho
+ricostruito"* — cioè esattamente quando le sospensioni vanno ripetute. In Erlang il republish
+periodico manda anche `{leader, node()}`, così un back office partito tardi converge entro 30 s
+invece di aspettare un'elezione che non verrà.
+
+Provato riavviando il **solo** back office, senza nessuna elezione:
+
+```
+backoffice | Coordinator leader is now vs@coord3
+backoffice | Re-sent 1 suspension(s) to the new leader
+utente sospeso: {error, <<"r-c">>, suspended}
+```
+
+Prima sarebbe rimasto zitto.
+
+**Perché sfuggiva**, che è la parte che vale: la condizione `changed` sembrava un'ottimizzazione
+ovvia, ed era invece la confusione di **due domande diverse** — *chi è il leader?* e *il leader sa
+quel che deve sapere?* Un processo riavviato ha lo stesso nome e la memoria vuota, e il nome era
+ciò che stavamo guardando.
+
+È lo stesso problema del rebuild, con la sorgente dall'altra parte del confine: uno stato che il
+cluster non possiede, risolto una volta **chiedendo** alle stazioni e una volta **ripetendo** dal
+back office. Direi che questa coppia va raccontata insieme nella relazione.
+
+## Il rilievo di Copilot, per completezza
+
+`LocalDateTime.now()` porta i nanosecondi, e lo stesso istante finiva in tre posti che li trattano
+diversamente: `suspended_until` è un DATETIME MySQL che **arrotonda**, `toEpochSecond()` verso il
+coordinatore **tronca**, il log li tiene tutti. Database e coordinatore potevano quindi contenere
+istanti distanti un secondo — e dopo un failover `pushAllSuspensions()` avrebbe rimandato
+l'arrotondato sopra il troncato.
+
+Un secondo su una penalità di un giorno non cambia niente per un conducente. L'ho corretto lo
+stesso, troncando una volta sola alla creazione: due componenti che devono concordare su un
+istante non dovrebbero conservarne due numeri diversi.
+
+Nota di metodo, perché ti riguarda: **Copilot sta revisionando le PR del repository.** È utile,
+questo l'ha preso. Ma i suoi rilievi non passano dal nostro accordo sui contratti: se un giorno
+segnala qualcosa su `claim.md` o `jwt.md`, quella resta roba da decidere in due.
 
 — B
