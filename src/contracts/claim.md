@@ -153,6 +153,48 @@ Sent by the station on start-up and every 30 s, so the coordinator can keep the 
 
 The coordinator also sets a `monitor_node/2` on every announced station, so it detects a crash without waiting for the next announcement.
 
+**Announcements cannot be redirected.** Both messages are casts, so unlike `claim` and `renew`
+there is no reply through which a coordinator could answer `not_serving`. A station therefore
+keeps announcing itself to whichever coordinator it tried first, which after an election is very
+often not the leader. The **coordinator** resolves this, not the station: a follower records the
+announcement — useful to itself if it is ever elected, since it will know whom to ask — and
+forwards it to the leader it knows about. The station needs no change and may go on announcing
+wherever it likes.
+
+### 3.6 Session closed
+
+Sent by the station after it has written the session row to MySQL, so the back office can price it
+without polling. Forwarded to Java unchanged by the coordinator; the coordinator keeps no billing
+state of its own.
+
+```erlang
+{session_closed, SessionId :: pos_integer(), UserId :: pos_integer(),
+                 StationId :: station_id(), ConnId :: conn_id(),
+                 EnergyKwh :: float(), OverstaySeconds :: non_neg_integer(),
+                 StartedAt :: epoch_ms(), EndedAt :: epoch_ms()}
+```
+
+Sent by `vs_claim_client`, not by the connector: connectors never make remote calls, so the
+notification travels through the one process that already talks to the cluster.
+
+**Losing this message is harmless**, and the design depends on that being true. The row is already
+in `sessions`; the back office prices it by sweeping `cost_cents IS NULL`, and this message only
+makes the sweep run sooner. Delivery to an absent mailbox is dropped in silence — deliberately, so
+that Tomcat being down cannot disturb the cluster — and the conditional `UPDATE` makes a duplicate
+harmless too. At-least-once over an idempotent write, exactly like `release` in §3.3, with the
+sweep here playing the part expiry plays there.
+
+Two field notes, both about units, because this message carries more of them than any other:
+
+- `StartedAt` and `EndedAt` are **milliseconds**, like every other timestamp on this boundary
+  (`GrantedAt`, `ExpiresAt`, `NewExpiresAt`). A draft of this section said seconds; one message
+  changing unit among fields that do not is the kind of error that breaks no type, fails no test,
+  and surfaces as a date in 1970.
+- `OverstaySeconds` is in seconds — it says so in its name — and is the **billable** overstay, with
+  `OVERSTAY_GRACE_SECONDS` already subtracted by the station. The grace lives on the station and
+  nowhere else, so nobody subtracts it twice. What that overstay *costs* is not carried here: it is
+  `stations.tariff_cents_min_overstay`, decided at settlement.
+
 ---
 
 ## 4. Finding the leader
