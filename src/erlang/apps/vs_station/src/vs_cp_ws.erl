@@ -24,6 +24,17 @@
 %%% Silence is therefore not handled here at all. The socket dies of its
 %%% own timeout, the connector sees the `DOWN' and starts its grace timer,
 %%% and the verdict is that one process's — the one that owns the outlet.
+%%%
+%%% ## The other death, and the one this module now has to notice
+%%%
+%%% That covers the socket dying. The mirror case — the **connector**
+%%% dying under a socket that is perfectly healthy — has nothing to do
+%%% with silence and used to have nobody watching for it: the equipment
+%%% carried on reporting, the reborn connector had no session to put the
+%%% readings in and no socket to send commands to, and the whole delivery
+%%% went unbilled without one error anywhere. The socket now monitors the
+%%% connector it attached to, and `websocket_info/2' below hands the
+%%% `DOWN' and the retry timer to `vs_cp_proto', where the decision lives.
 %%%-------------------------------------------------------------------
 -module(vs_cp_ws).
 -behaviour(cowboy_websocket).
@@ -92,19 +103,45 @@ websocket_info(station_shutdown, State) ->
     {text_frames([vs_cp_proto:stop_command(station_shutdown)])
      ++ [{close, 1001, <<>>}], State};
 
+%% §6 — the connector died under a live socket, and the timer that goes
+%% looking for its replacement. Both are decisions, so both go to
+%% `vs_cp_proto'; what is left here is writing out what comes back.
+%%
+%% Above the catch-all on purpose: matched by that instead, they would
+%% become a debug line and the socket would stay bound to a process that
+%% no longer exists.
+websocket_info(Info = {'DOWN', _Ref, process, _Pid, _Reason},
+               State = #{session := Session}) ->
+    from_info(Info, Session, State);
+
+websocket_info(cp_reattach, State = #{session := Session}) ->
+    from_info(cp_reattach, Session, State);
+
 websocket_info(Info, State) ->
     logger:debug("charge point channel ignoring ~p", [Info]),
     {[], State}.
 
-%% Nothing to unwind: the connector monitors this process and starts the
-%% grace of §3.2 on the `DOWN', which covers a socket that dies without
-%% terminating politely as well as one that does.
+%% Nothing to unwind. The two directions of the surveillance are set up and
+%% taken down by the processes that own them: the connector monitors this
+%% one and starts the grace of §3.2 on the `DOWN' — which covers a socket
+%% that dies without terminating politely as well as one that does — and
+%% the monitor this process holds on the connector dies with the process
+%% that holds it.
 terminate(_Reason, _Req, _State) ->
     ok.
 
 %%%===================================================================
 %%% internal
 %%%===================================================================
+
+from_info(Info, Session, State) ->
+    case vs_cp_proto:handle_info(Info, Session) of
+        {Frames, Session1} ->
+            {text_frames(Frames), State#{session := Session1}};
+        {close, Code, Frames, Session1} ->
+            {text_frames(Frames) ++ [{close, Code, <<>>}],
+             State#{session := Session1}}
+    end.
 
 text_frames(Frames) ->
     [{text, jsx:encode(F)} || F <- Frames].

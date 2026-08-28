@@ -15,7 +15,8 @@
 -module(vs_cp_stub).
 
 %% arranging
--export([reset/0, set_connectors/1, set_plugged/1, set_snapshot/1, set_user/1]).
+-export([reset/0, set_connectors/1, set_plugged/1, set_snapshot/1, set_user/1,
+         set_pid/1]).
 %% inspecting
 -export([calls/0, count/1, last/1]).
 %% conn_mod
@@ -32,11 +33,18 @@ reset() ->
     persistent_term:put(?K(connectors), [3]),
     persistent_term:put(?K(plugged), ok),
     persistent_term:put(?K(snapshot), free_snapshot()),
-    persistent_term:put(?K(user), identity).
+    persistent_term:put(?K(user), identity),
+    persistent_term:put(?K(pid), self).
 
 %% Ids this station owns; `manager_down' makes the dirty read raise the
 %% way a missing ETS table does.
 set_connectors(Ids)   -> persistent_term:put(?K(connectors), Ids).
+%% Which pid the registry hands back. `self' — the default, and what every
+%% test before the reattach wanted — is the calling process. A real pid is
+%% how a test says "the connector came back as a NEW process", which is the
+%% one thing the reattach of §6 has to be able to tell apart from "the
+%% registry still names the one that just died".
+set_pid(Pid)          -> persistent_term:put(?K(pid), Pid).
 %% Reply :: ok | {error, Refusal} | unreachable
 set_plugged(Reply)    -> persistent_term:put(?K(plugged), Reply).
 set_snapshot(Map)     -> persistent_term:put(?K(snapshot), Map).
@@ -64,8 +72,11 @@ record(Call) ->
 %%% conn_mod
 %%%===================================================================
 
-attach_cp(_Pid, CpPid) ->
-    record({attach_cp, CpPid}),
+%% Both pids are recorded, not just the socket's: since the reattach of §6
+%% the question "which connector did it bind to" is the whole point, and a
+%% call that only said "it bound to somebody" could not answer it.
+attach_cp(Pid, CpPid) ->
+    record({attach_cp, Pid, CpPid}),
     ok.
 
 plugged(_Pid, Info) ->
@@ -105,9 +116,15 @@ lookup_pid(ConnId) ->
             {error, unknown_connector};
         Ids ->
             case lists:member(ConnId, Ids) of
-                true  -> {ok, self()};
+                true  -> {ok, registered_pid()};
                 false -> {error, unknown_connector}
             end
+    end.
+
+registered_pid() ->
+    case persistent_term:get(?K(pid), self) of
+        self -> self();
+        Pid  -> Pid
     end.
 
 %%%===================================================================

@@ -166,7 +166,9 @@ boot_is_acked_with_everything_the_equipment_needs() ->
 %% it is also what closes a stale socket with 4409, on the connector side.
 boot_attaches_this_socket_to_the_connector() ->
     {[_Ack], _S} = handle(frame(<<"boot">>, <<"cp-1">>, boot_payload()), session()),
-    ?assertEqual({attach_cp, self()}, vs_cp_stub:last(attach_cp)).
+    %% Both halves of the binding: the connector the registry named, and
+    %% this process as the socket that speaks for it.
+    ?assertEqual({attach_cp, self(), self()}, vs_cp_stub:last(attach_cp)).
 
 %% §3.1: "Booting resets nothing. A charge point that reconnects sends
 %% boot again and reports its true physical status; the station reconciles
@@ -177,7 +179,7 @@ boot_hands_the_reported_status_over() ->
     ?assertEqual({cp_status, available}, vs_cp_stub:last(cp_status)),
     %% and in this order: attached first, so the status lands on a
     %% connector that already knows which socket speaks for it
-    ?assertMatch([{lookup_pid, _}, {attach_cp, _}, {cp_status, available} | _],
+    ?assertMatch([{lookup_pid, _}, {attach_cp, _, _}, {cp_status, available} | _],
                  vs_cp_stub:calls()).
 
 boot_carries_the_limit_of_a_running_session() ->
@@ -337,8 +339,13 @@ request_id_is_echoed_on_the_acks_that_exist() ->
 %% `command'. There is no `error', so a frame that cannot be read leaves a
 %% log line and nothing else — the contract is not widened from here.
 a_frame_with_no_request_id_is_dropped() ->
+    %% Compared against the session that went **in**, not against a second
+    %% one built the same way: since the boot takes out a monitor on the
+    %% connector, two sessions built alike differ by that reference, and
+    %% "unchanged" is what this assertion is actually about.
+    S = booted_session(),
     Bin = jsx:encode(#{action => <<"heartbeat">>, payload => #{}}),
-    ?assertEqual({[], booted_session()}, handle(Bin, booted_session())),
+    ?assertEqual({[], S}, handle(Bin, S)),
     NoPayload = jsx:encode(#{action => <<"heartbeat">>, request_id => <<"cp-1">>}),
     ?assertMatch({[], _}, handle(NoPayload, booted_session())),
     NoAction = jsx:encode(#{request_id => <<"cp-1">>, payload => #{}}),
@@ -372,6 +379,263 @@ the_connector_is_looked_up_on_every_event() ->
     ?assertEqual(Before + 2, vs_cp_stub:count(lookup_pid)).
 
 %%%===================================================================
+%%% §6 — the connector dies under the socket: reattach and reconcile
+%%%===================================================================
+
+%% The defect these cover, reproduced on the compose before a line of the
+%% fix was written: with a car charging on connector 3, `exit(Pid, kill)'
+%% from the shell left the reborn connector `free' with `cp = undefined',
+%% every later `meter' became a "meter for a connector with no session"
+%% line, no `set_limit' could reach the hardware again, and the final
+%% `unplugged' landed on an idle connector — 1.878 kWh delivered and no
+%% `sessions' row written.
+%%
+%% Unlike the rest of this file these tests need a real pid to monitor, so
+%% they spawn one: the monitor and its `DOWN' are the mechanism under
+%% test, and a synthetic message would prove only that the code can read a
+%% tuple.
+
+reattach_test_() ->
+    [{Name, fun() -> vs_cp_stub:reset(), flush(), Case() end}
+     || {Name, Case} <- reattach_cases()].
+
+reattach_cases() ->
+    [{"the DOWN arms a timer instead of blocking the socket",
+      fun the_down_arms_a_timer/0},
+     {"a DOWN followed by a new pid reattaches and rebuilds the session",
+      fun a_new_pid_reattaches_and_rebuilds_the_session/0},
+     {"the rebuilt session carries the energy of the last meter",
+      fun the_rebuilt_session_carries_the_energy_of_the_last_meter/0},
+     {"the connector is attached before it is told anything",
+      fun the_connector_is_attached_before_it_is_told_anything/0},
+     {"a DOWN with no session reattaches without a plugged",
+      fun a_down_with_no_session_reattaches_without_a_plugged/0},
+     {"an unplugged is forgotten, so no ghost session comes back",
+      fun an_unplugged_is_forgotten/0},
+     {"five attempts with no connector close the socket 4404",
+      fun five_attempts_with_no_connector_close_4404/0},
+     {"a connector that comes back on the last attempt is not closed",
+      fun a_connector_back_on_the_last_attempt_is_not_closed/0},
+     {"the monitor is re-armed, so a second death is noticed too",
+      fun the_monitor_is_rearmed/0},
+     {"a DOWN this socket does not hold is ignored",
+      fun a_foreign_down_is_ignored/0}].
+
+%% A stand-in for a connector process, alive until the test kills it. What
+%% makes it worth spawning: the `DOWN' the socket reacts to is then the one
+%% the runtime really delivered, not one the test wrote by hand.
+fake_connector() ->
+    spawn(fun() -> receive stop -> ok end end).
+
+%% `reattach_ms => 0' so the timer the code arms is observable inside a
+%% test without a sleep; the retries themselves are driven by hand, which
+%% is what keeps the assertions about the logic and not about timing.
+reattach_session(ConnPid) ->
+    vs_cp_stub:set_pid(ConnPid),
+    S = vs_cp_proto:new(#{station_id   => 1,
+                          connector_id => ?CONN,
+                          conn_mod     => vs_cp_stub,
+                          mgr_mod      => vs_cp_stub,
+                          db_mod       => vs_cp_stub,
+                          reattach_ms  => 0,
+                          reattach_tries_max => 5}),
+    {[_Ack], S1} = handle(frame(<<"boot">>, <<"cp-1">>, boot_payload()), S),
+    S1.
+
+%% A session with a car charging on it, which is the case the whole
+%% mechanism exists for.
+charging_session(ConnPid) ->
+    S0 = reattach_session(ConnPid),
+    {[], S1} = handle(frame(<<"plugged">>, <<"cp-2">>, plug_payload()), S0),
+    {[], S2} = handle(frame(<<"meter">>, <<"cp-3">>,
+                            #{power_kw => 150.0, energy_kwh => 4.5, soc_pct => 40}), S1),
+    S2.
+
+plug_payload() ->
+    #{vehicle_id => ?VEHICLE, soc_pct => 22, battery_kwh => 58,
+      max_kw => 150, energy_kwh => 0}.
+
+%% Kill the connector and hand back the `DOWN' the runtime delivered.
+kill_and_collect(Pid) ->
+    exit(Pid, kill),
+    receive
+        {'DOWN', _Ref, process, Pid, _Reason} = Down -> Down
+    after 2000 ->
+            error({no_down_from, Pid})
+    end.
+
+flush() ->
+    receive _Anything -> flush()
+    after 0 -> ok
+    end.
+
+info(Msg, Session) -> vs_cp_proto:handle_info(Msg, Session).
+
+%% The socket must go on reading frames while it waits — a charge point
+%% does not stop reporting because a station process died — so the wait is
+%% a timer and not a `receive'. What proves it: the message the code armed
+%% turns up in this process's own mailbox.
+the_down_arms_a_timer() ->
+    Conn = fake_connector(),
+    S0 = charging_session(Conn),
+    {[], _S1} = info(kill_and_collect(Conn), S0),
+    receive
+        cp_reattach -> ok
+    after 2000 ->
+            error(no_reattach_timer)
+    end.
+
+%% The heart of it: the connector comes back as a different process, and
+%% the session the station lost is rebuilt from what the socket remembers.
+a_new_pid_reattaches_and_rebuilds_the_session() ->
+    Old = fake_connector(),
+    S0 = charging_session(Old),
+    Down = kill_and_collect(Old),
+    {[], S1} = info(Down, S0),
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    {[], _S2} = info(cp_reattach, S1),
+    %% bound to the NEW connector, with this socket as its charge point
+    ?assertEqual({attach_cp, New, self()}, vs_cp_stub:last(attach_cp)),
+    %% §6.2 — the true physical status, then the cable
+    ?assertEqual({cp_status, available}, vs_cp_stub:last(cp_status)),
+    {plugged, Info} = vs_cp_stub:last(plugged),
+    ?assertEqual(?VEHICLE, maps:get(vehicle_id, Info)),
+    %% §4.2 makes max_kw mandatory and the replay goes through the same
+    %% validation as a live plugged, so it must still be there
+    ?assertEqual(150, maps:get(max_kw, Info)).
+
+%% §6.2: "a `plugged' with the vehicle and the cumulative energy it has
+%% counted". The plug frame said zero; the meter is what the hardware has
+%% counted since, and it is the only side that counted it.
+the_rebuilt_session_carries_the_energy_of_the_last_meter() ->
+    Old = fake_connector(),
+    S0 = charging_session(Old),
+    {[], S1} = info(kill_and_collect(Old), S0),
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    {[], _S2} = info(cp_reattach, S1),
+    {plugged, Info} = vs_cp_stub:last(plugged),
+    ?assertEqual(4.5, maps:get(energy_kwh, Info)),
+    %% and the fresher soc, for the same reason
+    ?assertEqual(40, maps:get(soc_pct, Info)).
+
+%% The order is load-bearing: `plugged' takes the connector into
+%% `charging', whose entry callback sends the interim `set_limit' back
+%% through this socket. Reconciling before attaching would drop that
+%% command into a `cp = undefined' and leave the car on a stale limit.
+the_connector_is_attached_before_it_is_told_anything() ->
+    Old = fake_connector(),
+    S0 = charging_session(Old),
+    {[], S1} = info(kill_and_collect(Old), S0),
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    Before = length(vs_cp_stub:calls()),
+    {[], _S2} = info(cp_reattach, S1),
+    After = lists:nthtail(Before, vs_cp_stub:calls()),
+    ?assertMatch([{lookup_pid, ?CONN}, {attach_cp, _, _},
+                  {cp_status, available}, {user_for_vehicle, ?VEHICLE} | _],
+                 After),
+    %% and the plugged really is last of the three
+    ?assertMatch({plugged, _}, lists:last(After)).
+
+%% Nothing was plugged in, so there is nothing to re-announce. The status
+%% still goes over — a reborn connector has no idea what the hardware is
+%% doing — but no session is invented for a cable that is not there.
+a_down_with_no_session_reattaches_without_a_plugged() ->
+    Old = fake_connector(),
+    S0 = reattach_session(Old),
+    {[], S1} = info(kill_and_collect(Old), S0),
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    {[], _S2} = info(cp_reattach, S1),
+    ?assertEqual({attach_cp, New, self()}, vs_cp_stub:last(attach_cp)),
+    ?assertEqual({cp_status, available}, vs_cp_stub:last(cp_status)),
+    ?assertEqual(0, vs_cp_stub:count(plugged)).
+
+%% The other half of the same rule, and the one that would hurt: a copy
+%% kept past the `unplugged' describes a car that has driven away, and the
+%% next reattach would open a session for it.
+an_unplugged_is_forgotten() ->
+    Old = fake_connector(),
+    S0 = charging_session(Old),
+    {[], S1} = handle(frame(<<"unplugged">>, <<"cp-4">>, #{energy_kwh => 4.9}), S0),
+    {[], S2} = info(kill_and_collect(Old), S1),
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    {[], _S3} = info(cp_reattach, S2),
+    ?assertEqual({attach_cp, New, self()}, vs_cp_stub:last(attach_cp)),
+    %% the one from before the unplug, and no second one
+    ?assertEqual(1, vs_cp_stub:count(plugged)).
+
+%% The supervisor has given up: five attempts, then 4404 and let the charge
+%% point come back on its own backoff. Better a clean reconnection than a
+%% socket bound to a connector that does not exist.
+five_attempts_with_no_connector_close_4404() ->
+    Old = fake_connector(),
+    S0 = charging_session(Old),
+    {[], S1} = info(kill_and_collect(Old), S0),
+    vs_cp_stub:set_connectors([]),          %% nothing comes back, ever
+    S2 = lists:foldl(fun(_N, S) ->
+                             {[], S1b} = info(cp_reattach, S),
+                             S1b
+                     end, S1, lists:seq(1, 4)),
+    ?assertMatch({close, 4404, [], _}, info(cp_reattach, S2)),
+    %% and it never bound itself to anything in the meantime
+    ?assertEqual(1, vs_cp_stub:count(attach_cp)).
+
+%% The counter is a budget, not a deadline: a connector that turns up on
+%% the last attempt is reattached like any other.
+a_connector_back_on_the_last_attempt_is_not_closed() ->
+    Old = fake_connector(),
+    S0 = charging_session(Old),
+    {[], S1} = info(kill_and_collect(Old), S0),
+    vs_cp_stub:set_connectors([]),
+    S2 = lists:foldl(fun(_N, S) ->
+                             {[], S1b} = info(cp_reattach, S),
+                             S1b
+                     end, S1, lists:seq(1, 4)),
+    New = fake_connector(),
+    vs_cp_stub:set_connectors([?CONN]),
+    vs_cp_stub:set_pid(New),
+    {[], S3} = info(cp_reattach, S2),
+    ?assertEqual({attach_cp, New, self()}, vs_cp_stub:last(attach_cp)),
+    %% and the budget is full again, so the next death gets five of its own
+    ?assertEqual(0, maps:get(reattach_tries, S3)).
+
+%% A reattach that did not re-arm the monitor would work exactly once, and
+%% the second crash would be the original defect all over again.
+the_monitor_is_rearmed() ->
+    Old = fake_connector(),
+    S0 = charging_session(Old),
+    {[], S1} = info(kill_and_collect(Old), S0),
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    {[], S2} = info(cp_reattach, S1),
+    flush(),
+    %% second death, and the socket must notice it the same way
+    {[], _S3} = info(kill_and_collect(New), S2),
+    receive
+        cp_reattach -> ok
+    after 2000 ->
+            error(no_second_reattach_timer)
+    end.
+
+%% The `DOWN' of a connector this socket was replaced on, or one whose
+%% message outran the `demonitor'. There is nothing to repair and nothing
+%% to arm — a timer here would go looking for a connector that is fine.
+a_foreign_down_is_ignored() ->
+    Conn = fake_connector(),
+    S0 = charging_session(Conn),
+    Stranger = fake_connector(),
+    Foreign = {'DOWN', make_ref(), process, Stranger, killed},
+    ?assertEqual({[], S0}, info(Foreign, S0)),
+    receive
+        cp_reattach -> error(armed_a_timer_for_a_stranger)
+    after 100 -> ok
+    end.
+
+%%%===================================================================
 %%% the transport — the three close codes and the command frame
 %%%===================================================================
 
@@ -387,7 +651,11 @@ ws_test_() ->
      {"a command from the connector goes out as a frame",
       fun ws_command_goes_out_as_a_frame/0},
      {"shutdown stops the car before closing",
-      fun ws_shutdown_stops_the_car_before_closing/0}].
+      fun ws_shutdown_stops_the_car_before_closing/0},
+     {"the DOWN of the connector reaches the protocol",
+      fun() -> vs_cp_stub:reset(), flush(), ws_down_reaches_the_protocol() end},
+     {"a reattach that gives up closes the socket 4404",
+      fun() -> vs_cp_stub:reset(), flush(), ws_give_up_closes_the_socket() end}].
 
 ws_refused_handshake_closes_4404() ->
     ?assertEqual({[{close, 4404, <<>>}], {refuse, 4404}},
@@ -406,6 +674,37 @@ ws_command_goes_out_as_a_frame() ->
     ?assertEqual(null, maps:get(<<"request_id">>, Decoded)),
     ?assertEqual(#{<<"command">> => <<"set_limit">>, <<"limit_kw">> => 60.0},
                  maps:get(<<"payload">>, Decoded)).
+
+%% Both messages have to be matched **above** the catch-all, or they become
+%% a debug line and the socket stays bound to a process that is gone. The
+%% test is on the callback rather than on the clause order because that is
+%% what actually breaks if the order is wrong.
+ws_down_reaches_the_protocol() ->
+    Conn = fake_connector(),
+    S0 = charging_session(Conn),
+    Down = kill_and_collect(Conn),
+    {[], State1} = vs_cp_ws:websocket_info(Down, #{session => S0}),
+    %% the monitor is released, and the timer the protocol armed is here
+    ?assertEqual(undefined, maps:get(conn_mon, maps:get(session, State1))),
+    receive cp_reattach -> ok after 2000 -> error(no_reattach_timer) end,
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    {[], _State2} = vs_cp_ws:websocket_info(cp_reattach, State1),
+    ?assertEqual({attach_cp, New, self()}, vs_cp_stub:last(attach_cp)).
+
+%% The give-up of §6 as the socket sees it: a close frame, and the charge
+%% point reconnects on its own backoff.
+ws_give_up_closes_the_socket() ->
+    Conn = fake_connector(),
+    S0 = charging_session(Conn),
+    {[], State1} = vs_cp_ws:websocket_info(kill_and_collect(Conn), #{session => S0}),
+    vs_cp_stub:set_connectors([]),
+    State2 = lists:foldl(fun(_N, St) ->
+                                 {[], St1} = vs_cp_ws:websocket_info(cp_reattach, St),
+                                 St1
+                         end, State1, lists:seq(1, 4)),
+    {Frames, _State3} = vs_cp_ws:websocket_info(cp_reattach, State2),
+    ?assertEqual([{close, 4404, <<>>}], Frames).
 
 %% The frame first, the close after: a car left drawing power from a
 %% station that no longer counts it is the outcome §7.3 rules out.

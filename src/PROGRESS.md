@@ -1661,6 +1661,211 @@ cronometro.
    delle quali con un `SITE_POWER_KW` a 10 che **non** è nel compose committato. Alla fine
    `docker compose down`: nessun container e nessun emulatore lasciati in giro.
 
+## 7w. M2-A passo 5: il riaggancio del socket colonnina e l'emulatore dei driver — 28 agosto
+
+Branch `a/m2-load`, da `a/m2-session` (`2c6a2a4`, passo 4 committato davvero). Due lavori in un
+giro, in quest'ordine perché il primo è la premessa del secondo: un difetto che si innesca
+proprio sotto carico avrebbe reso illeggibile ciò che le prove di carico trovavano.
+
+`vs_cp_proto` guadagna `handle_info/2` e sei chiavi di sessione, `vs_cp_ws` due clausole di
+`websocket_info/2`; `src/emulator/driver.js` è nuovo. Nessun contratto toccato.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline 286 test | `rebar3 eunit` (mai `--app`) su `2c6a2a4` | **286 test, 0 fallimenti**. Confermata |
+| Il connettore riparte davvero, e il registro guarisce | `exit(Pid, kill)` sul compose, `lookup_pid/1` prima e dopo | **sì**. Nella riproduzione pre-correzione: `<10252.333.0>` ucciso, `lookup_pid/1` un secondo dopo risponde `<10251.400.0>`. `vs_connector_sup` è `transient` e il `connector_up` dell'`init` del connettore fa guarire il registro senza che nessuno interroghi niente |
+| Il difetto esiste **come descritto** | riprodotto sul compose prima di scrivere una riga | **il difetto sì, il meccanismo del piano no.** Vedi sotto: è la scoperta principale di questo passo |
+
+### Il difetto riprodotto — e il piano corretto
+
+`PIANO_LOAD.md` diceva che i `meter` «continuano ad arrivare a un pid morto» e spariscono in
+silenzio. **Non è così.** `vs_cp_proto` non ha mai memorizzato il pid (scelte §11.10, con un
+test che lo asserisce): il connettore si rilegge a ogni evento, e il registro guarisce in meno
+di un secondo. I `meter` arrivano al connettore **nuovo**.
+
+Quello che succede davvero, osservato:
+
+```
+connector 3: charging, user 12, vehicle 88, 0.42 kWh, 150 kW      <- prima
+<kill>
+connector 3: free, 0.0 kW                                          <- 1 s dopo, e per sempre
+connector 3: meter for a connector with no session (state free)    <- una ogni 5 s
+```
+
+L'emulatore intanto è arrivato a **1,878 kWh a 150 kW**, la stazione ha mostrato il connettore
+`free` per tutto il tempo, e in `sessions` **non è comparsa nessuna riga**: l'`unplugged` finale
+cade su un connettore inattivo e §4.4 lo ignora. In più `#data.cp` del connettore nuovo è
+`undefined`, quindi `send_cp/2` è un no-op e **nessun `set_limit` e nessuno `stop` può più
+raggiungere l'hardware**.
+
+Il sintomo è quello del piano; il meccanismo è peggiore, perché il difetto lascia tracce che
+sembrano diagnostiche e non lo sono. `PROGRESS.md` §7p («Non provato — e perché») lo aveva già
+annotato **correttamente** al passo 1: «il `meter` successivo finisce nel log "meter senza
+sessione" invece che nel vuoto». Il piano lo aveva riscritto peggio di come era già scritto qui.
+
+### Il comportamento dopo, sulla stessa prova
+
+```
+charge point channel: connector 3 (<0.136.0>) died under a live socket (killed)
+                      - reattaching in 500 ms
+charge point channel: connector 3 is back as <0.225.0> - reattached
+charge point channel: connector 3 reconciled to status available,
+                      re-announcing vehicle 88 with 0.75 kWh
+connector 3 walk-in session for user 12
+```
+
+**501 ms** fra il `DOWN` e il riaggancio. La sessione riappare con l'energia che il contatore
+aveva; la potenza torna a 150 kW, quindi il `set_limit` interinale ha davvero raggiunto
+l'hardware; e l'emulatore non se ne accorge — il suo log non ha un buco.
+
+Ciclo completo, con l'auto che stacca da sola dopo il riaggancio:
+
+```
+final energy_kwh = 2.416 (soc 26%, soc reached 26%)     <- l'emulatore
+session 1 written: connector 3, user 12, 2.416 kWh      <- la stazione
+id=1  user_id=12  connector_id=3  energy_kwh=2.416      <- MySQL
+```
+
+Prima: 1,878 kWh erogati, zero righe. Dopo: 2,416 kWh erogati, 2,416 kWh fatturati, una riga.
+
+### Catena dei chiamanti, cercata prima di toccare il codice
+
+| Funzione | Chiamanti trovati | Conseguenza |
+|---|---|---|
+| `vs_connector:attach_cp/2` | in produzione **uno solo**, `vs_cp_proto:attach_to/2` (dal `boot`); 21 punti nei test di `vs_connector`/`vs_m2a_regression` | un chiamante nuovo, il riaggancio. Il connettore **non distingue i due casi** e va bene così: la clausola sta in `handle_common`, valida in ogni stato, e cancella la grazia in entrambi |
+| `vs_station_mgr:lookup_pid/1` | `vs_claim_client:443`, `vs_station_mgr:reallocate/1` (interno), `vs_cp_proto:connector/1` | un chiamante in più sullo stesso percorso, stessa lettura sporca. Nessun cambio di firma |
+| `vs_cp_proto:new/1` | `handshake/2`, `vs_cp_proto_tests:81`, `vs_m2a_regression_tests:402` | sei chiavi additive. **Ha rotto un test**, non per la firma ma per un confronto di mappa intera — vedi sotto |
+| `vs_cp_proto:handle_text/2` | `vs_cp_ws:websocket_handle/2` | firma invariata; cambia solo la sessione che restituisce |
+| `vs_cp_ws:websocket_info/2` | cowboy, più 4 chiamate nei test del trasporto | due clausole nuove, **sopra** il catch-all. Sotto sarebbero diventate una riga di debug e il socket sarebbe rimasto attaccato a un processo che non c'è più |
+| `vs_cp_stub:attach_cp/2` (test) | `vs_cp_proto` attraverso `conn_mod` | registra una tupla a tre invece che a due, perché «a **quale** connettore si è attaccato» è tutta la domanda del riaggancio. Due asserzioni aggiornate |
+
+**Il test rotto, e perché è servito.** `a_frame_with_no_request_id_is_dropped` faceva
+`?assertEqual({[], booted_session()}, handle(Bin, booted_session()))`: due sessioni costruite
+separatamente, che ora differiscono per il riferimento del monitor. Corretto confrontando la
+sessione **con sé stessa**, che è anche ciò che il test voleva dire — «non è cambiato niente»,
+non «è uguale a un'altra istanza».
+
+### Verificato — girato davvero
+
+- **Suite: 298 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 286 di baseline + 12 nuovi:
+  10 sul riaggancio in `vs_cp_proto` e 2 sul trasporto in `vs_cp_ws`. I dieci fanno nascere un
+  processo vero da monitorare invece di sintetizzare il `DOWN`: il monitor **è** il meccanismo
+  in prova, e un messaggio scritto a mano proverebbe solo che il codice sa leggere una tupla.
+- **Il difetto prima e dopo**, sopra, sul compose con sette container.
+- **`--self-test` dell'emulatore driver**: rifirma i claim di `sample-tokens.md` §1 e produce
+  la fixture pubblicata **byte per byte**. È la prova che i token che manda sono quelli che
+  firmerebbe Tomcat, non qualcosa che la stazione accetta per caso.
+
+#### Scenario 1 — contesa sullo stesso connettore
+
+| driver | accettate | rifiutate | tempo max | media |
+|---|---|---|---|---|
+| 20 | 1 | 19 `ALREADY_HELD` | 21 ms | 16 ms |
+| 50 | 1 | 49 | 23 ms | 16 ms |
+| 100 | 1 | 99 | 32 ms | 17 ms |
+| 200 | 1 | 199 | 68 ms | 33 ms |
+| 500 | 1 | 499 | 100 ms | 48 ms |
+
+Il conteggio chiude esatto a ogni riga, senza avanzi, e la stazione conferma: **un** connettore
+`held`, quello del vincitore. Il massimo cresce all'incirca linearmente con N, che è la firma
+attesa dell'attore: le N richieste per quell'outlet sono N messaggi in **una** casella, servite
+una alla volta nell'ordine di arrivo. Nessun lock, e nessuno che ne veda uno.
+
+#### Scenario 2 — un veicolo, una prenotazione in rete
+
+Lo stesso `vehicle_id` su cinque connettori di due stazioni, nello stesso istante: **1 accettata,
+4 `NO_CLAIM`**, massimo 5 ms, media 5 ms. È l'unico scenario che attraversa il coordinatore, e
+la distinzione fra i due rifiuti è quella che `ws-driver.md` §4.1 tiene separata apposta:
+`ALREADY_HELD` lo alza il connettore («questo outlet è preso»), `NO_CLAIM` il coordinatore («il
+tuo veicolo è impegnato altrove, e nessun altro connettore ti aiuta»).
+
+Ripetuto **15 volte di fila** con veicoli diversi: 15 su 15 esatte.
+
+#### Scenario 3 — carico sostenuto
+
+10 driver su due stazioni, 150 secondi, mentre due colonnine erogano.
+
+| | |
+|---|---|
+| richieste | 5620 |
+| accettate | 2904 (1452 `reserve` + 1452 `cancel_reservation`) |
+| rifiutate | 2716 `ALREADY_HELD` |
+| tempo di risposta | **max 62 ms**, media 8 ms |
+| connettori `held` alla fine | **0** su entrambe le stazioni |
+| crash / supervisor report | **0** su tutti e cinque i nodi |
+
+Il conto chiude: 4168 `reserve` = 1452 accettate + 2716 rifiutate, e 1452 `cancel` tutte
+accettate. Le due colonnine hanno erogato per tutta la corsa senza interruzioni.
+
+Memoria (`erlang:memory(total)`, campionata ogni 25 s):
+
+```
+station1  58 864 KB → 60 323 KB (picco) → 59 453 KB     processi 151 → 156 → 150
+station2  57 391 KB → 58 598 KB (picco) → 57 744 KB     processi 150 → 155 → 150
+```
+
+Cresce del 2,5 % con i socket aperti e **torna alla base** quando si chiudono. Non cresce senza
+fermarsi.
+
+#### La sonda di proprietà
+
+Un carico di driver anonimi non può mostrare le due cose riservate a chi **possiede** una
+sessione. Con un `cp.js` che eroga sul connettore 3 e il driver del veicolo 88:
+
+```
+stranger sees session frames: no        <- §5.2, solo al proprietario
+owner sees session frames:    YES       <- phase charging, 150 kW, 7.414 kWh, soc 33%, eta 933s
+stranger stop_session:        NOT_YOURS <- §4.3
+owner stop_session:           ACK
+```
+
+e la riga scritta porta `7.414 kWh`, identica al `final energy_kwh` dell'emulatore.
+
+### Difetti trovati sotto carico e **non** corretti
+
+Uno solo, e non è del carico: è la conseguenza del 4404 della resa.
+
+**`cp.js` tratta il 4404 come fatale e termina** invece di riconnettersi col backoff. Il piano
+assumeva il contrario («lascia riconnettere la colonnina col suo backoff»), e per il nostro
+emulatore su quel percorso l'assunzione è falsa. Non corretto qui: `cp.js` è fuori perimetro, e
+la scelta fra cambiare il codice della resa e insegnare a `cp.js` a distinguere il 4404
+dell'handshake da quello a metà vita è una decisione di contratto, che è di Caleb. Il percorso
+è quasi irraggiungibile — richiede che il supervisore abbia rinunciato del tutto — e in nessuna
+prova è stato imboccato.
+
+Il resto delle prove non ha prodotto difetti: zero crash, zero report di supervisore, zero
+`ERROR REPORT` su stazioni e coordinatori, in tutte le corse.
+
+### Non provato — e perché
+
+- **Il ramo della resa (4404) non è stato eseguito su un socket vero.** Ha i due test unitari
+  — cinque tentativi a vuoto → `{close, 4404, ...}`, e la corsa dal trasporto → `[{close, 4404,
+  <<>>}]` — ma per vederlo sul compose bisognerebbe far arrendere `vs_connector_sup`, cioè
+  cinque crash in dieci secondi, e a quel punto la stazione ha un problema più grande di questo.
+- **Nessun `plugged` di veicolo sbagliato attraverso il riaggancio.** Il replay passa dal
+  percorso ordinario, quindi `not_your_reservation` è raggiungibile in teoria; in pratica il
+  connettore rinato è `free` e non ha hold, quindi non può succedere finché la prenotazione non
+  sopravvive al riavvio — e §6 dice che non deve.
+- **Il limite vero di cowboy/ranch non è stato trovato.** 500 driver simultanei su una stazione
+  passano senza degradare oltre i 100 ms; il default di ranch è 1024 connessioni per listener e
+  non ci si è arrivati. La premessa «le stazioni reggono M driver simultanei» è verificata fino
+  a 500, non oltre.
+- **Nessuna prova con il back office acceso.** I token li firma l'emulatore, quindi Tomcat non
+  serviva e non è stato avviato; la fatturazione delle righe scritte durante le prove non è
+  stata guardata.
+- **Docker Desktop si sospende da solo** — pause fino a **ventidue minuti** fra una corsa e
+  l'altra. Si vedono come buchi nel ping da tre secondi della stazione. Una da 38 secondi è
+  caduta dentro la riproduzione del difetto, fra il `plugged` e il primo `set_limit`: la corsa
+  vale lo stesso, perché il kill e le due istantanee sono successivi alla ripresa e
+  l'osservazione è di stato e non di tempo. **Tutti i tempi delle prove di carico** sono stati
+  verificati con quel controllo eseguito dopo la corsa, e nessuno attraversa una pausa.
+- **Il seed di prova non è nel repository.** `users` e `vehicles` sono tabelle di B, popolate
+  dalla registrazione, e `schema.sql` non le semina. Le due righe che servono a un `plugged`
+  sono documentate in `src/emulator/README.md` invece di essere aggiunte a un contratto che non
+  è nostro.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
@@ -1690,9 +1895,10 @@ dal funzionare, e senza di esso lo scenario 5 si mostra dai log invece che da un
 server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il suo
 `vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
 
-**M2-A è completo**: canale colonnina (§7p), allocazione della potenza (§7q) e INSERT su
-`sessions` (§7s). La fatturazione non gira più su righe inserite a mano: l'auto carica, la
-stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
+**M2-A è completo**: canale colonnina (§7p), allocazione della potenza (§7q), INSERT su
+`sessions` (§7s), il frame `session` con la sua pagina (§7v) e il riaggancio del socket con
+l'emulatore dei driver (§7w). La fatturazione non gira più su righe inserite a mano: l'auto
+carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
 fine della sessione. Quello che resta di M2-A è la verifica del fuso in `history.jsp`, che
 richiede un browser e una password che non ho.
 

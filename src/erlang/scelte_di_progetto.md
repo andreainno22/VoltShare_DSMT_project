@@ -1481,3 +1481,244 @@ lettera, e due macchine con orologi diversi continuano a non doversi accordare.
 `ws-chargepoint.md` è di A da entrambi i lati, quindi la modifica non richiede una PR. **Non si
 fa adesso:** prima il passo 5 (emulatore dei driver e prove di carico), poi un pair piccolo per
 chiuderla. Il passo 4 aggiunge un frame, non rimaneggia il contratto della colonnina.
+
+---
+
+## 17. Il riaggancio del socket colonnina e l'emulatore dei driver (M2-A passo 5)
+
+Due lavori in un giro: un difetto che si innesca proprio sotto carico, e il carico che serviva
+a trovarne di nuovi. In quest'ordine, perché partire con un difetto noto avrebbe reso
+illeggibile ciò che le prove trovavano.
+
+### 17.1 Il difetto era vero, il meccanismo del piano no
+
+`PIANO_LOAD.md` descriveva così la conseguenza della morte di un connettore: «i suoi `meter` e
+`status` continuano ad arrivare a un pid morto — `gen_statem:cast` verso un processo defunto
+non fallisce, sparisce in silenzio». **Non è quello che succede**, e la verifica bloccante
+«riproduci prima di correggere» è servita esattamente a questo.
+
+`vs_cp_proto` non ha mai memorizzato il pid: §11.10 lo dice e un test lo asserisce, il
+connettore si rilegge da `lookup_pid/1` a ogni evento. Il registro del manager guarisce da solo
+sul `connector_up`, e misurato sul compose ci mette meno di un secondo. Quindi i `meter`
+**arrivano** al connettore nuovo. Il difetto è un altro, ed è peggiore perché lascia più tracce
+sbagliate che giuste:
+
+- il connettore rinato è `free` e non ha sessione, quindi ogni lettura diventa una riga
+  «meter for a connector with no session (state free)» e viene buttata;
+- `#data.cp` è `undefined`, quindi `send_cp/2` è un no-op: **nessun `set_limit` e nessuno
+  `stop` può più raggiungere l'hardware**;
+- l'`unplugged` finale cade su un connettore inattivo e §4.4 lo ignora, quindi la riga su
+  `sessions` **non viene mai scritta**.
+
+Misurato: con una `exit(Pid, kill)` sul connettore 3 a sessione in corso, l'auto ha continuato
+a prendere 150 kW fino a 1,878 kWh, la stazione ha mostrato il connettore `free` per tutto il
+tempo, e in `sessions` non è comparsa nessuna riga. `PROGRESS.md` lo aveva già annotato
+correttamente al passo 1 («il `meter` successivo finisce nel log "meter senza sessione" invece
+che nel vuoto»); il piano lo aveva riscritto peggio.
+
+Il sintomo per cui la correzione esiste resta identico a quello del piano. Cambia la frase da
+dire all'orale, e cambia il punto in cui si guarda per accorgersene: non un pid morto, ma un
+connettore vivo che non sa niente.
+
+### 17.2 Perché il socket si riaggancia invece di chiudersi
+
+L'alternativa scartata era la più semplice: al `DOWN` del connettore, chiudere il socket e
+lasciare che la colonnina si riconnetta col backoff di §6.1. Costa una riga.
+
+Costa anche un secondo abbondante di erogazione non contata, ma soprattutto sposta
+**sull'hardware la riparazione di un guasto della stazione**. §7.1 divide le competenze in modo
+netto — la stazione autorizza, la colonnina riferisce — e §7.2 le dà il ruolo di autorità sullo
+stato fisico, non quello di infermiere. Una stazione che chiede all'hardware di riavviarsi
+perché un suo processo è morto sta chiedendo all'hardware di coprirla.
+
+Quindi il socket monitora il connettore a cui si è attaccato, e sul `DOWN`:
+
+1. arma un `erlang:send_after` di `CP_REATTACH_MS` — **un timer, non un'attesa**: il socket
+   deve continuare a leggere frame, perché la colonnina non smette di parlare solo perché un
+   processo della stazione è morto;
+2. rilegge il pid da `vs_station_mgr:lookup_pid/1`, la stessa lettura sporca dell'handshake e
+   per la stessa ragione (§11.10: mai una call sincrona dal socket al manager);
+3. si riattacca con `attach_cp/2` e **riconcilia**;
+4. dopo `CP_REATTACH_TRIES` tentativi si arrende con un 4404.
+
+Misurato sul compose: dal `DOWN` al riaggancio, **501 ms**. L'emulatore non se ne accorge — il
+suo log non ha un buco, la potenza non scende — e la riga finale porta `2.416 kWh`, identica al
+totale del contatore.
+
+### 17.3 Il pid ricordato non è una cache di instradamento
+
+§11.10 dice che il connettore non si memorizza mai, e la sessione del socket adesso contiene un
+`conn_pid`. Le due cose convivono, e la distinzione va detta perché è esattamente il genere di
+cosa che in revisione sembra una contraddizione:
+
+- **l'instradamento** passa ancora da `lookup_pid/1` a ogni evento, senza eccezioni;
+- `conn_pid` esiste per due motivi che non sono l'instradamento: dare un soggetto al monitor,
+  e permettere al riaggancio di distinguere «il connettore è tornato come processo **nuovo**»
+  da «il registro nomina ancora quello che è appena morto».
+
+Il secondo non è teorico. Il `DOWN` del socket e quello del manager sono indipendenti: se il
+timer scatta prima che il manager abbia gestito il suo, `lookup_pid/1` restituisce ancora il
+pid defunto. Confrontarlo è l'unico modo esatto di accorgersene — `is_process_alive/1` sarebbe
+una domanda sul passato, e per un pid remoto nemmeno affidabile.
+
+### 17.4 Lo stato nuovo del socket, e perché è giustificato
+
+Il socket ricorda tre cose: `last_status`, `last_plugged`, `last_meter`. È tutto lo stato che
+questo processo ha oltre all'handshake, e la giustificazione è una sola frase: **è la stessa
+copia che la colonnina rimanderebbe riconnettendosi**, tenuta da questa parte per non chiedere
+all'hardware di rifare una cosa che ha già fatto.
+
+Non è un'analogia: §6.2 descrive letteralmente quel comportamento — «invia `boot` con il suo
+stato vero e, se una sessione è in corso, un `plugged` con il veicolo e l'energia cumulativa
+che ha contato» — ed è ciò che `cp.js` fa. Il riaggancio replica quelle due cose al posto suo.
+
+Tre decisioni dentro questa scelta:
+
+- **Il `plugged` si ricorda comunque**, anche quando la stazione lo rifiuta. La colonnina lo
+  rimanderebbe comunque: `cp.js` mette `car.plugged = true` senza guardare la risposta, perché
+  §7.1 le dà il ruolo di riferire e non quello di giudicare. Un `plugged` rifiutato viene
+  rifiutato di nuovo al replay, che è l'esito onesto invece di uno silenzioso.
+- **Si dimentica sull'`unplugged`.** Tenuto oltre, descriverebbe un'auto che se n'è andata, e
+  il riaggancio successivo aprirebbe una sessione per lei. È l'unico modo in cui questa
+  memoria potrebbe fare danno, e ha un test suo.
+- **L'energia del replay viene dall'ultimo `meter`**, non dal `plugged` di quando il cavo è
+  entrato — che porta quasi sempre zero. Scritto come `max` dei due perché §4.3 dice che il
+  cumulativo è monotono: il `max` non può che pescare il `meter`, ed è la regola a essere
+  scritta, non un dubbio sull'ordine di arrivo.
+
+**Prima si attacca, poi si racconta.** L'ordine è portante: il `plugged` replicato porta il
+connettore in `charging`, la cui `enter` manda il `set_limit` interinale attraverso `send_cp/2`.
+Riconciliare prima di attaccare lo farebbe cadere in un `cp = undefined`, e l'auto resterebbe
+sul limite vecchio fino al tick successivo del manager — cioè avremmo corretto metà del difetto
+tenendoci l'altra metà.
+
+### 17.5 La sessione che torna è un walk-in, e la prenotazione no
+
+Il connettore rinato è `free`, quindi il `plugged` replicato ci entra dalla porta del walk-in:
+niente claim, utente risolto dal veicolo (`vehicles.user_id` è unico, D1). È §6 preso alla
+lettera — «ricostruire la prenotazione non viene deliberatamente tentato: l'auto continua a
+caricare, la sessione viene fatturata, la prenotazione non c'è più» — e non una semplificazione
+scelta qui.
+
+Ha una conseguenza che va detta: se il connettore era `held` da un altro driver quando è morto,
+quell'hold è perso col processo, e il primo `plugged` che arriva apre un walk-in. Lo stesso vale
+già oggi per il riavvio di una stazione intera; qui la finestra è più piccola.
+
+### 17.6 `CP_REATTACH_MS` e `CP_REATTACH_TRIES` non entrano nel contratto
+
+Stessa regola di §12.8. `ws-chargepoint.md` §10 configura **il filo** — quello che la colonnina
+si sente dire e a cui viene tenuta — mentre queste due descrivono come la stazione si ripara
+dietro il filo. Una colonnina non sa, e non deve sapere, che un processo connettore le è
+rinato sotto.
+
+I valori: 500 ms perché è abbondantemente sopra il tempo misurato perché il `simple_one_for_one`
+rifaccia il figlio e il manager gestisca il proprio `DOWN`, e ben dentro l'intervallo di un
+`meter`. Cinque tentativi, cioè due secondi e mezzo: oltre quel punto il supervisore non è stato
+lento, si è **arreso** (`intensity 5, period 10`), e restare attaccati a niente non aiuta.
+
+### 17.7 Il 4404 della resa, e una divergenza segnalata e non corretta
+
+Alla resa il socket chiude con **4404**, che è il codice che §1 dà a «questa stazione non ha
+quel connettore» — e dopo cinque tentativi è letteralmente vero.
+
+**`cp.js` però tratta il 4404 come fatale e termina** (`die(...)`), invece di riconnettersi col
+backoff. Non è irragionevole da parte sua: §1 mette quel codice all'handshake, dove significa
+una configurazione sbagliata, e riprovare all'infinito una configurazione sbagliata sarebbe un
+ciclo. Ma vuol dire che l'ipotesi «lascia riconnettere la colonnina col suo backoff» **è falsa
+per il nostro emulatore su quel percorso**.
+
+Segnalato e non corretto: `cp.js` è fuori dal perimetro di questo passo, e la scelta fra
+«cambiare il codice della resa» e «insegnare a `cp.js` a distinguere il 4404 dell'handshake da
+quello a metà vita» è una decisione di contratto, che è di Caleb. Il percorso è comunque quasi
+irraggiungibile — richiede che il supervisore abbia rinunciato del tutto — e nelle prove non è
+mai stato imboccato.
+
+### 17.8 L'emulatore dei driver: perché firma i token da sé
+
+`driver.js` si firma i JWT, uno per driver emulato, ognuno col suo `vehicle_id`. Può farlo solo
+perché il segreto **di sviluppo** è pubblicato in `sample-tokens.md`, e un generatore di carico
+che avesse bisogno di un Tomcat acceso per produrre quaranta login non sarebbe un generatore di
+carico.
+
+In esercizio è impossibile e deve restarlo: `VOLTSHARE_JWT_SECRET` viene iniettato al deploy e
+non è mai committato, e il back office è l'unico emittente (`jwt.md` §1). La stazione ha già un
+`vs_jwt:secret/0` che avverte quando si accorge di star verificando col segreto pubblicato:
+firmare qui è l'immagine speculare di quell'avviso, e le due cose smettono di essere vere nello
+stesso istante.
+
+La prova che non è una scorciatoia sciatta: `--self-test` rifirma i claim di `sample-tokens.md`
+§1 e stampa se il risultato è la fixture pubblicata **byte per byte**. Lo è. Vuol dire che
+questo file firma quello che firma Tomcat — stesso header, stesso ordine dei claim, `sub` come
+stringa e `vehicle_id` come numero — e non qualcosa che la stazione accetta per caso.
+
+### 17.9 Dove `driver.js` copia `js/ws.js`, e perché non è duplicazione
+
+L'intestazione di `ws-driver.md` dice che i driver emulati del generatore di carico parlano lo
+stesso contratto della pagina. Se le semantiche divergessero, la prova di carico misurerebbe
+qualcosa che nessuno usa. Quindi sono identiche, e ciascuna è marcata nel sorgente:
+
+- stesso `request_id` su ogni ritentativo (§2, §7.2), che è la metà client di P7 — senza,
+  la cache at-most-once della stazione è codice che nessuno esercita;
+- niente viaggia prima che il `join` sia acked (§3): le azioni sollevate prima aspettano;
+- 4400/4401/4408 fatali, tutto il resto riconnette con backoff 500 ms → 10 s (§7.5);
+- `?station_id=` lo appende il client (§1, §10.5).
+
+Non è duplicazione perché **non è lo stesso programma**: `js/ws.js` gira nel browser, non ha
+scenari, non misura tempi e non conta esiti; `driver.js` non ha DOM, non ha promesse esposte a
+una pagina e ha un ciclo di vita a batch. Condividere il file avrebbe voluto dire un bundler e
+un modulo comune per due runtime diversi — la stessa complicazione che il progetto ha rifiutato
+ovunque. Dove i due divergessero, la regola dichiarata è che **ha ragione `js/ws.js`**: è quello
+che gira davanti a un utente. Nelle prove non è emersa nessuna divergenza.
+
+### 17.10 Cosa misurano gli scenari, e perché il massimo e non la media
+
+Tre scenari, in ordine di valore: la contesa sullo stesso connettore (l'invariante centrale,
+SCOPE §4), un veicolo e una prenotazione sola in rete (che attraversa il coordinatore), e il
+carico sostenuto (dove il difetto della Parte 1 si sarebbe innescato).
+
+Ogni scenario riporta richieste, accettate, rifiutate **per codice**, e il tempo di risposta
+come **massimo e media**. Il massimo è il numero che conta: una prenotazione da otto secondi è
+un'esperienza rotta anche con una media da 200 ms, e una media è esattamente la statistica che
+nasconde quel caso.
+
+L'orologio parte quando il driver **chiede**, non quando il frame parte: una richiesta rimasta
+in coda dietro un `join` lento ha aspettato, e nasconderlo misurerebbe la stazione invece
+dell'esperienza. I ritentativi sono dentro la stessa misura, per la stessa ragione.
+
+E il conteggio deve **chiudere esatto**: su N richieste allo stesso connettore, `1 + (N-1)`
+rifiuti senza avanzi. Un solo esito diverso e l'invariante è violata; il programma esce con
+stato diverso da zero.
+
+### 17.11 `stop_session` e il frame `session` hanno bisogno di un proprietario
+
+Un carico di driver anonimi non può mostrare le due cose che §5.2 e §4.3 riservano a chi
+**possiede** una sessione: che il frame `session` arrivi al proprietario e a nessun altro, e
+che `stop_session` sulla ricarica di un altro sia `NOT_YOURS`.
+
+Quindi `--charging-connector <n>`: con un `cp.js` che eroga su quel connettore, la corsa aggiunge
+una sonda finale con il driver il cui veicolo è quello che sta caricando. Una volta sola, dopo
+il ciclo e non dentro: il soggetto è una regola di autorizzazione, e ripeterla mille volte
+aggiungerebbe rumore ai numeri senza aggiungere un fatto. Termina quella ricarica, e questa è
+la dimostrazione — la stazione manda lo `stop`, la colonnina obbedisce, la riga viene scritta.
+
+Misurato: `NOT_YOURS` all'estraneo, `ACK` al proprietario, `7.414 kWh` sulla riga, identici al
+totale finale dell'emulatore.
+
+### 17.12 Docker Desktop si sospende, e le misure vanno buttate
+
+Non è una scelta di progetto, è una condizione dell'ambiente che invalida silenziosamente i
+numeri, e sta scritta qui perché chiunque rifaccia le prove ci inciamperà. Docker Desktop mette
+in pausa la sua VM quando nessuno le parla: fra una corsa e l'altra si sono osservate pause di
+**ventidue minuti**, e una da 38 secondi è caduta dentro la riproduzione del difetto — fra il
+`plugged` e il primo `set_limit`, quindi prima del kill e delle due istantanee, che sono
+osservazioni di stato e non di tempo e reggono comunque.
+
+Si vedono come buchi nel ping da tre secondi che la stazione fa comunque:
+
+```bash
+docker logs --since 5m station1 | grep -B1 "ping vs@" | grep NOTICE
+```
+
+Due timestamp consecutivi a più di sei secondi vogliono dire che la VM si è fermata, e quella
+corsa va rifatta invece che spiegata. Tutti i **tempi** riportati per il passo 5 sono stati
+presi con questo controllo eseguito **dopo** la corsa, e nessuno di essi attraversa una pausa.

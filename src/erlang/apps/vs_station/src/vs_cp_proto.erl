@@ -17,6 +17,16 @@
 %%%   booted                whether `boot' has been seen (§3.1)
 %%%   heartbeat_interval_s,
 %%%   meter_interval_s      §10; handed to the equipment in the boot ack
+%%%   conn_pid, conn_mon    the connector this socket attached to, and the
+%%%                         monitor on it. NOT a routing cache — see below
+%%%   reattach_ms,
+%%%   reattach_tries_max,
+%%%   reattach_tries        the reattach of §6, and how far it has got
+%%%   last_status,
+%%%   last_plugged,
+%%%   last_meter            the hardware's last word, kept for that same
+%%%                         reconciliation (see "What this socket
+%%%                         remembers" below)
 %%%   conn_mod, mgr_mod,
 %%%   db_mod                injected collaborators
 %%%
@@ -52,10 +62,63 @@
 %%% into a dead mailbox instead of into the live process — where the
 %%% "meter with no session" log of §4.3 is what tells us the two sides
 %%% have diverged.
+%%%
+%%% `conn_pid' does **not** change that. Every event still routes through a
+%%% fresh `lookup_pid/1'; the pid is remembered only so that the monitor
+%%% below has something to be about, and so that the reattach can tell "the
+%%% connector came back as a new process" from "the registry still holds
+%%% the one that just died". Routing never reads it.
+%%%
+%%% ## Why this socket reattaches, and what it remembers to do it
+%%%
+%%% The surveillance used to run one way only: the connector monitors the
+%%% socket and starts the grace of §3.2 when it dies. The return direction
+%%% was missing, and the hole it left was the quietest defect in the
+%%% system. When the **connector** is the one that dies, `vs_connector_sup'
+%%% restarts it with a new pid and `cp = undefined', while the TCP socket
+%%% of the charge point is perfectly healthy and has no reason to
+%%% reconnect. Measured, not deduced (a walk-in on connector 3, then
+%%% `exit(Pid, kill)' from the shell):
+%%%
+%%%   * the registry heals within a second, so the meters do reach the new
+%%%     connector — and it has no session, so every one of them becomes a
+%%%     "meter for a connector with no session (state free)" line and is
+%%%     dropped;
+%%%   * the new connector's `cp' is `undefined', so `send_cp/2' is a no-op:
+%%%     no `set_limit' and no `stop' can reach the hardware ever again;
+%%%   * the car goes on drawing 150 kW while the station shows the
+%%%     connector `free', and the final `unplugged' lands on an idle
+%%%     connector and is ignored (§4.4) — the `sessions' row is never
+%%%     written and the energy is never billed.
+%%%
+%%% So the socket monitors the connector it attached to. On the `DOWN' it
+%%% waits `reattach_ms' — an `erlang:send_after', never a blocking wait:
+%%% this process must go on reading frames — then looks the pid up again
+%%% and reattaches, up to `reattach_tries_max' times, and gives up with a
+%%% 4404.
+%%%
+%%% Reattaching is not enough on its own: the new connector has no memory,
+%%% and the hardware does. That is exactly the reconciliation §6 describes
+%%% for "the station restarted" — here the station is alive and only one
+%%% connector was reborn, but from that connector's point of view the
+%%% situation is identical. §6.2 has the equipment resend its true `status'
+%%% and, under a live session, a `plugged' with the cumulative energy; this
+%%% socket replays the two on its behalf, which is why it keeps
+%%% `last_status', `last_plugged' and `last_meter'. It is the only state
+%%% this process holds beyond the handshake, and it is justified by being
+%%% *the same copy the charge point would send if it reconnected* — kept on
+%%% this side so the hardware is not asked to redo something it has already
+%%% done. `last_plugged' and `last_meter' are dropped on `unplugged',
+%%% because after that the copy would describe a cable that is out.
+%%%
+%%% The session that comes back is a **walk-in adoption**: §6 says
+%%% rebuilding the reservation is deliberately not attempted, so the hold
+%%% is gone and the account is resolved from the vehicle, exactly as for a
+%%% car that never reserved.
 %%%-------------------------------------------------------------------
 -module(vs_cp_proto).
 
--export([new/1, handshake/2, handle_text/2,
+-export([new/1, handshake/2, handle_text/2, handle_info/2,
          boot_ack/3, command_frame/1, stop_command/1]).
 
 -type frame()   :: map().
@@ -81,6 +144,18 @@ new(Opts) ->
       meter_interval_s =>
           opt(meter_interval_s, Opts,
               fun() -> vs_env:get_int("METER_INTERVAL_S", 5) end),
+      %% The connector we are attached to and watching. Never read to
+      %% route an event — see the module doc.
+      conn_pid     => undefined,
+      conn_mon     => undefined,
+      reattach_ms  => opt(reattach_ms, Opts, fun reattach_ms/0),
+      reattach_tries_max =>
+          opt(reattach_tries_max, Opts, fun reattach_tries_max/0),
+      reattach_tries => 0,
+      %% The hardware's last word, for the reconciliation of §6.
+      last_status  => undefined,
+      last_plugged => undefined,
+      last_meter   => undefined,
       conn_mod     => opt(conn_mod, Opts, fun() -> vs_connector end),
       mgr_mod      => opt(mgr_mod, Opts, fun() -> vs_station_mgr end),
       db_mod       => opt(db_mod, Opts, fun() -> vs_station_db end)}.
@@ -236,7 +311,10 @@ event(<<"status">>, _ReqId, Payload, Session) ->
         {ok, Status} ->
             _ = with_connector(Session,
                                fun(Conn, Pid) -> Conn:cp_status(Pid, Status) end),
-            {[], Session};
+            %% Remembered for the replay of §6.2: a connector reborn under
+            %% a live socket has to be told the physical state again, and
+            %% the hardware only sends it on change.
+            {[], Session#{last_status := Status}};
         error ->
             logger:error("charge point channel (connector ~p): unusable status ~p",
                          [maps:get(connector_id, Session),
@@ -244,20 +322,29 @@ event(<<"status">>, _ReqId, Payload, Session) ->
             {[], Session}
     end;
 
+%% Remembered **whatever the station makes of it**, and on purpose: the
+%% copy is here to stand in for the one the charge point would resend, and
+%% the charge point resends it whenever the cable is in — it has no idea
+%% whether we authorised anything (§7.1, the equipment reports and the
+%% station decides). A `plugged' that was refused here is refused again on
+%% the replay, which is the honest outcome rather than a silent one.
 event(<<"plugged">>, _ReqId, Payload, Session) ->
-    plugged(Payload, Session);
+    plugged(Payload, Session#{last_plugged := Payload});
 
 event(<<"meter">>, _ReqId, Payload, Session) ->
     Reading = #{power_kw   => num(<<"power_kw">>, Payload, 0.0),
                 energy_kwh => num(<<"energy_kwh">>, Payload, 0.0),
                 soc_pct    => int(<<"soc_pct">>, Payload, 0)},
     _ = with_connector(Session, fun(Conn, Pid) -> Conn:meter(Pid, Reading) end),
-    {[], Session};
+    {[], Session#{last_meter := Payload}};
 
+%% The cable is out. The copy of §6.2 is dropped with it — kept, it would
+%% describe a car that is no longer there, and the next reattach would
+%% open a session for it.
 event(<<"unplugged">>, _ReqId, Payload, Session) ->
     Energy = num(<<"energy_kwh">>, Payload, 0.0),
     _ = with_connector(Session, fun(Conn, Pid) -> Conn:unplugged(Pid, Energy) end),
-    {[], Session};
+    {[], Session#{last_plugged := undefined, last_meter := undefined}};
 
 event(Action, _ReqId, _Payload, Session) ->
     logger:warning("charge point channel (connector ~p): unknown action ~p",
@@ -287,13 +374,16 @@ boot(ReqId, Payload, Session = #{connector_id := ConnId}) ->
                            bin(<<"firmware">>, Payload),
                            int(<<"rated_kw">>, Payload, 0),
                            bin(<<"status">>, Payload)]),
-            ok = attach_to(Session, Pid),
-            case cp_status(Payload) of
-                {ok, Status} -> (conn_mod(Session)):cp_status(Pid, Status);
-                error        -> ok
-            end,
-            {[boot_ack(ReqId, limit_kw(Session, Pid), Session)],
-             Session#{booted := true}};
+            Session1 = attach_to(Session, Pid),
+            Session2 = case cp_status(Payload) of
+                           {ok, Status} ->
+                               (conn_mod(Session1)):cp_status(Pid, Status),
+                               Session1#{last_status := Status};
+                           error ->
+                               Session1
+                       end,
+            {[boot_ack(ReqId, limit_kw(Session2, Pid), Session2)],
+             Session2#{booted := true}};
         {error, Reason} ->
             %% §3.1: "`accepted: false' with a `reason' means the station
             %% does not recognise this connector; the charge point closes
@@ -345,13 +435,46 @@ limit_kw(Session, Pid) ->
 %% within a millisecond of arriving. Binding at the upgrade instead would
 %% let a half-open TCP connection — a port scan, a proxy probe — throw a
 %% working charge point off its own connector before saying a single word.
+%%
+%% A refused attach is logged and the session goes on unwatched: `boot' has
+%% an ack to produce and a charge point that cannot be bound is one the
+%% handshake already said we own, so the honest answer is a log line rather
+%% than a dead socket. The next `boot' — the equipment retries — binds it.
 attach_to(Session, Pid) ->
-    try (conn_mod(Session)):attach_cp(Pid, self())
-    catch exit:Reason ->
+    case attach(Session, Pid) of
+        {ok, Session1} ->
+            Session1;
+        {error, Reason} ->
             logger:warning("charge point channel: connector ~p refused the "
                            "attach (~p)", [maps:get(connector_id, Session), Reason]),
-            ok
+            Session
     end.
+
+%% Attach **and watch**. The monitor is the return direction of the
+%% surveillance: the connector has watched this socket since M2 step 1, and
+%% this is how the socket learns that the connector died under it.
+%%
+%% `demonitor(..., [flush])' on the way in for the same reason
+%% `vs_connector:attach/2' has one: without the flush, the `DOWN' of the
+%% connector we are replacing may already be in the mailbox, and it would
+%% start a reattach cycle against a connector we are attached to already.
+attach(Session, Pid) ->
+    try (conn_mod(Session)):attach_cp(Pid, self()) of
+        ok ->
+            Session1 = demonitor_connector(Session),
+            Ref = erlang:monitor(process, Pid),
+            {ok, Session1#{conn_pid       := Pid,
+                           conn_mon       := Ref,
+                           reattach_tries := 0}}
+    catch exit:Reason ->
+            {error, Reason}
+    end.
+
+demonitor_connector(Session = #{conn_mon := undefined}) ->
+    Session;
+demonitor_connector(Session = #{conn_mon := Ref}) ->
+    _ = erlang:demonitor(Ref, [flush]),
+    Session#{conn_mon := undefined}.
 
 %%%===================================================================
 %%% §4.2 — plugged, the one place authorisation happens
@@ -467,6 +590,157 @@ user_for_vehicle(#{db_mod := Db}, VehicleId) ->
     end.
 
 %%%===================================================================
+%%% §6 — the connector died under us: reattach and reconcile
+%%%===================================================================
+
+%% @doc The messages that are not frames: the `DOWN' of the connector this
+%% socket is attached to, and the timer that retries the reattach.
+%%
+%% Same two shapes as `vs_driver_proto:handle_text/2', because the caller
+%% has the same two things to do with them: write the frames, or write the
+%% frames and then close.
+-spec handle_info(term(), session()) ->
+          {[frame()], session()} | {close, 4404, [frame()], session()}.
+
+%% The connector is gone. Not the socket's death — this process is fine,
+%% and so is the cable — so nothing is torn down: a timer is armed and the
+%% socket goes straight back to reading frames. The meters that arrive in
+%% the meantime are dropped by the reborn connector with the "no session"
+%% line of §4.3, which is the correct thing for it to say until the
+%% reconciliation below tells it otherwise.
+handle_info({'DOWN', Ref, process, Pid, Reason},
+            Session = #{conn_mon := Ref, connector_id := ConnId,
+                        reattach_ms := Ms}) ->
+    logger:warning("charge point channel: connector ~p (~p) died under a live "
+                   "socket (~p) - reattaching in ~p ms", [ConnId, Pid, Reason, Ms]),
+    _ = erlang:send_after(Ms, self(), cp_reattach),
+    %% `conn_pid' is deliberately kept, dead as it is: it is what the next
+    %% lookup is compared against.
+    {[], Session#{conn_mon := undefined, reattach_tries := 0}};
+
+%% A monitor we no longer hold — the connector we replaced, or one whose
+%% `DOWN' outran the `demonitor'. Nothing to repair.
+handle_info({'DOWN', _Ref, _Type, _Pid, _Reason}, Session) ->
+    {[], Session};
+
+handle_info(cp_reattach, Session = #{conn_pid := undefined}) ->
+    %% Never attached, so there is nothing to reattach to. Only reachable
+    %% from a timer that outlived its reason; said out loud rather than
+    %% silently absorbed (§7.6).
+    logger:notice("charge point channel (connector ~p): reattach timer with no "
+                  "connector to go back to", [maps:get(connector_id, Session)]),
+    {[], Session};
+
+handle_info(cp_reattach, Session = #{conn_pid := Dead, connector_id := ConnId}) ->
+    case connector(Session) of
+        {ok, Pid} when Pid =/= Dead ->
+            reattach(Pid, Session);
+        {ok, Dead} ->
+            %% The registry still holds the process that died: the
+            %% manager's own `DOWN' has not been handled yet. Not back.
+            retry(Session, "the registry still names the connector that died");
+        {error, Reason} ->
+            retry(Session, io_lib:format("no connector ~p yet (~p)",
+                                         [ConnId, Reason]))
+    end;
+
+handle_info(Info, Session) ->
+    logger:debug("charge point channel (connector ~p) ignoring ~p",
+                 [maps:get(connector_id, Session), Info]),
+    {[], Session}.
+
+%% A new process for this connector. Attach first and reconcile after, and
+%% the order carries weight: the replayed `plugged' takes the connector
+%% into `charging', whose entry callback sends the interim `set_limit'
+%% through `send_cp/2'. Reconciling before attaching would drop that
+%% command into a `cp = undefined' and leave the car on the limit it
+%% happened to be holding until the manager's next tick.
+reattach(Pid, Session = #{connector_id := ConnId}) ->
+    case attach(Session, Pid) of
+        {ok, Session1} ->
+            logger:notice("charge point channel: connector ~p is back as ~p - "
+                          "reattached", [ConnId, Pid]),
+            reconcile(Pid, Session1);
+        {error, Reason} ->
+            %% It was alive a moment ago and is not now. Same answer as
+            %% "not there yet": the supervisor is still working.
+            retry(Session, io_lib:format("connector ~p refused the attach (~p)",
+                                         [Pid, Reason]))
+    end.
+
+%% §6.2 — "It sends `boot' with its true `status' and, if a session is
+%% running, a `plugged' with the vehicle and the cumulative energy it has
+%% counted." The charge point is not asked to do it again; this socket has
+%% the same two things written down and says them on its behalf.
+%%
+%% No `boot' of our own: `boot' is a frame the equipment sends and this
+%% side answers, and the connector never sees one — what it sees is the
+%% `attach_cp' that has just happened and the two events below.
+reconcile(Pid, Session = #{connector_id := ConnId, last_status := Status,
+                           last_plugged := Plugged, last_meter := Meter}) ->
+    case Status of
+        undefined -> ok;
+        _         -> (conn_mod(Session)):cp_status(Pid, Status)
+    end,
+    case Plugged of
+        undefined ->
+            logger:notice("charge point channel: connector ~p reconciled to "
+                          "status ~p, nothing plugged in", [ConnId, Status]),
+            {[], Session};
+        _ ->
+            Replay = replayed_plugged(Plugged, Meter),
+            logger:notice("charge point channel: connector ~p reconciled to "
+                          "status ~p, re-announcing vehicle ~p with ~p kWh",
+                          [ConnId, Status,
+                           int(<<"vehicle_id">>, Replay, undefined),
+                           num(<<"energy_kwh">>, Replay, 0.0)]),
+            %% Straight through the ordinary `plugged' path: the account is
+            %% resolved from the vehicle, `max_kw' is insisted on, and the
+            %% state machine authorises. A reborn connector is `free', so
+            %% this is a walk-in — which is §6's answer in full: the claim
+            %% is not rebuilt, the car keeps charging, the session is
+            %% billed. Whatever frames that path produces are the caller's
+            %% to send, exactly as for a live `plugged'.
+            plugged(Replay, Session)
+    end.
+
+%% What the charge point would put in the `plugged' of §6.2: the vehicle it
+%% announced when the cable went in, and the cumulative it has counted
+%% since. §4.3 makes that cumulative monotonic, so the `max' can only ever
+%% pick the meter; it is written as a `max' because that is the rule the
+%% contract states, not because the two could arrive out of order.
+replayed_plugged(Plugged, undefined) ->
+    Plugged;
+replayed_plugged(Plugged, Meter) ->
+    Plugged#{<<"energy_kwh">> => max(num(<<"energy_kwh">>, Plugged, 0.0),
+                                     num(<<"energy_kwh">>, Meter, 0.0)),
+             <<"soc_pct">>    => int(<<"soc_pct">>, Meter,
+                                     int(<<"soc_pct">>, Plugged, 0))}.
+
+%% Not back yet. One more timer until the budget runs out, then 4404.
+%%
+%% 4404 is the code §1 gives to "this station has no such connector", and
+%% after `reattach_tries_max' attempts that is the literal truth: the
+%% supervisor has given up on it. Closing beats hanging on — a socket bound
+%% to nothing accepts frames it can do nothing with, while a charge point
+%% that is hung up on reconnects on its own (§6.1) and boots against
+%% whatever the station has by then.
+retry(Session = #{connector_id := ConnId, reattach_tries := Tries,
+                  reattach_tries_max := Max, reattach_ms := Ms}, Why) ->
+    case Tries + 1 of
+        N when N >= Max ->
+            logger:error("charge point channel: connector ~p did not come back "
+                         "in ~p attempts (~s) - closing 4404, the charge point "
+                         "will reconnect", [ConnId, N, Why]),
+            {close, 4404, [], Session#{reattach_tries := N}};
+        N ->
+            logger:notice("charge point channel: connector ~p not back yet "
+                          "(~s), attempt ~p of ~p", [ConnId, Why, N, Max]),
+            _ = erlang:send_after(Ms, self(), cp_reattach),
+            {[], Session#{reattach_tries := N}}
+    end.
+
+%%%===================================================================
 %%% §5 — commands
 %%%===================================================================
 
@@ -550,3 +824,25 @@ bin(Key, Payload) ->
         V when is_binary(V) -> V;
         _Missing            -> <<"?">>
     end.
+
+%%%===================================================================
+%%% configuration
+%%%===================================================================
+
+%% Deliberately **not** in ws-chargepoint.md §10, and the same rule as the
+%% allocator's two variables (scelte §12.8): §10 configures the wire — what
+%% the equipment is told and what it is held to — while these two describe
+%% how the station repairs itself behind that wire. A charge point neither
+%% knows nor needs to know that a connector process was reborn under it.
+%% They are written up in scelte_di_progetto.md instead.
+
+%% Long enough for `simple_one_for_one' to have run the child's `init/1'
+%% and for the manager to have handled its own `DOWN' and the
+%% `connector_up' behind it — measured at well under a second — and short
+%% enough that the car spends a fraction of one meter interval unattached.
+reattach_ms() -> vs_env:get_int("CP_REATTACH_MS", 500).
+
+%% Five attempts, so two and a half seconds. Past that the supervisor has
+%% not merely been slow, it has given up (`intensity 5, period 10'), and
+%% waiting longer only keeps a socket bound to nothing.
+reattach_tries_max() -> vs_env:get_int("CP_REATTACH_TRIES", 5).
