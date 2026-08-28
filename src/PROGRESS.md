@@ -778,6 +778,50 @@ percorso dell'erogazione.
 
 ---
 
+## 7q. La partizione si fa su un host solo — A aveva ragione, 27 agosto
+
+Provato il suggerimento di `nota-per-B-pendenze.md` §3, ed è **il risultato migliore della
+milestone M3**:
+
+```
+docker network disconnect voltshare_voltshare coord3     # non lo uccide: lo isola
+
+coord3 (vivo, isolato)     "QUORUM LOST (1 of 3) — this coordinator will refuse to serve"
+                           "election: out of quorum, abdicating"
+coord1 + coord2 (2 su 3)   coord2 eletto → rebuild: 2 stazioni interrogate → serving
+
+docker network connect voltshare_voltshare coord3
+coord3                     "quorum back, electing" → riprende la corona (rango più alto)
+                           → rebuild → serving
+```
+
+Interrogato dall'interno del container isolato:
+
+```
+coord3 è vivo         : true
+mode                  : suspended
+in_quorum             : false
+prenotazione tentata  : {not_serving, undefined}
+```
+
+**Il nodo è in esecuzione, si crede vivo, e si è tolto dal servizio da solo.** È esattamente lo
+scenario per cui esiste il quorum e che `docker kill` non può mostrare: quello è un *crash*, cioè
+un nodo che sparisce. Il caso difficile è un nodo che resta acceso e non vede più gli altri, e che
+deve avere il buon senso di smettere di concedere.
+
+Quindi cade anche l'ultimo motivo per il deploy multi-host (§7n): non serviva un'altra macchina per
+produrre una partizione vera, bastava staccare l'interfaccia. **Da mettere nella demo al posto di
+`docker kill`** — o meglio, accanto, perché sono due guasti diversi e il sistema li tratta in modo
+diverso.
+
+Un dettaglio onesto: alla riconnessione coord3 ha ricostruito con *"asked 0 station node(s)"*,
+perché le connessioni Erlang verso le stazioni non si erano ancora ristabilite. Ha atteso l'intera
+finestra — è il caso che avevamo corretto apposta il 25 (§7m) — e poi ha servito con tabella vuota;
+i claim sarebbero rientrati dai rinnovi entro dieci secondi. Non c'erano prenotazioni in corso, ma
+la finestra esiste e va detta.
+
+---
+
 ## 7p. M1 di A è chiusa, e undici nostri test non venivano eseguiti — 27 agosto
 
 `nota-per-B-pendenze.md`. **Il client browser è arrivato**: `station.jsp`, `js/ws.js`,

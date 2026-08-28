@@ -236,6 +236,22 @@ handle_cast({session_closed, Event}, State) ->
     vs_coord_bo:session_closed(Event),
     {noreply, State};
 
+%% Penalty accounting (M4). Same shape as session_closed and for the same
+%% reason: the station observes, the coordinator relays, and **only Java writes
+%% the counter** — nothing here keeps a second copy of it.
+%%
+%% Note what is not done: this coordinator does not suspend anybody on its own
+%% initiative. It learns of a suspension when Java tells it (`user_suspended'),
+%% because the rule "two consecutive no-shows" needs history that lives in the
+%% database, not in a process that any election can replace.
+handle_cast({no_show, _UserId, _StationId, _ConnId} = Event, State) ->
+    vs_coord_bo:penalty_event(Event),
+    {noreply, State};
+
+handle_cast({show_up, _UserId} = Event, State) ->
+    vs_coord_bo:penalty_event(Event),
+    {noreply, State};
+
 %% --- what the election tells us (M3) ---------------------------------
 
 handle_cast(become_leader, State) ->
