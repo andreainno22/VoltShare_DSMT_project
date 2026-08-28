@@ -13,9 +13,9 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 |---|---|---|
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
 | **M1** percorso base | ✅ **chiusa e verificata in Docker il 27/08**: 7 container, token emesso da Tomcat e verificato dalla stazione, `reserve` fino al coordinatore vero e ritorno, dedup provata dentro `vs_coord_srv`, lease che libera da solo, riconnessione dopo `stop station1`. Resta fuori solo la resa visiva in un browser vero (estensione non disponibile): la logica del rendering è provata con un DOM minimale, non i pixel | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
-| **M2** sessione e potenza | ⬜ canale colonnina, potenza, INSERT sessione, `session.jsp` | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
+| **M2** sessione e potenza | ✅ **chiusa il 28/08**: canale colonnina, riparto della potenza, INSERT su `sessions`, `session.jsp`, emulatore | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
 | **M3** tolleranza ai guasti | ⬜ rinnovo contro il nuovo leader, revoca, riconnessione client | ✅ **elezione, quorum, ricostruzione** — failover provato in Docker (§7m) |
-| **M4** regole di dominio | ⬜ overstay, lista d'attesa, segnalazione no_show | ✅ **penalità, notifiche, profilo** — provate contro il cluster (§7r) |
+| **M4** regole di dominio | ⬜ overstay, lista d'attesa, segnalazione no_show | ✅ **penalità, notifiche, profilo** — provate contro il cluster (§7z) |
 | **M5** consegna | ⬜ | ⬜ |
 
 ### Cosa è stato realmente eseguito
@@ -778,7 +778,7 @@ percorso dell'erogazione.
 
 ---
 
-## 7r. M4-B: penalità, notifiche, profilo — 28 agosto
+## 7z. M4-B: penalità, notifiche, profilo — 28 agosto
 
 Fatta e verificata end-to-end contro il cluster vero.
 
@@ -844,7 +844,7 @@ istante, ed è gestita dove va gestita — `recordNoShow` incrementa e rilegge c
 
 ---
 
-## 7q. La partizione si fa su un host solo — A aveva ragione, 27 agosto
+## 7y. La partizione si fa su un host solo — A aveva ragione, 27 agosto
 
 Provato il suggerimento di `nota-per-B-pendenze.md` §3, ed è **il risultato migliore della
 milestone M3**:
@@ -888,7 +888,7 @@ la finestra esiste e va detta.
 
 ---
 
-## 7p. M1 di A è chiusa, e undici nostri test non venivano eseguiti — 27 agosto
+## 7x. M1 di A è chiusa, e undici nostri test non venivano eseguiti — 27 agosto
 
 `nota-per-B-pendenze.md`. **Il client browser è arrivato**: `station.jsp`, `js/ws.js`,
 `js/station.js` su `main`, e con essi il JWT ha attraversato per la prima volta il confine fra le

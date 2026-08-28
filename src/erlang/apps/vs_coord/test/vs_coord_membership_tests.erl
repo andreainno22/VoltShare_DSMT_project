@@ -17,12 +17,18 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% Fast heartbeat so a test does not spend seconds waiting for a conclusion
-%% that production reaches in three.
--define(BEAT_MS, 40).
+%% The heartbeat interval is set far in the future on purpose: the automatic
+%% timer never fires during a test, and the beats are delivered by hand instead
+%% (see starve/1).
+%%
+%% The first version of this file did the opposite — a 40 ms beat and a sleep
+%% long enough to cover three of them. It passed for two days and then failed
+%% once the suite grew to 298 tests and 37 seconds: under load an Erlang timer
+%% is delivered late, so "three beats have certainly happened by now" stopped
+%% being true. A test that asserts on elapsed time measures the machine, not
+%% the code.
+-define(BEAT_MS, 3600000).
 -define(MISSES, 3).
-%% Comfortably more than MISSES beats, so the verdict has certainly been taken.
--define(SETTLE_MS, ?BEAT_MS * (?MISSES + 3)).
 
 setup(Peers) ->
     All = [atom_to_list(node()) | Peers],
@@ -46,6 +52,22 @@ cleanup(Pid) ->
 with(Peers, Body) ->
     {setup, fun() -> setup(Peers) end, fun cleanup/1, Body}.
 
+%% Delivers N heartbeat rounds with nobody answering, which is exactly what the
+%% timer would do — without depending on when it fires. The synchronous call
+%% after each one guarantees the message has been processed before the next.
+starve(N) ->
+    [begin
+         vs_coord_membership ! beat,
+         _ = vs_coord_membership:status()
+     end || _ <- lists:seq(1, N)],
+    ok.
+
+%% A peer announcing itself, as the real one would over the network.
+beat_from(Peer) ->
+    vs_coord_membership ! {heartbeat, Peer},
+    _ = vs_coord_membership:status(),
+    ok.
+
 %%%===================================================================
 %%% tests
 %%%===================================================================
@@ -65,13 +87,13 @@ alone_test_() ->
 %% minority side of a partition.
 minority_loses_quorum_test_() ->
     with(["vs@absent1", "vs@absent2"], fun(_) ->
-        {timeout, 10, fun() ->
-            timer:sleep(?SETTLE_MS),
+        fun() ->
+            starve(?MISSES),
             ?assertEqual(false, vs_coord_membership:in_quorum(),
                          "1 of 3 is not a majority"),
             ?assertEqual([node()], vs_coord_membership:alive(),
                          "a peer that never beats is not alive")
-        end}
+        end
     end).
 
 %% The optimistic start. Assuming the peers are up until proven otherwise is
@@ -88,38 +110,35 @@ starts_optimistic_test_() ->
 %% station top up the count would let a minority talk itself back into service.
 stranger_does_not_count_test_() ->
     with(["vs@absent1", "vs@absent2"], fun(_) ->
-        {timeout, 10, fun() ->
-            timer:sleep(?SETTLE_MS),
+        fun() ->
+            starve(?MISSES),
             ?assertEqual(false, vs_coord_membership:in_quorum()),
 
-            vs_coord_membership ! {heartbeat, 'vs@some_station'},
-            _ = vs_coord_membership:status(),
+            beat_from('vs@some_station'),
 
             ?assertEqual(false, vs_coord_membership:in_quorum(),
                          "an unconfigured node cannot restore quorum"),
             ?assertEqual([node()], vs_coord_membership:alive())
-        end}
+        end
     end).
 
 %% A peer that beats is alive, and two of three is a majority. The heartbeat is
 %% injected directly: what is under test is the counting, not the transport.
 one_live_peer_restores_quorum_test_() ->
     with(["vs@absent1", "vs@absent2"], fun(_) ->
-        {timeout, 10, fun() ->
-            timer:sleep(?SETTLE_MS),
+        fun() ->
+            starve(?MISSES),
             ?assertEqual(false, vs_coord_membership:in_quorum()),
 
-            %% Beat as one of the configured peers would, faster than the miss
-            %% window, and the verdict flips back.
-            [begin
-                 vs_coord_membership ! {heartbeat, 'vs@absent1'},
-                 timer:sleep(?BEAT_MS)
-             end || _ <- lists:seq(1, 3)],
+            %% One configured peer speaks up. Its counter resets and the recount
+            %% runs inside that same message, so the verdict flips immediately —
+            %% no waiting, and nothing to be late.
+            beat_from('vs@absent1'),
 
             ?assertEqual(true, vs_coord_membership:in_quorum(),
                          "2 of 3 is a majority"),
             ?assert(lists:member('vs@absent1', vs_coord_membership:alive()))
-        end}
+        end
     end).
 
 %% The threshold itself, stated once so a change to it fails loudly.
