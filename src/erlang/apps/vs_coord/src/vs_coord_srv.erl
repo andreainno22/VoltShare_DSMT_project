@@ -83,9 +83,9 @@ claim(ReqId, VehicleId, UserId, StationId, ConnId) ->
     gen_server:call(?SERVER, {claim, ReqId, VehicleId, UserId, StationId, ConnId}).
 
 %% The five-field entry is the contract (claim.md §3.2) and the only shape any
-%% real station sends. The implementation still tolerates the earlier three- and
-%% four-field forms; that is deliberate leniency, not part of the interface, so
-%% it is not declared here — see renew_one/4.
+%% real station sends. The earlier three- and four-field forms are no longer
+%% honoured — anything else is skipped and logged by renew_one/4, one entry at
+%% a time, without taking the coordinator down with it.
 -spec renew(pos_integer(),
             [{binary(), pos_integer(), pos_integer(), non_neg_integer(), vs_time:epoch_ms()}]) ->
           {renewed, [binary()], [binary()], vs_time:epoch_ms()}.
@@ -427,7 +427,6 @@ do_renew(_StationId, _Claims, State) when State#state.mode =:= suspended ->
 do_renew(StationId, Claims, State) ->
     Lease = vs_env:get_int("LEASE_SECONDS", 900),
     NewExpiry = vs_time:now_ms() + (Lease + State#state.grace_s) * 1000,
-    warn_if_legacy(StationId, Claims),
     {Ok, Revoked, State1} =
         lists:foldl(
           fun(Entry, Acc) -> renew_one(Entry, StationId, NewExpiry, Acc) end,
@@ -437,14 +436,6 @@ do_renew(StationId, Claims, State) ->
 
 %% Once per renewal rather than once per claim: a station on the old form sends
 %% one every 10 seconds, and a line per claim would drown the log.
-warn_if_legacy(StationId, Claims) ->
-    case lists:any(fun(E) -> tuple_size(E) =:= 3 end, Claims) of
-        false -> ok;
-        true  ->
-            logger:notice("station ~p renews without granted_at: conflicts on those "
-                          "claims are resolved with the coordinator's clock", [StationId])
-    end.
-
 %% Current form, five fields (contract PR of 24/08): `UserId' lets a leader that
 %% adopts a claim enforce suspensions straight away, without waiting for the
 %% who_do_you_hold of M3, and `GrantedAt' is the one this coordinator issued.
@@ -454,12 +445,6 @@ warn_if_legacy(StationId, Claims) ->
 %% renewal — every ten seconds, losing every claim it holds — which is a far
 %% worse failure than a missing field we can substitute. They cost three lines
 %% and remove an entire class of integration accident.
-renew_one({ClaimId, VehicleId, ConnId}, StationId, NewExpiry, Acc) ->
-    renew_one({ClaimId, VehicleId, ConnId, 0, vs_time:now_ms()}, StationId, NewExpiry, Acc);
-
-renew_one({ClaimId, VehicleId, ConnId, GrantedAt}, StationId, NewExpiry, Acc) ->
-    renew_one({ClaimId, VehicleId, ConnId, 0, GrantedAt}, StationId, NewExpiry, Acc);
-
 renew_one({ClaimId, VehicleId, ConnId, UserId, GrantedAt}, StationId, NewExpiry, {Ok, Revoked, State}) ->
     case maps:find(VehicleId, State#state.claims) of
         {ok, #claim{claim_id = ClaimId} = Existing} ->
@@ -501,7 +486,24 @@ renew_one({ClaimId, VehicleId, ConnId, UserId, GrantedAt}, StationId, NewExpiry,
                              granted_at = GrantedAt,
                              expires_at = NewExpiry},
             {[ClaimId | Ok], Revoked, store(Adopted, State)}
-    end.
+    end;
+
+%% Anything that is not a five-field entry: skipped and logged, never fatal.
+%%
+%% This replaces the three- and four-field clauses that used to be tolerated here. A agreed to
+%% removing them (nota-per-B-m2a.md §6): no station has sent those shapes since the contract
+%% settled on 24/08, so they were branches nobody could reach — and an unreachable branch is
+%% one more thing to explain, not one less.
+%%
+%% What is NOT restored along with them is the crash. The lesson of 24/08 was never "support
+%% the old tuples": it was that one unexpected message killed the process holding every claim
+%% in the network, on a message that arrives every ten seconds. So a malformed entry now costs
+%% **one claim**, not the coordinator. The station will find that claim in neither `Ok` nor
+%% `Revoked` and will renew it again on the next tick, which is the right outcome for a
+%% transient fault and a loud one for a permanent bug.
+renew_one(Malformed, StationId, _NewExpiry, Acc) ->
+    logger:warning("renew from station ~p: unusable entry ~p, skipped", [StationId, Malformed]),
+    Acc.
 
 %% The two announcement casts, applied to our own table. Separated out so that
 %% a forwarded copy takes exactly the same path as a direct one.

@@ -1,7 +1,7 @@
 package it.unipi.dsmt.voltshare.model;
 
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
+import it.unipi.dsmt.voltshare.util.Times;
 
 /**
  * Something the system needs to tell a driver who is not looking right now.
@@ -15,8 +15,6 @@ import java.time.format.DateTimeFormatter;
  * {@code getText()}.
  */
 public class Notification {
-
-    private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
 
     /** The kinds `schema.sql` documents. Kept as constants so a typo fails at compile time. */
     public static final String RESERVATION_EXPIRED = "reservation_expired";
@@ -60,8 +58,9 @@ public class Notification {
         return createdAt;
     }
 
+    /** Stored in UTC, shown in local time — see {@link Times}. */
     public String getCreatedText() {
-        return STAMP.format(createdAt);
+        return Times.format(createdAt);
     }
 
     /** A suspension is the one notice the driver must not scroll past. */

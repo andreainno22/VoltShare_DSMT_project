@@ -110,7 +110,19 @@ public class SessionDao {
     }
 
     private SessionView map(ResultSet rs) throws SQLException {
+        // getInt returns 0 for SQL NULL, so wasNull() is the only way to tell an unbilled
+        // session from a free one — and it reports on the LAST column read, which is why it
+        // is called here and not further down.
+        //
+        // It used to be evaluated at the end of the constructor call, after eight more
+        // columns. By then it was answering about overstay_seconds, which is NOT NULL, so it
+        // was always false and every unbilled session rendered as "€ 0.00" instead of
+        // "pending" — the exact distinction the comment claimed to be making. Found by A on
+        // 28/08; the window is normally one sweep, but it lasts as long as the back office is
+        // down, which is when unbilled rows pile up.
         int cost = rs.getInt("cost_cents");
+        boolean unbilled = rs.wasNull();
+
         return new SessionView(
                 rs.getLong("id"),
                 rs.getInt("station_id"),
@@ -120,9 +132,7 @@ public class SessionDao {
                 rs.getTimestamp("ended_at").toLocalDateTime(),
                 rs.getDouble("energy_kwh"),
                 rs.getInt("overstay_seconds"),
-                // getInt returns 0 for SQL NULL, so wasNull() is the only way to tell an
-                // unbilled session from a free one.
-                rs.wasNull() ? null : cost);
+                unbilled ? null : cost);
     }
 
     /**

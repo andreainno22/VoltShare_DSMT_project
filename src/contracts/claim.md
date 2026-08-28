@@ -168,11 +168,26 @@ without polling. Forwarded to Java unchanged by the coordinator; the coordinator
 state of its own.
 
 ```erlang
+%% on the wire, station → coordinator: a two-element wrapper
+{session_closed, Event}
+
+%% where Event is
 {session_closed, SessionId :: pos_integer(), UserId :: pos_integer(),
                  StationId :: station_id(), ConnId :: conn_id(),
                  EnergyKwh :: float(), OverstaySeconds :: non_neg_integer(),
                  StartedAt :: epoch_ms(), EndedAt :: epoch_ms()}
 ```
+
+**Read the wrapper carefully — it is not decoration.** The station sends `{session_closed, Event}`;
+the coordinator strips the wrapper and forwards `Event` to Java unchanged, which is why
+`erlang-java.md` §2.3 shows the flat nine-element tuple and this section shows two. Both are
+right, for different hops.
+
+An earlier version of this section described the flat tuple here as well. The code was correct
+and measured end to end; the document was not. Spelling it out because the cost of "tidying" the
+code to match the wrong document would have been silent: nine flat elements arriving where a
+two-element wrapper is expected fall into the coordinator's catch-all, no crash, no error — and
+no receipts. Found by A on 28/08.
 
 Sent by `vs_claim_client`, not by the connector: connectors never make remote calls, so the
 notification travels through the one process that already talks to the cluster.

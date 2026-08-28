@@ -146,7 +146,7 @@ public final class PenaltyService {
         users.suspendUntil(userId, until);
 
         notifications.add(userId, Notification.SUSPENDED,
-                "Reservations are suspended until " + until.withNano(0)
+                "Reservations are suspended until " + it.unipi.dsmt.voltshare.util.Times.format(until)
                         + " after " + strikesAllowed + " missed reservations in a row. "
                         + "Charging at a free connector without reserving is still available.");
 

@@ -27,7 +27,7 @@
     <c:choose>
         <c:when test="${account.suspended}">
             <div class="card warn">
-                <p><strong>Reservations are suspended until ${account.suspendedUntil}.</strong></p>
+                <p><strong>Reservations are suspended until ${account.suspendedUntilText}.</strong></p>
                 <p>You can still charge at any free connector — walking up to a free outlet needs
                     no reservation, and that has not been taken away.</p>
                 <p class="muted">The suspension followed ${strikesAllowed} missed reservations
