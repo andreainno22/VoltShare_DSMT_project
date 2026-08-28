@@ -5,10 +5,12 @@ import it.unipi.dsmt.voltshare.dao.UserDao;
 import it.unipi.dsmt.voltshare.erlang.ErlangBridge;
 import it.unipi.dsmt.voltshare.model.Notification;
 import it.unipi.dsmt.voltshare.util.Env;
+import it.unipi.dsmt.voltshare.util.Times;
 
 import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -142,11 +144,26 @@ public final class PenaltyService {
     // ---- internal ---------------------------------------------------------------
 
     private void suspend(int userId) throws SQLException {
-        LocalDateTime until = LocalDateTime.now().plusDays(suspensionDays);
+        // Truncated to the second, once, before it is used anywhere.
+        //
+        // The same instant travels to three places that disagree about fractions:
+        // `suspended_until` is a MySQL DATETIME, which has no fractional part and ROUNDS a
+        // value that has one; `toEpochSecond()` for the coordinator TRUNCATES instead; and the
+        // log keeps the nanoseconds. So the database and the coordinator could end up holding
+        // instants a second apart, and after a failover pushAllSuspensions() would replay the
+        // rounded one over the truncated one — two answers to "when does this end".
+        //
+        // A second on a one-day penalty changes nothing for a driver. It is fixed anyway
+        // because two components that are meant to agree on one instant should not be storing
+        // different numbers, and the fix is one call. Flagged in the review of PR #5.
+        LocalDateTime until = LocalDateTime.now()
+                .plusDays(suspensionDays)
+                .truncatedTo(ChronoUnit.SECONDS);
+
         users.suspendUntil(userId, until);
 
         notifications.add(userId, Notification.SUSPENDED,
-                "Reservations are suspended until " + it.unipi.dsmt.voltshare.util.Times.format(until)
+                "Reservations are suspended until " + Times.format(until)
                         + " after " + strikesAllowed + " missed reservations in a row. "
                         + "Charging at a free connector without reserving is still available.");
 
