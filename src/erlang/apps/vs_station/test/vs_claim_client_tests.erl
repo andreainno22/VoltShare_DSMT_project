@@ -215,6 +215,30 @@ station_stats_follow_the_reservations_test() ->
         end)
     end).
 
+%% `suspended' counts as charging. It is not a state of the connector's
+%% machine but what a charging session at a limit of zero reports since
+%% M2 step 2, so without its own clause it would fall into the catch-all
+%% and vanish from the three numbers — a connector with somebody's car in
+%% it, reported to the lobby as neither free, nor held, nor charging.
+%%
+%% count_stats/1 is a function of a map, so the map is built by hand
+%% here: no station, no allocator, no budget small enough to starve
+%% anybody, just the shape the manager pushes.
+suspended_counts_as_charging_in_the_lobby_stats_test() ->
+    Push = fun(States) ->
+                   #{connectors => [#{connector_id => N, state => S}
+                                    || {N, S} <- lists:enumerate(States)]}
+           end,
+    ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(Push([suspended]))),
+    %% and it adds to the same total as a charging one, rather than
+    %% replacing it
+    ?assertEqual({1, 1, 3}, vs_claim_client:count_stats(
+                              Push([free, held, charging, suspended, closing]))),
+    %% offline is still nothing, which is why the three may add up to
+    %% less than the number of connectors
+    ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(
+                              Push([offline, suspended]))).
+
 revocation_travels_from_coordinator_to_connector_test() ->
     with_station(fun() ->
         {ok, Pid} = vs_station_mgr:connector_pid(?CONN),

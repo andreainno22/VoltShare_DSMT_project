@@ -1058,6 +1058,995 @@ Nel merito dimostra la stessa cosa, e in più è vera.
 
 ---
 
+## 7p. M2-A passo 1: il canale colonnina — 27 agosto
+
+Branch `a/m2-chargepoint`. Nuovi `vs_cp_proto`, `vs_cp_ws`, `src/emulator/cp.js`; modificati
+`vs_connector` (D1-D5), `vs_station_app` (secondo listener), `vs_station_db`
+(`user_for_vehicle/1`). Contratto `contracts/ws-chargepoint.md` **non toccato**: è
+implementabile com'è scritto, incluse le tre assenze che sembrano dimenticanze e non lo sono
+(nessuna cache di dedup, nessun frame `error`, nessun ack sugli eventi — vedi
+`scelte_di_progetto.md` §11.9).
+
+Prima di questo passo, `plugged`/`meter`/`unplugged` esistevano come API di `vs_connector` e
+**nessun codice di produzione le chiamava**: solo i test. Il sistema sapeva prenotare e non
+sapeva caricare.
+
+### Le tre premesse che il piano dichiarava NON VERIFICATE — ora misurate
+
+| Premessa | Misura | Esito |
+|---|---|---|
+| Suite attuale 133 test, 0 fallimenti | `rebar3 eunit` (senza `--app`), 27/08 | **verificata**: 133/0 esatti |
+| Node sul host ha il `WebSocket` globale | `node --version` → v24.18.0; `typeof WebSocket` → `function` | **verificata** |
+| Un secondo listener cowboy convive col primo | app vera avviata, `cowboy:start_clear(vs_cp_listener, 8081)` accanto a `vs_driver_listener`, GET su entrambe le rotte | **verificata**: `{ok,Pid}`, `426 Upgrade Required` da 8080/ws/driver **e** da 8081/ws/cp, ranch non si lamenta |
+
+La terza è stata provata **prima** di scrivere il listener vero, con un modulo usa-e-getta:
+se ranch avesse protestato, il piano andava fermato lì e non dopo due ore di codice.
+
+### Verificato — girato davvero
+
+- **Suite: 180 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 133 di baseline + 47 nuovi:
+  18 su `vs_connector` (D1-D5, grazia, sostituzione socket, riconciliazione) e 29 su
+  `vs_cp_proto` (handshake e 4404, boot/ack, heartbeat, i quattro esiti del `plugged`,
+  meter/unplugged/status, envelope, e le quattro verdette del trasporto — 4404, 4409,
+  encoding del comando, shutdown).
+- **Sessione walk-in completa sul compose**, emulatore dal host contro
+  `ws://localhost:9201/ws/cp?station_id=1&connector_id=3`, connettore 3: `boot` → ack
+  (heartbeat 30 s, meter 5 s, limit 0) → `plugged` → `set_limit 150` dal connettore → `meter`
+  → `unplugged`. **Emulatore `final energy_kwh = 1.206`, log stazione
+  `session closed (not yet persisted): … energy_kwh => 1.206`: differenza 0.000**, contro una
+  tolleranza dichiarata di ±0.01. La sessione è stata letta dal log della stazione, non da
+  `station.jsp`.
+- **Riconciliazione §6 sul compose**: `docker restart station1` con l'emulatore in carica a
+  **1.417 kWh**. La stazione, andandosene, ha mandato `stop {reason: station_shutdown}` e ha
+  chiuso 1001; l'emulatore ha tenuto cavo e contatore, si è riconnesso col backoff
+  (1 s → 2 s), ha rimandato `boot` (`status: occupied`) e `plugged` con
+  `energy_kwh: 1.417`, e la stazione ha **adottato** la sessione: il `meter` successivo
+  riporta 1.625 — mai indietro. `started_at` della riga è l'istante dell'adozione, non del
+  cavo: la stazione non ha memoria del pre-crash e §6 fa fede al totale del contatore.
+- **Grazia dei tre heartbeat, sul compose**: emulatore ucciso a sessione in corso. Il log dice
+  `connector 3: no charge point for 90000 ms mid-session - closing with the last measured
+  energy` — 90 s = `CP_HEARTBEAT_MISSED × CP_HEARTBEAT_INTERVAL_S` letti dall'ambiente, non
+  una costante — e la riga è stata scritta con **2.875 kWh**, esattamente l'ultimo `meter`
+  ricevuto. Poi `out_of_service`.
+- **Rientro in servizio**: un nuovo `boot` con `status: available` →
+  `charge point reports available - back in service` → `free`, e la sessione successiva è
+  finita nel modo ordinario (`energy_kwh => 0.583`, di nuovo pari al totale dell'emulatore).
+  È la prova E2E che `after_closing` è una bandierina di sola andata (§11.5).
+- **I due listener convivono nel container**: `GET :9101/ws/driver` → `426 Upgrade Required`,
+  `GET :9201/ws/cp` → `426 Upgrade Required`, dopo tutto quanto sopra.
+- **`warnings_as_errors` attivo**: la build passa pulita, nessun `catch Expr` deprecato.
+
+### Non provato — e perché
+
+- **`station.jsp` non è stato aperto in Chrome.** La sessione walk-in è stata verificata dal
+  log della stazione, che è l'alternativa prevista. Manca quindi la conferma visiva che
+  `out_of_service` e la sessione arrivino fino alla pagina — anche se la catena è verificata
+  per struttura (`wire_connector_state/1` ha la clausola passante, l'enum di `ws-driver.md`
+  §5.1 contiene già `out_of_service`).
+- **Un connettore che crasha a sessione in corso** riparte `free` con `cp = undefined`, e
+  niente dice al socket CP di riagganciarsi: i comandi smettono di fluire fino alla
+  riconnessione del socket. È semantica di riavvio già presente da M1, non introdotta qui, e
+  il `meter` successivo finisce nel log "meter senza sessione" invece che nel vuoto. Non
+  allargato: il rimedio è un `attach_cp` scatenato dal `connector_up`, che tocca il manager.
+- **La notifica `session_interrupted` non arriva al browser.** Il connettore *emette* l'evento
+  verso il manager, come già fa per `claim_revoked`, ma il frame `notification` di
+  `ws-driver.md` non è implementato sul canale driver (verificato: nessun builder in
+  `vs_driver_proto`). Fuori perimetro, com'era per gli eventi di M1.
+- **`user_for_vehicle/1` è uno stub dichiarato**: risponde l'identità e lo scrive nel log a
+  ogni chiamata. Finché non c'è la SELECT del passo 3, un walk-in apre la sessione su
+  `user_id = vehicle_id` — corretto per il seed dove i due coincidono, falso altrove.
+- **Il rifiuto 4409 non è stato provato su un socket vero**: c'è il test del trasporto
+  (`{cp_replaced}` → close 4409) e quello del connettore (il vecchio pid riceve
+  `{cp_replaced}`), ma due emulatori sullo stesso connettore non sono mai stati messi in
+  concorrenza sul compose.
+- **La seconda uscita da `out_of_service` non è stata provata E2E.** L'adozione di §6 su un
+  connettore fuori servizio (colonnina tornata `occupied` dopo la grazia, `plugged` col
+  cumulativo) ha il test unitario ma non uno scenario sul compose: servirebbe un
+  `docker network disconnect` di oltre 90 s tenendo vivo l'emulatore. Il buco è stato trovato
+  in revisione, non dai test: tutti gli scenari eseguiti rientravano in servizio da un
+  connettore libero, dove basta `available`.
+- **`limit_kw: 0` come "sospeso"** è implementato e coperto dai test unitari, ma nessuno
+  scenario E2E lo ha esercitato: nel passo 1 il limite viene impostato una volta sola e non
+  scende mai. Sarà lo scenario naturale del passo 2, quando l'allocatore ripartisce.
+
+### Catena dei chiamanti: una voce che il piano non aveva
+
+Il piano (§6) elencava sei funzioni modificate. La ricerca per struttura (grep sui nomi, non
+sui file attesi) ne ha trovata una settima, e per fortuna non richiede modifiche:
+`vs_claim_client:count_stats/1` legge lo stato dei connettori per le `station_stats` verso il
+coordinatore. Ha un catch-all `_ -> {F, H, Ch}`, quindi `out_of_service` viene contato come
+niente — la stessa semantica di `offline`, che è quella giusta. Se il catch-all non ci fosse
+stato, un connettore guasto avrebbe fatto crashare il client dei claim.
+
+---
+
+## 7q. M2-A passo 2: il riparto della potenza — 27 agosto
+
+Branch `a/m2-power`, da `a/m2-chargepoint`. Nuovo `vs_power` (modulo puro) più i suoi test;
+modificati `vs_station_mgr` (ricalcolo, tick, `allocated_kw`), `vs_connector`
+(`build_snapshot`: `suspended` derivato e `max_kw` nello snapshot) e
+`vs_claim_client:count_stats/1`. **Nessun contratto toccato**, `ws-driver.md` e
+`ws-chargepoint.md` compresi: `suspended` era già nell'enum di §5.1 e `MIN_CHARGE_KW` già in
+§10.
+
+Prima di questo passo il limite era quello interinale di D5 — `min(rated_kw, max_kw)`, deciso
+una volta all'ingresso in `charging` e mai più toccato. Con due auto sulla stazione 2 la somma
+faceva 150 + 50 = 200 kW su un sito da 180: il buco che il passo 1 dichiarava e che questo
+chiude.
+
+### Una premessa del piano era falsa, ed è stata corretta prima di iniziare
+
+Il piano diceva «base: `a/m2-chargepoint` (passo 1 committato)». **Non lo era**: l'ultimo
+commit del branch era il merge di M1, e tutto il passo 1 stava nel working tree, non
+versionato. Il contenuto era giusto — la baseline ha dato i 180 test attesi — ma il passo 2
+sarebbe nato mescolato al passo 1 in un albero sporco, senza uno stato a cui tornare. Il passo
+1 è stato committato (`b9ee35e`) su richiesta esplicita, e `a/m2-power` parte da lì.
+
+### Le tre premesse che il piano dichiarava NON VERIFICATE — ora misurate
+
+| Premessa | Misura | Esito |
+|---|---|---|
+| Baseline 180 test, 0 fallimenti | `rebar3 eunit` (senza `--app`), 27/08 | **verificata**: 180/0 esatti |
+| L'emulatore applica un `set_limit` che **scende** a sessione in corso | una sola auto in carica a 150 kW su st. 2/conn 5, `vs_connector:set_limit(Pid, 20)` a mano via rpc | **verificata**: comando a `13:15:11.3`; `meter` a +4.3 s → 37.7 kW (rampa a metà, interpolazione esatta), `meter` a +9.3 s → **20 kW**. Dentro `LIMIT_APPLY_SECONDS` (5 s) più un intervallo di contatore |
+| Due emulatori concorrenti sulla stessa stazione | conn 5 (150 kW) e conn 6 (50 kW) in carica insieme su st. 2 | **verificata**: nessun 4409, nessun socket rimpiazzato, nessun frame incrociato. Ognuno tiene il proprio limite e la propria sequenza di `request_id`; conn 5 è rimasto a 20 kW mentre conn 6 saliva a 50 |
+
+La seconda e la terza sono esattamente ciò che il passo 2 mette sotto sforzo per la prima
+volta: se l'emulatore non avesse obbedito a un limite in discesa, l'allocatore non avrebbe
+avuto modo di funzionare e il difetto sarebbe stato lì.
+
+### Verificato — girato davvero
+
+- **Suite: 217 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 180 di baseline, **+37 netti**:
+  28 su `vs_power` (i sei scenari attesi, quattro proprietà su uno sweep deterministico di 112
+  casi, gli angoli della sospensione, e `demand_kw`/`demands`), 6 su `vs_station_mgr`
+  (allocazione, invariante, partenza, tick/taper, sospensione, il non-ciclo — sei, ma uno
+  **sostituisce** il test M1 di `allocated_kw`, quindi +5 su quel file), 3 su
+  `vs_connector` (limite zero → `suspended`, `plugged` senza `max_kw`, `max_kw` nello
+  snapshot), 1 su `vs_claim_client` (`suspended` conta come `charging`).
+- **I sei scenari del piano §8 escono esatti**, confronto con tolleranza dichiarata (0.001), non
+  con `=:=`:
+
+  | Scenario | Domande (kW) | Budget | Atteso | Osservato |
+  |---|---|---|---|---|
+  | St. 2, una 150 | 150 | 180 | 150 | **150** |
+  | St. 2, 150 + 50 | 150, 50 | 180 | 130, 50 | **130, 50** |
+  | St. 2, tre auto | 150, 50, 50 | 180 | 80, 50, 50 | **80, 50, 50** |
+  | St. 1, quattro auto | 150, 150, 150, 50 | 350 | 100, 100, 100, 50 | **100, 100, 100, 50** |
+  | St. 1, taper | 150, 150, 45, 50 | 350 | 127.5, 127.5, 45, 50 | **127.5, 127.5, 45, 50** |
+  | Sospensione (budget forzato) | 50, 50, 50 | 15 | 7.5, 7.5, 0 | **7.5, 7.5, 0** |
+
+- **E2E sul compose, stazione 2 (budget 180), tre fasi:**
+
+  | Momento | Atteso | Osservato | Ritardo |
+  |---|---|---|---|
+  | Una 150 kW sul conn 5 | limite 150, `allocated_kw` 150 | **150.0 / 150.0** | — |
+  | Arriva una 50 kW sul conn 6 | limiti 130 e 50, `allocated_kw` 180 | **130.0 e 50.0 / 180.0** | `plugged` a `13:34:28.627`, nuovo limite al conn 5 a `13:34:28.632` — **5 ms** |
+  | La seconda se ne va (`stop_session` → `unplugged`) | il primo torna a 150 | **150.0 / 150.0** | stop a `13:34:48.317`, nuovo limite a `13:34:48.319` — **2 ms** |
+
+  I contatori si sono assestati sui valori concessi esatti (130 e 50 kW), dopo la rampa
+  `LIMIT_APPLY_SECONDS`. Il riparto è **guidato dagli eventi**: nessuna delle due transizioni
+  ha aspettato il tick, che serve solo al taper.
+- **`allocated_kw =< site_power_kw`** è un test dell'invariante, non un'osservazione: il campo
+  è la somma dell'allocazione memorizzata, quindi vale per costruzione.
+- **Il ricalcolo non si autoalimenta**: un test tiene il tick a 20 ms con una sessione viva e
+  verifica che in 200 ms (≈10 ricalcoli) arrivino **zero** push ai sottoscrittori.
+  `charging(cast, {set_limit,_})` non emette `notify`, e il test è lì perché smetta di essere
+  vero rumorosamente se qualcuno gliela aggiunge.
+- **`warnings_as_errors` attivo**: build pulita da `_build` svuotato.
+
+### Non provato — e perché
+
+- **`station.jsp` non è stato aperto in Chrome.** L'E2E è stato letto da `station_state` via
+  rpc, non dalla pagina. Manca quindi la conferma visiva che `allocated_kw` che cambia e uno
+  stato `suspended` arrivino fino al browser — la catena è verificata per struttura
+  (`wire_connector_state/1` ha la clausola passante, `station.js:99` legge `allocated_kw`), non
+  per osservazione. È lo stesso buco del passo 1.
+- **La sospensione non è stata vista girare sul compose, e non può esserlo con i budget veri**:
+  350/4 = 87.5 e 180/3 = 60, entrambi molto sopra i 6 kW di `MIN_CHARGE_KW`. È coperta da test
+  unitari e da un test del manager con `site_power_kw` forzato a 8; per mostrarla nella demo
+  serve un `SITE_POWER_KW` ridotto via ambiente. Scritto qui invece di lasciar credere che il
+  caso sia stato osservato.
+- **Il taper non è stato osservato E2E**: portare un'auto sopra l'80% di SoC richiede minuti di
+  carica reale. È coperto dal test del manager (`the_power_tick_is_what_notices_a_taper_test`,
+  con tick a 50 ms) e dai test di `demand_kw`, ma nessuna auto vera è arrivata all'80% con un
+  vicino che ne raccogliesse l'avanzo.
+- **Tre auto insieme sulla stessa stazione** non sono state provate sul compose: l'E2E ne ha
+  usate due. Lo scenario a tre è un test unitario (80/50/50), non un'osservazione.
+- **La stazione 1 non è stata toccata**: l'E2E è tutto su st. 2. Gli scenari a quattro auto e
+  con il taper sono aritmetica verificata, non un compose osservato.
+- **`vs_station_db` resta lo stub del passo 1**: le sessioni non finiscono ancora su MySQL, e il
+  passo 2 non lo cambia (fuori perimetro).
+
+### Catena dei chiamanti: quattro voci che il piano non aveva
+
+La tabella §7 del piano elencava cinque funzioni. La ricerca per struttura ne ha aggiunte
+quattro, e una era una trappola vera:
+
+1. **`vs_cp_proto:limit_kw/2`** chiama `snapshot/1` per l'ack del `boot`. Innocuo — legge
+   `session.limit_kw`, non `state` — ma è un consumatore reale che il piano non aveva.
+2. **`vs_driver_ws:state_tick`** rilegge `station_state()` su un proprio timer da 5 s. È la
+   ragione per cui il power tick **non** fa broadcast: la pagina vede il taper lo stesso, e
+   spingere da entrambe le parti raddoppierebbe il traffico.
+3. **`allocated_kw` non è letto "solo da `wire_state` e `station.js`"**: lo leggono anche
+   `vs_driver_stub.erl:120` e tre asserzioni nei test.
+4. **La trappola.** Il piano non prevedeva l'interazione fra `suspended` derivato e il
+   ricalcolo: dopo la derivazione il manager vede `suspended` dove vedeva `charging`, e un
+   filtro su `state =:= charging` avrebbe tolto la sessione dal riparto **nell'istante in cui
+   la sospende** — fame permanente invece che di un tick. `vs_power:demands/3` accetta
+   entrambi gli stati e ha un test dedicato.
+
+### Una regola del piano raffinata, con conferma esplicita prima di scrivere
+
+La sospensione letterale del piano — «finché una quota è sotto soglia, sospendi quella con
+`started_at` maggiore» — sbaglia bersaglio quando la fame nasce dalla *domanda* invece che dal
+*budget*. Domande di 3 e 50 kW su 180 di budget: la 3 prende 3 (sotto soglia) → si sospende la
+50 perché è la più recente → resta la 3 da sola, ancora sotto soglia → si sospende anche quella
+→ zero allocato con 180 kW liberi.
+
+Il raffinamento, approvato prima di toccare il codice: se la quota sotto soglia coincide con la
+domanda della sessione stessa, quella sessione non può essere alzata togliendo nessun altro, e
+va lei. «L'ultimo arrivato» resta la regola dove è stata progettata, cioè sotto pressione di
+budget. **I sei numeri attesi sono identici sotto le due letture** — cambia solo quell'angolo —
+e la proprietà «nessuna allocazione fra 0 e `MIN_CHARGE_KW` esclusi» diventa esattamente vera.
+
+### Un difetto dell'emulatore, trovato dall'E2E — e poi corretto
+
+`cp.js` confrontava il limite in arrivo con quello **interpolato** in quel momento invece che
+con il proprio bersaglio, quindi una ripetizione dello stesso valore mentre la rampa è a metà la
+faceva ripartire dal punto in cui era. Con `set_limit` re-inviato a ogni tick — che è
+ws-chargepoint.md §5 alla lettera — succedeva a ogni ricalcolo: convergeva (i contatori avevano
+chiuso su 130 e 150 kW esatti) ma allungava la rampa, e il tempo di applicazione misurato nella
+demo sarebbe stato più lungo di quello vero.
+
+Segnalato alla fine del passo 2 e **corretto subito dopo**, insieme al lock-in del taper (§7r):
+il confronto è ora con `limit.target`. Verificato dopo la correzione: `20 → 150` seguito da
+quattro `set_limit 20` a un secondo l'uno dall'altro produce **una sola** riga di log, e il
+contatore a +3.4 s legge 36.7 kW — l'interpolazione esatta da un'unica partenza, cioè la prova
+che la rampa non è ripartita.
+
+---
+
+## 7r. Due correzioni al passo 2, prima di committare — 27 agosto
+
+Sempre su `a/m2-power`, prima del commit. Due difetti trovati **in revisione, nessuno dei due
+dai test**: è il dato interessante di questa voce, perché entrambi vivono in un angolo che i
+budget veri non raggiungono mai e che quindi nessuno scenario eseguito aveva toccato.
+Perimetro: `vs_power.erl`, `vs_power_tests.erl`, `src/emulator/cp.js`. L'algoritmo di riparto
+(`fair_share/2`, `allocate/4`, `starved/3`, `victim/1`) **non è stato toccato**.
+
+### Difetto 1 — la sospensione era permanente sopra la soglia del taper
+
+Il gemello del lock-in che la soglia sul SoC doveva evitare, rientrato attraverso `power_kw`:
+
+```
+sospesa → limit_kw 0 → il CP applica 0 → meter riporta power_kw = 0
+        → demand = min(Ceiling, 0 + TAPER_MARGIN_KW) = 5
+        → 5 < MIN_CHARGE_KW (6), e Got >= demand ⇒ è `demand'-bound
+        → victim/1 la preferisce a chiunque ⇒ sospesa di nuovo, per sempre
+```
+
+Un consumo misurato **mentre la sessione è a zero** non dice niente sulla curva della batteria:
+dice che le abbiamo tolto la corrente. La correzione è in `demand_kw/3` — il ramo del taper
+chiede due cose, sopra la soglia **e** `limit_kw =/= 0.0` — e sta in `scelte_di_progetto.md`
+§12.3 con il perché.
+
+**I due test nuovi sono stati eseguiti prima della correzione, e come falliscono è il dato:**
+
+| Test | Prima | Dopo |
+|---|---|---|
+| `a_suspended_session_above_the_threshold_asks_for_its_ceiling_test` | `expected: 150.0 / got: **5.0**` | passa |
+| `a_session_suspended_above_the_threshold_comes_back_test` | la sospesa resta a **0.0** col budget interamente libero | risale a 12.0 |
+
+Il secondo è il ciclo completo — tre sessioni, budget stretto, una sospesa a SoC 85; poi le
+altre due se ne vanno e al ricalcolo successivo la sospesa deve risalire. Il primo da solo non
+basta: descrive un numero, non il difetto. `a_suspended_session_still_takes_part_test` (SoC 22,
+copre l'altro lock-in, quello di `is_live/1`) continua a passare e resta separato: i due si
+somigliano e non vanno fusi.
+
+*Conseguenza sui test esistenti.* L'helper `snapshot/4` dei test fissava `limit_kw => 0.0`,
+quindi ogni test del taper descriveva uno stato impossibile — 40 kW che scorrono con un limite
+di zero. Adesso l'helper usa il proprio `Ceiling` come limite e c'è `snapshot/5` per chi vuole
+una sessione davvero sospesa. Nessun numero atteso è cambiato: i 28 test preesistenti passavano
+già prima della correzione con il nuovo helper.
+
+### Difetto 2 — `setLimit` dell'emulatore faceva ripartire la rampa
+
+Descritto in §7q e corretto qui: il confronto è ora con `limit.target` invece che con il valore
+interpolato. Verifica eseguita su una stazione usa-e-getta con `SITE_POWER_KW=20`, così che le
+ripetizioni identiche siano quelle che il contratto stesso produce a ogni tick:
+
+- `limit 20 -> 150` a `14:11:23.055`, poi quattro `set_limit 20` a un secondo l'uno dall'altro;
+- il log mostra **una sola** riga `limit 71.7 -> 20` (`14:11:25.045`) — le tre ripetizioni non
+  producono niente, e nemmeno i tick della stazione;
+- contatore a +3.4 s: **36.7 kW**, che è `71.7 + (20 − 71.7) × 3.385/5` esatto — la rampa è
+  partita una volta sola;
+- primo contatore dopo la finestra di 5 s: **20 kW**.
+
+La partenza da 71.7 e non da 150 è la parte giusta del comportamento: un valore davvero nuovo
+riparte da dove l'hardware è, non da dove gli era stato detto di arrivare.
+
+### Suite
+
+**219 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`): 217 del passo 2 più i due nuovi.
+Compilazione pulita da `_build` svuotato, `warnings_as_errors` attivo.
+
+---
+
+## 7s. M2-A passo 3: la riga su `sessions` — 27 agosto
+
+Branch `a/m2-db`, da `a/m2-power` (`21ba127`). `vs_station_db` diventa un gen_server con una
+connessione `mysql-otp`; nuova `vs_claim_client:session_closed/1`; `vs_connector:closing/3`
+perde il `case` sull'esito della scrittura; `vs_station_sup` guadagna un figlio. Nuova
+dipendenza `{mysql, "1.8.0"}`, `rebar.lock` aggiornato. **`schema.sql` non toccato**: la
+tabella si usa com'è.
+
+Con questo, la catena è chiusa da capo a fondo per la prima volta: l'auto carica, la stazione
+scrive la riga, il coordinatore sveglia Java, Java la fattura. Fino a ieri la fatturazione
+girava su righe inserite a mano.
+
+### Una premessa del prompt era vecchia di due ore
+
+Il prompt dava la baseline a 217 test. Sono **219**: i due test aggiunti dal commit `21ba127`
+(le correzioni al passo 2), che il piano precede. Discrepanza spiegata per intero, non un
+mistero: si riparte da 219.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline `rebar3 eunit` (mai `--app`) | 27/08 | **219 test, 0 fallimenti** (non 217 — vedi sopra) |
+| `mysql-otp` 1.8.0 compila su OTP 29 | `{mysql, "1.8.0"}` in `rebar.config` + `rebar3 compile` | **verificata**: compila. Due warning nel sorgente della dipendenza (`catch` deprecato, `0.0` che non matcha `-0.0`), già coperti dall'`overrides` che toglie `warnings_as_errors` alle dipendenze |
+| Il nodo Erlang raggiunge MySQL | connessione dal container `station2` con le credenziali del compose | **verificata**: `SELECT 1` → `[[1]]`; `vehicles` → `[[1,1],[2,2]]`; `sessions` → 0 righe (quindi nessun residuo di `cc-probe` che disturbi — la quarta premessa NON VERIFICATA del piano, chiusa) |
+
+*Di passaggio, e vale la pena:* il container MySQL gira con `time_zone = SYSTEM` e
+`NOW() = UTC_TIMESTAMP()`. Cioè `FROM_UNIXTIME()` oggi avrebbe dato lo stesso risultato — ed è
+esattamente perché non la si usa: funzionerebbe finché nessuno cambia il fuso del container.
+
+### Verificato — girato davvero
+
+- **Suite: 244 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 219 di baseline + 25 nuovi:
+  23 su `vs_station_db` (l'orologio verso UTC compresa un'ora legale e un cambio d'ora, la riga
+  colonna per colonna, la tupla di `erlang-java.md` §2.3 campo per campo, la coda, il tetto, il
+  ritenta, il rifiuto del server contro la connessione caduta, la riconnessione, e i quattro
+  esiti di `user_for_vehicle/1`) e 2 su `vs_connector`. **Nessuno richiede MySQL**: la parte che
+  conta è il comportamento quando il database *non* risponde, e un test che avesse bisogno di un
+  database funzionante non potrebbe produrlo su richiesta.
+- **Sessione completa → una riga.** Emulatore su st. 2/conn 5, veicolo 2:
+  `final energy_kwh = 1.164`, riga `energy_kwh = 1.164` — **differenza 0.000**. Log stazione:
+  `session 1 written: connector 5, user 2, 1.164 kWh`.
+- **Le date, lette in SQL.** Emulatore `plugged` alle `15:04:52.237`, `unplugged` alle
+  `15:05:20.259` (il log di `cp.js` è in UTC, `toISOString`); riga
+  `started_at = 15:04:52`, `ended_at = 15:05:20`. **Coincidono al secondo, in UTC.** Confermato
+  da una seconda sessione: plugged `15:16:33.356` / unplugged `15:17:06.455` → riga
+  `15:16:33` / `15:17:06`.
+- **`cost_cents` NULL all'inserimento.** Non si riesce a *vederlo* nel giro normale, perché
+  B fattura in 38 ms (sotto); osservato fermando il back office: riga `[5, 1, 2, 7, …, 0.458, 0,
+  **null**]`. Al riavvio la spazzata periodica l'ha prezzata da sola
+  (`15:20:55 Billed 1 session(s)`, costo 19) — cioè la proprietà del contratto "perdere l'evento
+  ritarda una ricevuta di un intervallo e non perde niente", vista girare.
+- **La catena fino a Java, cronometrata.** Sessione finita alle `15:17:06.455`; back office:
+  `15:17:06.493 BillingService.sweep Billed 1 session(s)`. **38 ms**, che non è la spazzata da 60
+  secondi: è la sveglia `session_closed` che l'ha fatta partire prima. È anche la prova che la
+  tupla di §2.3 è nella forma giusta — un campo fuori posto non avrebbe dato errore da nessuna
+  parte, e questo è l'unico modo di accorgersene senza guardare una fattura.
+- **La prova che conta: MySQL fermo.** Sessione avviata con MySQL su, `docker stop mysql` a
+  sessione in corso, poi chiusura:
+
+  | | MySQL su | MySQL fermo |
+  |---|---|---|
+  | percorso di `closing`, dal cast `unplugged` al `free` | **12 µs** | **44 µs** |
+
+  Microsecondi in entrambi i casi: nessun ritardo misurabile, che è il punto dell'INSERT
+  asincrono. Connettore `free`, **1 riga in coda**. Al `docker start mysql` la riga è comparsa
+  **da sola entro ~1 s** dal momento in cui MySQL è tornato sano — dentro `DB_RETRY_MS` (5 s) —
+  con `session 3 written` nel log e nessun intervento.
+- **Una riga per sessione, mai due**: cinque sessioni, cinque righe, id da 1 a 5, nessun
+  duplicato — compresa quella passata dalla coda.
+- **`warnings_as_errors` attivo**: build pulita da `_build` svuotato.
+
+### Un difetto trovato dall'E2E, che i test non avevano preso
+
+Il timer del ritenta fa due lavori — svuotare la coda **e** riaprire la connessione — e una coda
+vuota lo cancellava. Una stazione che aveva scritto tutto e poi perdeva MySQL restava con coda
+vuota e nessuna connessione: **cancellava la propria riconnessione e non ne apriva più un'altra.**
+MySQL tornava su e la stazione continuava a rifiutare ogni walk-in, perché `user_for_vehicle/1`
+rispondeva `no_connection` per sempre — senza un errore da nessuna parte che lo spiegasse.
+
+Trovato perché dopo un `docker start mysql` la stazione andava avanti a rifiutare l'emulatore. Le
+due clausole di `flush/1` sono ora nell'ordine opposto. Il test che lo copre tiene il guasto più
+lungo del primo ritenta: scritto prima in una versione che *passava lo stesso* — la connessione
+riusciva al primo tentativo e il ramo difettoso non veniva mai attraversato — e reso capace di
+fallire prima di correggere. Senza quel passaggio sarebbe rimasto un test verde su un difetto
+vivo.
+
+### Non provato — e perché
+
+- **`history.jsp` non è stata aperta.** Due ostacoli, entrambi fuori dal mio controllo:
+  l'estensione Chrome non risulta connessa (`Browser extension is not connected`), e non ho la
+  password di `lore` né di `cc-probe` — gli utenti sono di B e le loro credenziali non stanno nel
+  repo. **La verifica del fuso è quindi fatta a metà**: le date coincidono al secondo lette in
+  SQL, ma nessuno ha ancora confermato che appaiano con la stessa ora nella pagina. È l'unica
+  metà che potrebbe nascondere un errore di un'ora, perché lì passa dal `getTimestamp` di B.
+- **Il tetto della coda non è stato provato E2E**: 100 righe richiedono cento sessioni. Coperto
+  da un test unitario con `queue_max => 3`.
+- **La riga persa alla morte del nodo** (la finestra dichiarata) non è stata provocata: servirebbe
+  un `docker kill` cronometrato fra il cast e l'INSERT. Il `terminate/2` che la scrive nel log
+  esiste e non è stato visto scattare.
+- **Il seed non distingue lo stub dalla SELECT vera** per i veicoli che ha: `vehicles` mappa 1→1
+  e 2→2, quindi identità e query danno lo stesso risultato. Quello che *distingue* è il veicolo
+  88 dell'esempio del passo 1, ora rifiutato (`no account for vehicle 88`) — ed è stato visto.
+- **`overstay_seconds` è sempre 0**: è M4, e il campo è scritto come valore dichiarato, non
+  mancante.
+
+### Catena dei chiamanti: quattro voci che il piano non aveva
+
+1. **`vs_cp_stub` è un secondo `db_mod`** che la tabella §6 non elenca: implementa
+   `user_for_vehicle/1` per i test di `vs_cp_proto`. Non implementa `insert_session/1`, quindi il
+   passaggio a cast non lo tocca — ma è un'implementazione in più da tenere allineata.
+2. **`{session_closed, Row}` esisteva già** come nome di evento del connettore verso il manager
+   (`vs_connector.erl:538`), ed è una cosa diversa dalla `vs_claim_client:session_closed/1` nuova
+   verso il coordinatore. Stesso nome, due direzioni, due righe di distanza nello stesso file.
+3. **La forma sul filo non è quella che sembra.** `vs_coord_srv` fa match su
+   `{session_closed, Event}` — una tupla a **due** elementi che ne avvolge una a nove — mentre
+   `station_stats`, che il piano indica come modello, viaggia piatta a cinque. Mandare i nove
+   campi piatti sarebbe caduto nel catch-all del coordinatore: un warning in un log che nessuno
+   guarda, e una ricevuta che non arriva mai. Verificato leggendo `vs_coord_srv:203-265` e
+   `vs_coord_bo:126`, non assunto dal nome.
+4. **`db_mod` è iniettato anche in `vs_cp_proto`** (`:86`), non solo nel connettore: due percorsi
+   indipendenti verso lo stesso modulo.
+
+### Una conseguenza di progetto da mettere agli atti
+
+Con MySQL fermo un walk-in **non può cominciare**: `user_for_vehicle/1` non ha risposta e il
+`plugged` viene rifiutato. Le sessioni già in corso si chiudono normalmente e le loro righe si
+accodano. L'autonomia della stazione vale quindi per *finire* di caricare, non per *cominciare*
+— e il commento di D1 (`user_for_vehicle` sta alla stazione «perché il walk-in deve funzionare
+mentre il sito è isolato») va letto con questo in mano: MySQL è remoto quanto il coordinatore. Il
+beneficio vero di quella scelta resta un altro e regge: `vehicles` è una tabella del back office
+che il coordinatore non possiede.
+
+---
+
+## 7t. Lotto 1 delle correzioni della review — 27 agosto
+
+Una sessione di review su M2-A (`REVIEW_M2A_ESITO.md`) ha trovato nove difetti, ognuno con un
+test scritto per fallire. Quattro toccano quanto un driver paga, e sono questi. Gli altri cinque
+(D-3 oscillazione del taper, D-4 sessione senza `max_kw`, D-5 riga persa in silenzio, D-8
+prenotazione che trapela nello snapshot, D-9 novanta secondi che diventano centottanta) vanno nel
+lotto 2 e sono stati **lasciati stare apposta**: le loro cinque prove continuano a fallire, ed è
+il controllo che la correzione non ha effetti fuori dal suo perimetro.
+
+**Le due verifiche bloccanti, prima di scrivere una riga.** Baseline `rebar3 eunit` senza
+`--app`: 244 test, 0 fallimenti. Con le prove del revisore rimesse nell'albero: 254 con
+esattamente 10 fallimenti, quelli attesi. Se ne fosse fallito un numero diverso le prove non
+avrebbero più descritto il codice davanti a me, e correggere alla cieca è peggio che non
+correggere. (Piano e prompt dicevano «quattro passano, sei continuano a fallire»: sono cinque e
+cinque — D-1 ha due prove, il percorso della grazia e quello del guasto.)
+
+**D-1, l'energia fatturata due volte.** Il difetto peggiore, e quello con la diagnosi più
+interessante: lo *stesso* frame `plugged` arriva in due situazioni che non sono la stessa cosa.
+Se il nodo è morto non esiste nessuna riga e adottare il cumulativo intero è giusto — è §6 del
+contratto. Se invece il connettore è vivo e ha appena scritto una riga (grazia scaduta, guasto),
+quel cumulativo comprende energia già fatturata. Il connettore ora ricorda quanto ha appena
+scritto e lo sottrae; un processo appena avviato ha il campo a zero, quindi il caso del contratto
+resta identico senza un ramo dedicato. Dettagli in `scelte_di_progetto.md` §14.2 — in
+particolare perché si porta avanti il cumulativo e non la fetta, e perché un contatore ripartito
+fa buttare l'offset invece di applicarlo.
+
+**D-2, la riga scritta una frame troppo presto.** `stop_session` e `revoke` mandano un `stop`
+all'hardware e §5 dice che l'hardware riferisce il risultato — con l'`unplugged` che porta il
+totale vero. La riga veniva scritta prima, con l'ultimo `meter`: nove centesimi a sessione,
+sistematici. Ora `closing` ascolta per `CLOSING_SETTLE_MS` (2000) prima di scrivere, e un
+`unplugged` chiude l'attesa subito. Il percorso comune non paga niente perché la transizione
+posta l'evento in avanti invece di applicarlo da sé.
+
+**D-6 e D-7, la coda del writer.** `announce/3` stava nel corpo dopo `of` — che il `catch` della
+stessa `try` non copre, per regola del linguaggio — quindi un `insert_id/1` su una connessione
+appena morta uccideva il writer e con lui la coda intera. E ogni errore non riconosciuto
+diventava `retry`, quindi una riga che non sarebbe passata mai teneva ferme tutte quelle dietro.
+Ora i tre modi di fallire una scrittura sono distinti per quanto costano: non codificabile →
+scartata subito; il server ha detto no in un modo che non capiamo → cinque tentativi e poi
+scartata; non è partita → riprovata per sempre e non contata.
+
+**Un test esistente è stato corretto, e va detto.**
+`an_out_of_service_connector_adopts_a_reconnected_session_test` asseriva che la sessione adottata
+partisse da 12.3 kWh — cioè asseriva il doppio addebito come comportamento atteso. Ora asserisce
+0.0 e in più che le due righe sommate diano quello che è uscito dall'outlet, che è la proprietà
+per cui l'offset esiste. Un test che codifica un difetto non è una rete di sicurezza, è il
+difetto scritto due volte.
+
+Anche la prova D-2 del revisore è stata risequenziata: aspettava l'evento `session_closed`
+*fra* lo stop e l'`unplugged`, il che incorporava la tempistica del difetto (sotto
+scrittura-in-entrata l'evento partiva prima che l'hardware potesse rispondere). L'asserzione non
+è cambiata, e la prova risequenziata è stata rieseguita contro il connettore **non** corretto
+per controllare che fallisse ancora: fallisce.
+
+**Numeri.** Suite committabile 260 test, 0 fallimenti (244 di prima + 16 nuovi). Con le dieci
+prove del revisore: 270 con 5 fallimenti, tutti del lotto 2. End-to-end sui container
+ricostruiti, contro MySQL vero: venti kWh erogati attraverso un guasto e una riconnessione danno
+due righe da 12.000 e 8.000 — **venti**, non trentadue; e uno `stop_session` con l'`unplugged`
+subito dopo scrive **10.200**, il totale dell'hardware, non i 10.0 dell'ultimo `meter`.
+
+**Una cosa trovata per strada:** `station1` stava girando da cinque ore un'immagine anteriore al
+commit del passo 3, senza `vs_station_db` nell'albero di supervisione. Il revisore l'aveva
+dichiarato e aveva misurato solo su `station2`; entrambe sono state ricostruite prima delle
+misure di adesso, e i beam dei container hanno lo stesso md5 di `_build`. Vale la pena
+ricordarsene: `docker compose up -d` non ricostruisce, e un'immagine vecchia misura il codice
+sbagliato senza dirlo.
+
+## 7u. Lotto 2 delle correzioni della review — 28 agosto
+
+Le cinque prove ancora rosse del revisore: D-3 (oscillazione del taper), D-4 (sessione senza
+`max_kw`), D-5 (riga persa in silenzio), D-8 (prenotazione che trapela nello snapshot), D-9
+(novanta secondi che diventavano centottanta). Nessuno di questi tocca quanto si paga — quelli
+erano il lotto 1 — ma due toccano cosa il driver vede e uno il tempo di reazione a un guasto.
+
+**Le tre verifiche bloccanti, tutte e tre confermate.** Baseline 261/0, e 271 con esattamente
+le cinque rosse attese. `release/2` trova il `claim_id` nella sessione quando l'hold è
+`undefined` — riletta sul codice **dopo** il lotto 1, che aveva rimaneggiato `closing`, perché
+se fosse stato falso azzerare l'hold avrebbe fatto perdere il rilascio dei claim. E sì,
+**esisteva** un test che dava per buono un `plugged` senza `max_kw`.
+
+**D-3 e D-4 erano lo stesso difetto visto da due lati, e la toppa precedente li aveva creati
+entrambi.** La regola «si sospende chi sta sotto il minimo» non distingueva chi è sotto perché
+il sito è a corto da chi è sotto perché chiede poco. Il secondo non è affamato da nessuno:
+portarlo a zero non libera niente per nessuno. Da lì l'oscillazione — sospendi, il limite va a
+zero, il limite a zero riporta la domanda al massimo, il massimo la fa rientrare, si
+ricomincia — su un sito **vuoto**, con 350 kW liberi. Adesso si sospende solo per scarsità:
+quota sotto il minimo **e** sotto la domanda. I sei scenari di `PIANO_POTENZA.md` §8 danno
+numeri identici a prima, che era la prova richiesta: la regola nuova non cambia i casi
+ordinari, toglie solo una sospensione inutile.
+
+D-4 si è chiuso a monte e non nell'allocatore: `max_kw` è obbligatorio in §4.2, quindi un
+`plugged` che non ce l'ha viene rifiutato da `vs_cp_proto` e non apre nessuna sessione.
+Metterci una pezza nell'allocatore avrebbe voluto dire decidere noi cosa può prendere un
+hardware che non l'ha detto — esattamente lo split che §7.2 vieta.
+
+**Tre test esistenti codificavano il difetto, e vanno detti.** Due di `vs_power` asserivano che
+un'auto che chiede 3 kW su un sito da 180 debba essere sospesa (era la specifica della toppa
+precedente); una proprietà del sweep diceva «zero oppure almeno `MIN_CHARGE_KW`» e ora dice
+«zero, almeno `MIN_CHARGE_KW`, **oppure esattamente ciò che ha chiesto**». E
+`a_session_with_no_max_kw_starts_suspended_test` trattava come «segnalato onestamente» il
+risultato che teneva l'auto a zero per sempre: resta, perché documenta la difesa del
+connettore, ma con il commento corretto — dopo la correzione un payload del genere non arriva
+più fin lì.
+
+**Tre delle cinque prove del revisore sono state ri-puntate**, ed è la parte del lotto che
+merita più attenzione. Quella di D-3 asseriva *prima* che il tick 1 sospendesse l'auto (cioè
+osservava il difetto) e *poi* che il tick 2 fosse d'accordo: la prima asserzione non era un
+invariante. Ora la prova gira il ciclo per sei tick e chiede un punto fisso, che è più forte.
+Quelle di D-4 osservavano il difetto dentro l'allocatore, chiedendo che una sessione con
+`max_kw = 0` ricevesse 350 kW — cosa che nessun allocatore deve fare: erano l'unico posto da
+cui il difetto era ancora visibile, perché a quel punto era già successo. Adesso guardano dove
+il difetto si chiude, cioè il payload. **Ognuna delle tre è stata rieseguita contro i sorgenti
+non corretti e deve ancora fallire**: la regola seguita è che un'asserzione può spostarsi dove
+il difetto viene davvero chiuso, ma non può essere indebolita.
+
+**D-9 era il difetto più semplice e il più imbarazzante:** due funzioni che calcolano lo stesso
+prodotto e agiscono in serie. Cowboy aspetta 90 s di silenzio, chiude il socket, e solo allora
+il connettore ne aspetta altri 90. Tre heartbeat mancati ne facevano sei, e i commenti di
+entrambi i moduli sostenevano che i due scadessero «sullo stesso orologio» — stessa durata, non
+stesso istante. Adesso i novanta secondi sono un budget ripartito: 60 al socket, 30 alla
+grazia. La grazia non poteva sparire — serve al blip di rete di §1, il socket che cade per un
+FIN e non per silenzio — e trenta secondi bastano per una riconnessione che il contratto dà a
+un secondo.
+
+L'alternativa più fedele era distinguere le due morti del socket passando al connettore il
+motivo dalla `terminate/3` di cowboy. Costa un messaggio nuovo sul confine più delicato del
+passo 1, ed è annotata in `scelte_di_progetto.md` §15.5 come la strada da prendere se la
+ripartizione si rivelasse rigida. Non ora: **il lotto 2 chiude difetti, non introduce
+meccanismi.**
+
+**Le dieci prove del revisore sono verdi e sono entrate nel commit**, rinominate
+`vs_m2a_regression_tests.erl` con lo stub che le accompagna: da qui in avanti sono test di
+regressione come tutti gli altri, e il nome lo dice. Ognuna delle tre ri-puntate porta una NOTE
+che spiega cosa è cambiato e perché.
+
+**Numeri.** Suite 274 test, 0 fallimenti — 261 del lotto 1, 11 di regressione (le dieci del
+revisore, con quella di D-4 diventata tre: due rifiuti e un controllo positivo che tiene le
+altre due dal passare per il motivo sbagliato), 2 per l'aritmetica di D-9. I sei scenari della
+potenza: 150 / 130-50 / 80-50-50 / 100-100-100-50 / 127,5-127,5-45-50 / 7,5-7,5-0, identici.
+
+## 7v. M2-A passo 4: il frame `session` e la pagina della sessione — 28 agosto
+
+Branch `a/m2-session`, da `a/m2-fix2` (`ae848d7`) e **non da `main`** — vedi la verifica
+bloccante 1 qui sotto. `vs_driver_proto` guadagna `session_frame/2` e `session_push/3`,
+`vs_driver_ws` un campo di stato e il rinomino di `push_state/2` in `push/2`,
+`vs_connector:build_snapshot/2` la chiave `battery_kwh`. Lato pagina: nove righe in `js/ws.js`,
+`js/session.js` e `session.jsp` nuovi. Nessun contratto toccato: §5.2 si implementa com'è
+scritta, e `SESSION_TICK_MS` era già in §10.
+
+Con questo, chi carica vede la propria ricarica. Fino a ieri la sessione si intravedeva solo di
+sbieco, come `power_kw` nella griglia della stazione.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline 274 test **su `main`** | `git ls-tree main` + `rebar3 eunit` sull'albero corrente | **fallita come premessa, sana come sostanza.** `main` è fermo a `54a03c4` e non ha **nessuno** dei merge di M2-A: niente `vs_cp_proto`, `vs_cp_ws`, `vs_power`, niente `vs_station_db_tests`. I 274 verdi esistono, ma su `a/m2-fix2`. Fermato e segnalato prima di scrivere una riga |
+| Esiste un servlet per `session.jsp` | otto file in `backoffice/src/main/java/.../web/` | **no**, come il piano si aspettava. C'è solo `StationPageServlet` (`@WebServlet("/station")`, forward a `station.jsp`, mette in pagina `station` e `sessionScope.jwt`). Nessuna rotta `/session` |
+| `battery_kwh` non è già nello snapshot | `build_snapshot/2` letto prima di toccarlo | **confermato**: la sotto-mappa aveva `user_id`, `vehicle_id`, `started_at`, `energy_kwh`, `soc_pct`, `max_kw`, `limit_kw`. Nessun doppione da creare |
+
+**Sulla prima.** Non è «i merge sono andati male»: è che non sono mai stati fatti. La sostanza
+che il controllo protegge — una base M2-A completa e verde — c'era, solo su un altro ramo e con
+il lotto 2 ancora non committato. Le due decisioni sono state chieste e prese: committare il
+lotto 2 (`ae848d7`) e ramificare da lì, e chiedere a B il servlet gemello.
+
+### Catena dei chiamanti, cercata prima di toccare il codice
+
+| Funzione | Chiamanti trovati | Conseguenza |
+|---|---|---|
+| `vs_connector:build_snapshot/2` (+`battery_kwh`) | `vs_station_mgr:connector_entry/1` → `build_state/1`; `vs_cp_proto:limit_kw/2` (legge `limit_kw`); `vs_power:demand_kw/3` (`max_kw`, `soc_pct`, `limit_kw`), `demands/1` (`started_at`), `is_live/1` (`session` è una mappa); `vs_driver_proto:wire_connector/2` (`user_id`); 15 punti nei test | **additiva**: ogni lettura nomina la sua chiave. Cercate anche le asserzioni su mappa intera (`?assertEqual(#{`) per escludere una rottura silenziosa: nessuna riguarda la sotto-mappa `session` |
+| `vs_driver_ws:push_state/2` → `push/2` | privata, due chiamanti nello stesso modulo (`{station_state, _}` e `state_tick`) | cambia il tipo di ritorno in `{Frames, State}`, perché ora aggiorna `last_session`. Nessun chiamante fuori dal modulo |
+| `vs_driver_ws:websocket_info/2` | cowboy | due frame invece di uno, dallo stesso snapshot e nella stessa `send` |
+| `vs_driver_proto` (+ due funzioni) | `vs_driver_ws` | additiva |
+| `js/ws.js` (+ caso `session`) | `station.js`, `session.js` | additiva. **`station.js` non registra `onSession`**: una pagina della stazione aperta dal proprietario di una sessione riceve il frame e lo lascia cadere, senza differenza visibile |
+
+### Verificato — girato davvero
+
+- **Suite: 286 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 274 di baseline + 12 nuovi:
+  11 su `vs_driver_proto` (gli otto campi del contratto e nessuno in più, il silenzio per chi
+  non carica, la proprietà del frame, `suspended` dal connettore, `complete` dal SoC e non dalla
+  potenza, il salto dell'ETA, i tre casi di `null`, il frame `closed` e il silenzio dopo, il
+  giro attraverso jsx, e la non-fuga di `battery_kwh` nel frame `state`) e 1 su `vs_connector`.
+  Tutti su mappe costruite a mano: nessun manager, nessun connettore, nessun socket.
+- **I due frame partono nella stessa `send`.** Sul nodo vivo, timestamp del socket driver:
+  `09:17:39.691 state` / `09:17:39.691 session`, per venti tick di fila. Non è una coincidenza
+  di arrotondamento: è la stessa lista di frame.
+- **Energia e potenza avanzano ogni cinque secondi.** St. 2 / conn 5, veicolo 2, batteria 58
+  kWh: `0.333 → 0.541 → 0.749 → 0.958 → 1.166 → 1.374 kWh` a 150 kW, un frame ogni 5 s.
+- **L'ETA salta, misurato.** Con la sola auto a 150 kW: `eta = 1044 s` (soc 25 %). Una seconda
+  auto si attacca sul conn 6 (50 kW su un sito da 180): il riparto scende a 130 kW e un tick
+  dopo `eta = 1189 s` (soc 26 %). **+145 secondi in un tick**, con un punto di SoC *in meno* da
+  fare. È P5 che si vede, ed è la ragione per cui non c'è smoothing. Nessun `SITE_POWER_KW`
+  ritoccato: la stazione 2 è seminata a 180 kW contro 250 installati proprio per questo.
+  Rifatto poi nel browser e letto sulla pagina — vedi sotto.
+- **`suspended` dal vivo.** `SITE_POWER_KW` di st. 2 portato a 10 con un override di compose
+  (file di scratch, non committato): due auto, quota 5 kW a testa, sotto `MIN_CHARGE_KW`.
+  Il frame: `phase=suspended power=0 kW eta=null`. La vittima è l'ultima arrivata, come vuole
+  `victim/1`.
+- **Il frame finale, per due strade diverse.** (a) `stop_session` dal canale driver → la
+  stazione manda `stop` → `cp.js` stacca il cavo e riporta il totale → nell'istante in cui il
+  connettore torna `free` arriva `phase=closed energy=5.97 kWh soc=32%`, e **niente dopo**.
+  (b) `--unplug-at-soc 24`, cioè il cavo che esce da solo senza che il driver tocchi niente →
+  `phase=closed energy=1.083 kWh soc=24%`, di nuovo una volta sola.
+- **Il canale colonnina regge il riavvio.** Le stazioni sono state riavviate due volte durante
+  le prove e l'emulatore ha riconciliato da solo ogni volta (§6): `boot` + `plugged` con il
+  cumulativo, sessione riaperta senza intervento.
+- **Il rendering di `js/session.js`** contro i payload reali dei sei casi, sotto un DOM di
+  prova: placeholder senza sessione, «Charging / 130.0 kW / 5.970 kWh / 18 min», «Paused» con
+  la spiegazione al posto della parola, «Charge complete», «Session ended» con potenza e stima
+  a `—` e i totali al loro posto, e il socket che cade (sotto).
+
+### Nel Chrome vero — cosa è stato visto con gli occhi
+
+Tutto il blocco qui sopra è misurato **sul filo**: un client WebSocket Node che parla il
+contratto e stampa i frame uno per uno. Il giro nel browser è arrivato dopo, sulla pagina
+statica servita da `python -m http.server` (stesso `<style>`, stesso markup e gli stessi
+`js/ws.js` e `js/session.js` della JSP, con le tre costanti di `jwt.md` §2 messe a mano).
+Distinguere le due cose è il punto di questa sezione.
+
+- **Card `charging`, vista**: connettore #5, badge *Charging*, barra del SoC, potenza, energia
+  ed ETA che avanzano ogni cinque secondi, pastiglia *live*. La prima lettura è caduta dentro
+  la rampa del limite (≈77 kW → «40 min»), che è la risposta giusta: l'ETA insegue il contatore
+  e non lo smussa.
+- **Card `suspended`, vista**: badge *Paused*, `Power 0.0 kW`, `Energy 0.000 kWh`,
+  `Estimated time left unavailable`, e la nota ambra al posto della parola. **Con l'energia
+  ferma e il Time che continuava a scorrere** — che è la dimostrazione visiva di §7.1: la
+  pagina fa scorrere l'orologio, non il contatore.
+- **La fase `suspended` ha tenuto per un'ora esatta**, ~720 frame consecutivi a
+  `power=0 eta=null`, senza un solo rimbalzo. È il D-3 del lotto 2 (si sospende solo per
+  scarsità) confermato dal vivo su una finestra che i test unitari coprono per sei tick.
+- **Card `closed`, vista**: *Session ended*, potenza e stima a `—`, i totali al loro posto.
+- **Il reset del reconnect, verificato per via indiretta ma conclusiva**: `docker stop` +
+  `docker start` di `station2` e la sessione è ricomparsa con il **Time ripartito da zero**.
+  Il socket è caduto davvero e la card si è svuotata per la durata del riavvio — troppo breve
+  per coglierla a occhio, ma il cronometro azzerato lo dimostra. *Nota metodologica:* il
+  throttling «Offline» di DevTools **non** chiude i WebSocket già aperti, quindi non serve come
+  prova; l'unico modo è far cadere il socket sul serio.
+- **Il salto dell'ETA, letto sulla pagina**: `18 min` → `21 min` in **un solo frame**, cinque
+  secondi l'uno dall'altro, con il SoC fermo al 23 %. Sul filo: `eta 1072 s` a 150 kW,
+  `eta 1237 s` a 130 kW.
+
+### La rampa non è smoothing, e la differenza è stata misurata
+
+Al primo tentativo il salto è arrivato in **due** frame (`15 min → 16 min → 18 min`), e la
+domanda giusta era se ci fosse uno smoothing nascosto. Non c'è, e la prova è in due pezzi.
+
+**Primo:** l'allocatore si muove in un colpo solo. Al `plugged` della seconda auto,
+`allocated_kw` passa **150 → 180 in un unico push** e il `set_limit(130)` parte subito. Ciò che
+sale gradualmente è il **contatore**, perché `ws-chargepoint.md` §5 concede alla colonnina
+`LIMIT_APPLY_SECONDS` (§10, 5 s) per onorare un limite nuovo, e l'emulatore interpola su quella
+finestra proprio per non far sembrare lo scenario migliore di com'è. L'ETA insegue il contatore
+istante per istante, senza memoria del valore precedente.
+
+**Secondo, ed è la prova decisiva:** rifatta la scena con `--limit-apply 0` — cioè con una
+colonnina che applica il limite di scatto — il salto è tornato in **un frame solo**, `18 → 21
+min`. Se ci fosse uno smoothing da qualche parte, quel parametro dell'emulatore non avrebbe
+potuto toglierlo.
+
+### La riga scritta, verificata a tre voci
+
+Quattro sessioni chiuse nel giro finale (righe 18-21), **una riga per sessione, nessun
+doppione**, e per ognuna i tre numeri coincidono:
+
+| Riga | Frame `closed` | Contatore dell'emulatore | `sessions.energy_kwh` |
+|---|---|---|---|
+| 21 (conn 5, utente 2) | `3.986 kWh` | `final energy_kwh = 3.986` | `3.986` |
+| 18 (conn 6, utente 1) | — (non è il driver della pagina) | `final energy_kwh = 12.042` | `12.042` |
+
+La riga **18 è la prova dell'offset**: la sessione era nata al riavvio delle 10:43 ed è vissuta
+23 secondi, ma porta **12.042 kWh** — un'ora di ricarica erogata *prima* di due spegnimenti
+della stazione, restituita dall'emulatore con il `plugged` della riconciliazione (§6) e non
+contata due volte. Il totale non è mai risultato superiore al contatore, che era la condizione
+per fermarsi.
+
+**Un artefatto onesto da mettere agli atti:** su quella riga `started_at`/`ended_at` coprono 23
+secondi mentre l'energia ne copre sessanta minuti. Una stazione che riparte perde la sua
+sessione e §6 le restituisce **l'energia, non l'istante di inizio**; la riga registra quindi la
+sessione post-riavvio. Non tocca il conto — `BillingService.cost/3` prezza energia e secondi di
+overstay, mai le due date — ma la durata di una sessione che ha attraversato uno spegnimento
+non è quella vera, e chi leggesse `ended_at - started_at` come tempo di ricarica sbaglierebbe.
+
+### Un difetto trovato in revisione, che nessuna delle prove copriva
+
+Tutte le prove del rendering davano frame a una pagina connessa. Nessuna faceva **cadere il
+socket**, ed è lì che stava il buco: se la ricarica finisce mentre la pagina è disconnessa — cioè
+esattamente ciò che è successo due volte oggi, riavviando `station2` — il frame `closed` va a un
+socket che non esiste più, il socket nuovo riparte con `last_session` vuoto, e a un driver senza
+sessione **non si manda niente**. Nessun frame sarebbe mai arrivato a dire che era finita: la
+pagina sarebbe rimasta su «Charging, 130 kW» con il cronometro che correva, sopra una sessione
+chiusa da minuti.
+
+È la deriva che §7.1 esiste per impedire, in una pagina il cui commento in testa dichiara di
+obbedirvi. `station.js` non ce l'ha solo perché §3 spinge un `state` a ogni `join`, e per §5.2
+quella garanzia non esiste.
+
+Corretto lato pagina, tre righe: appena il canale non è `online`, `session.js` butta ciò che ha
+in mano e torna al placeholder. La cura lato server sarebbe stata peggiore — un frame di zeri
+riporta l'ambiguità che si era tolta, e far sopravvivere `last_session` alla morte del socket
+vuol dire uno stato per utente sulla stazione, cioè la sessione lato server che §7.5 non ha.
+Motivazione per esteso in `scelte_di_progetto.md` §16.6; il caso è ora nella prova di rendering.
+
+### Una scelta di formato, presa guardando l'output
+
+La stima usciva come `18:12`, che un lettore prende per un'ora del giorno. Ora è scritta a
+parole e arrotondata al minuto (`18 min`, `1 h 22 min`): il secondo è rumore su un numero che è
+dichiaratamente advisory e che salta. Il tempo trascorso resta a `mm:ss`, perché lì è un
+cronometro.
+
+### Non provato — e perché
+
+1. **`session.jsp` non è mai stata renderizzata da Tomcat**, perché nessun servlet la serve. È
+   committata pronta; il rischio residuo è un errore JSP che solo il compilatore di pagine
+   troverebbe. Lo `<style>` e il markup sono però esattamente quelli girati nel browser sulla
+   pagina statica, e la parte JSP è tre righe di taglib più il blocco di `jwt.md` §2 copiato da
+   `station.jsp`.
+2. **La barra del SoC non è stata guardata a percentuali diverse.** È stata vista disegnata,
+   ma non c'è una lettura fatta apposta a 0 %, 50 % e 100 % per confermare che la larghezza
+   segua. Il calcolo è ritagliato in `[0, 100]` ed è provato dal DOM di prova, non dall'occhio.
+3. **`SESSION_TICK_MS` non viene letto** (scelte §16.1). Finché il default coincide con quello
+   di `STATE_TICK_MS` non si vede; cambiarlo non produrrebbe alcun effetto.
+4. **`overstay` e `complete` non sono stati visti dal vivo.** Il primo è M4. Il secondo
+   richiede un'auto che arrivi al 100 %, cioè una ventina di minuti di emulatore: è provato in
+   EUnit, sui tre casi che contano (taper al 94 % → `charging`, 100 % → `complete`, 100 % con
+   il connettore sospeso → `complete`), e nel browser solo attraverso il DOM di prova.
+5. **Lo svuotamento della card alla caduta del socket non è stato colto a occhio**, perché dura
+   i due secondi del riavvio: è dimostrato dal cronometro ripartito da zero, non da un
+   fotogramma. Il throttling «Offline» di DevTools non serve come prova — non chiude i
+   WebSocket già aperti.
+6. **Effetti sull'ambiente vivo.** `station1` e `station2` sono state ricostruite dal codice di
+   questo passo (station2 era rimasta al lotto 1). Le prove hanno prodotto le righe sintetiche
+   **13-21** in `sessions` per gli utenti 1 e 2, come le precedenti, tutte con `cost_cents`
+   NULL perché il back office non era in piedi; `station2` è stata riavviata cinque volte, due
+   delle quali con un `SITE_POWER_KW` a 10 che **non** è nel compose committato. Alla fine
+   `docker compose down`: nessun container e nessun emulatore lasciati in giro.
+
+## 7w. M2-A passo 5: il riaggancio del socket colonnina e l'emulatore dei driver — 28 agosto
+
+Branch `a/m2-load`, da `a/m2-session` (`2c6a2a4`, passo 4 committato davvero). Due lavori in un
+giro, in quest'ordine perché il primo è la premessa del secondo: un difetto che si innesca
+proprio sotto carico avrebbe reso illeggibile ciò che le prove di carico trovavano.
+
+`vs_cp_proto` guadagna `handle_info/2` e sei chiavi di sessione, `vs_cp_ws` due clausole di
+`websocket_info/2`; `src/emulator/driver.js` è nuovo. Nessun contratto toccato.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline 286 test | `rebar3 eunit` (mai `--app`) su `2c6a2a4` | **286 test, 0 fallimenti**. Confermata |
+| Il connettore riparte davvero, e il registro guarisce | `exit(Pid, kill)` sul compose, `lookup_pid/1` prima e dopo | **sì**. Nella riproduzione pre-correzione: `<10252.333.0>` ucciso, `lookup_pid/1` un secondo dopo risponde `<10251.400.0>`. `vs_connector_sup` è `transient` e il `connector_up` dell'`init` del connettore fa guarire il registro senza che nessuno interroghi niente |
+| Il difetto esiste **come descritto** | riprodotto sul compose prima di scrivere una riga | **il difetto sì, il meccanismo del piano no.** Vedi sotto: è la scoperta principale di questo passo |
+
+### Il difetto riprodotto — e il piano corretto
+
+`PIANO_LOAD.md` diceva che i `meter` «continuano ad arrivare a un pid morto» e spariscono in
+silenzio. **Non è così.** `vs_cp_proto` non ha mai memorizzato il pid (scelte §11.10, con un
+test che lo asserisce): il connettore si rilegge a ogni evento, e il registro guarisce in meno
+di un secondo. I `meter` arrivano al connettore **nuovo**.
+
+Quello che succede davvero, osservato:
+
+```
+connector 3: charging, user 12, vehicle 88, 0.42 kWh, 150 kW      <- prima
+<kill>
+connector 3: free, 0.0 kW                                          <- 1 s dopo, e per sempre
+connector 3: meter for a connector with no session (state free)    <- una ogni 5 s
+```
+
+L'emulatore intanto è arrivato a **1,878 kWh a 150 kW**, la stazione ha mostrato il connettore
+`free` per tutto il tempo, e in `sessions` **non è comparsa nessuna riga**: l'`unplugged` finale
+cade su un connettore inattivo e §4.4 lo ignora. In più `#data.cp` del connettore nuovo è
+`undefined`, quindi `send_cp/2` è un no-op e **nessun `set_limit` e nessuno `stop` può più
+raggiungere l'hardware**.
+
+Il sintomo è quello del piano; il meccanismo è peggiore, perché il difetto lascia tracce che
+sembrano diagnostiche e non lo sono. `PROGRESS.md` §7p («Non provato — e perché») lo aveva già
+annotato **correttamente** al passo 1: «il `meter` successivo finisce nel log "meter senza
+sessione" invece che nel vuoto». Il piano lo aveva riscritto peggio di come era già scritto qui.
+
+### Il comportamento dopo, sulla stessa prova
+
+```
+charge point channel: connector 3 (<0.136.0>) died under a live socket (killed)
+                      - reattaching in 500 ms
+charge point channel: connector 3 is back as <0.225.0> - reattached
+charge point channel: connector 3 reconciled to status available,
+                      re-announcing vehicle 88 with 0.75 kWh
+connector 3 walk-in session for user 12
+```
+
+**501 ms** fra il `DOWN` e il riaggancio. La sessione riappare con l'energia che il contatore
+aveva; la potenza torna a 150 kW, quindi il `set_limit` interinale ha davvero raggiunto
+l'hardware; e l'emulatore non se ne accorge — il suo log non ha un buco.
+
+Ciclo completo, con l'auto che stacca da sola dopo il riaggancio:
+
+```
+final energy_kwh = 2.416 (soc 26%, soc reached 26%)     <- l'emulatore
+session 1 written: connector 3, user 12, 2.416 kWh      <- la stazione
+id=1  user_id=12  connector_id=3  energy_kwh=2.416      <- MySQL
+```
+
+Prima: 1,878 kWh erogati, zero righe. Dopo: 2,416 kWh erogati, 2,416 kWh fatturati, una riga.
+
+### Catena dei chiamanti, cercata prima di toccare il codice
+
+| Funzione | Chiamanti trovati | Conseguenza |
+|---|---|---|
+| `vs_connector:attach_cp/2` | in produzione **uno solo**, `vs_cp_proto:attach_to/2` (dal `boot`); 21 punti nei test di `vs_connector`/`vs_m2a_regression` | un chiamante nuovo, il riaggancio. Il connettore **non distingue i due casi** e va bene così: la clausola sta in `handle_common`, valida in ogni stato, e cancella la grazia in entrambi |
+| `vs_station_mgr:lookup_pid/1` | `vs_claim_client:443`, `vs_station_mgr:reallocate/1` (interno), `vs_cp_proto:connector/1` | un chiamante in più sullo stesso percorso, stessa lettura sporca. Nessun cambio di firma |
+| `vs_cp_proto:new/1` | `handshake/2`, `vs_cp_proto_tests:81`, `vs_m2a_regression_tests:402` | sei chiavi additive. **Ha rotto un test**, non per la firma ma per un confronto di mappa intera — vedi sotto |
+| `vs_cp_proto:handle_text/2` | `vs_cp_ws:websocket_handle/2` | firma invariata; cambia solo la sessione che restituisce |
+| `vs_cp_ws:websocket_info/2` | cowboy, più 4 chiamate nei test del trasporto | due clausole nuove, **sopra** il catch-all. Sotto sarebbero diventate una riga di debug e il socket sarebbe rimasto attaccato a un processo che non c'è più |
+| `vs_cp_stub:attach_cp/2` (test) | `vs_cp_proto` attraverso `conn_mod` | registra una tupla a tre invece che a due, perché «a **quale** connettore si è attaccato» è tutta la domanda del riaggancio. Due asserzioni aggiornate |
+
+**Il test rotto, e perché è servito.** `a_frame_with_no_request_id_is_dropped` faceva
+`?assertEqual({[], booted_session()}, handle(Bin, booted_session()))`: due sessioni costruite
+separatamente, che ora differiscono per il riferimento del monitor. Corretto confrontando la
+sessione **con sé stessa**, che è anche ciò che il test voleva dire — «non è cambiato niente»,
+non «è uguale a un'altra istanza».
+
+### Verificato — girato davvero
+
+- **Suite: 298 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 286 di baseline + 12 nuovi:
+  10 sul riaggancio in `vs_cp_proto` e 2 sul trasporto in `vs_cp_ws`. I dieci fanno nascere un
+  processo vero da monitorare invece di sintetizzare il `DOWN`: il monitor **è** il meccanismo
+  in prova, e un messaggio scritto a mano proverebbe solo che il codice sa leggere una tupla.
+- **Il difetto prima e dopo**, sopra, sul compose con sette container.
+- **`--self-test` dell'emulatore driver**: rifirma i claim di `sample-tokens.md` §1 e produce
+  la fixture pubblicata **byte per byte**. È la prova che i token che manda sono quelli che
+  firmerebbe Tomcat, non qualcosa che la stazione accetta per caso.
+
+#### Scenario 1 — contesa sullo stesso connettore
+
+| driver | accettate | rifiutate | tempo max | media |
+|---|---|---|---|---|
+| 20 | 1 | 19 `ALREADY_HELD` | 21 ms | 16 ms |
+| 50 | 1 | 49 | 23 ms | 16 ms |
+| 100 | 1 | 99 | 32 ms | 17 ms |
+| 200 | 1 | 199 | 68 ms | 33 ms |
+| 500 | 1 | 499 | 100 ms | 48 ms |
+
+Il conteggio chiude esatto a ogni riga, senza avanzi, e la stazione conferma: **un** connettore
+`held`, quello del vincitore. Il massimo cresce all'incirca linearmente con N, che è la firma
+attesa dell'attore: le N richieste per quell'outlet sono N messaggi in **una** casella, servite
+una alla volta nell'ordine di arrivo. Nessun lock, e nessuno che ne veda uno.
+
+#### Scenario 2 — un veicolo, una prenotazione in rete
+
+Lo stesso `vehicle_id` su cinque connettori di due stazioni, nello stesso istante: **1 accettata,
+4 `NO_CLAIM`**, massimo 5 ms, media 5 ms. È l'unico scenario che attraversa il coordinatore, e
+la distinzione fra i due rifiuti è quella che `ws-driver.md` §4.1 tiene separata apposta:
+`ALREADY_HELD` lo alza il connettore («questo outlet è preso»), `NO_CLAIM` il coordinatore («il
+tuo veicolo è impegnato altrove, e nessun altro connettore ti aiuta»).
+
+Ripetuto **15 volte di fila** con veicoli diversi: 15 su 15 esatte.
+
+#### Scenario 3 — carico sostenuto
+
+10 driver su due stazioni, 150 secondi, mentre due colonnine erogano.
+
+| | |
+|---|---|
+| richieste | 5620 |
+| accettate | 2904 (1452 `reserve` + 1452 `cancel_reservation`) |
+| rifiutate | 2716 `ALREADY_HELD` |
+| tempo di risposta | **max 62 ms**, media 8 ms |
+| connettori `held` alla fine | **0** su entrambe le stazioni |
+| crash / supervisor report | **0** su tutti e cinque i nodi |
+
+Il conto chiude: 4168 `reserve` = 1452 accettate + 2716 rifiutate, e 1452 `cancel` tutte
+accettate. Le due colonnine hanno erogato per tutta la corsa senza interruzioni.
+
+Memoria (`erlang:memory(total)`, campionata ogni 25 s):
+
+```
+station1  58 864 KB → 60 323 KB (picco) → 59 453 KB     processi 151 → 156 → 150
+station2  57 391 KB → 58 598 KB (picco) → 57 744 KB     processi 150 → 155 → 150
+```
+
+Cresce del 2,5 % con i socket aperti e **torna alla base** quando si chiudono. Non cresce senza
+fermarsi.
+
+#### La sonda di proprietà
+
+Un carico di driver anonimi non può mostrare le due cose riservate a chi **possiede** una
+sessione. Con un `cp.js` che eroga sul connettore 3 e il driver del veicolo 88:
+
+```
+stranger sees session frames: no        <- §5.2, solo al proprietario
+owner sees session frames:    YES       <- phase charging, 150 kW, 7.414 kWh, soc 33%, eta 933s
+stranger stop_session:        NOT_YOURS <- §4.3
+owner stop_session:           ACK
+```
+
+e la riga scritta porta `7.414 kWh`, identica al `final energy_kwh` dell'emulatore.
+
+### Difetti trovati sotto carico e **non** corretti
+
+Uno solo, e non è del carico: è la conseguenza del 4404 della resa.
+
+**`cp.js` tratta il 4404 come fatale e termina** invece di riconnettersi col backoff. Il piano
+assumeva il contrario («lascia riconnettere la colonnina col suo backoff»), e per il nostro
+emulatore su quel percorso l'assunzione è falsa. Non corretto qui: `cp.js` è fuori perimetro, e
+la scelta fra cambiare il codice della resa e insegnare a `cp.js` a distinguere il 4404
+dell'handshake da quello a metà vita è una decisione di contratto, che è di Caleb. Il percorso
+è quasi irraggiungibile — richiede che il supervisore abbia rinunciato del tutto — e in nessuna
+prova è stato imboccato.
+
+Il resto delle prove non ha prodotto difetti: zero crash, zero report di supervisore, zero
+`ERROR REPORT` su stazioni e coordinatori, in tutte le corse.
+
+### Non provato — e perché
+
+- **Il ramo della resa (4404) non è stato eseguito su un socket vero.** Ha i due test unitari
+  — cinque tentativi a vuoto → `{close, 4404, ...}`, e la corsa dal trasporto → `[{close, 4404,
+  <<>>}]` — ma per vederlo sul compose bisognerebbe far arrendere `vs_connector_sup`, cioè
+  cinque crash in dieci secondi, e a quel punto la stazione ha un problema più grande di questo.
+- **Nessun `plugged` di veicolo sbagliato attraverso il riaggancio.** Il replay passa dal
+  percorso ordinario, quindi `not_your_reservation` è raggiungibile in teoria; in pratica il
+  connettore rinato è `free` e non ha hold, quindi non può succedere finché la prenotazione non
+  sopravvive al riavvio — e §6 dice che non deve.
+- **Il limite vero di cowboy/ranch non è stato trovato.** 500 driver simultanei su una stazione
+  passano senza degradare oltre i 100 ms; il default di ranch è 1024 connessioni per listener e
+  non ci si è arrivati. La premessa «le stazioni reggono M driver simultanei» è verificata fino
+  a 500, non oltre.
+- **Nessuna prova con il back office acceso.** I token li firma l'emulatore, quindi Tomcat non
+  serviva e non è stato avviato; la fatturazione delle righe scritte durante le prove non è
+  stata guardata.
+- **Docker Desktop si sospende da solo** — pause fino a **ventidue minuti** fra una corsa e
+  l'altra. Si vedono come buchi nel ping da tre secondi della stazione. Una da 38 secondi è
+  caduta dentro la riproduzione del difetto, fra il `plugged` e il primo `set_limit`: la corsa
+  vale lo stesso, perché il kill e le due istantanee sono successivi alla ripresa e
+  l'osservazione è di stato e non di tempo. **Tutti i tempi delle prove di carico** sono stati
+  verificati con quel controllo eseguito dopo la corsa, e nessuno attraversa una pausa.
+- **Il seed di prova non è nel repository.** `users` e `vehicles` sono tabelle di B, popolate
+  dalla registrazione, e `schema.sql` non le semina. Le due righe che servono a un `plugged`
+  sono documentate in `src/emulator/README.md` invece di essere aggiunte a un contratto che non
+  è nostro.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
@@ -1087,8 +2076,12 @@ dal funzionare, e senza di esso lo scenario 5 si mostra dai log invece che da un
 server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il suo
 `vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
 
-**M2-A**: canale colonnina, allocazione della potenza, INSERT su `sessions`. Finché non c'è, la
-fatturazione gira su righe inserite a mano — il calcolo è verificato, il flusso completo no.
+**M2-A è completo**: canale colonnina (§7p), allocazione della potenza (§7q), INSERT su
+`sessions` (§7s), il frame `session` con la sua pagina (§7v) e il riaggancio del socket con
+l'emulatore dei driver (§7w). La fatturazione non gira più su righe inserite a mano: l'auto
+carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
+fine della sessione. Quello che resta di M2-A è la verifica del fuso in `history.jsp`, che
+richiede un browser e una password che non ho.
 
 ### Prima di M5
 
