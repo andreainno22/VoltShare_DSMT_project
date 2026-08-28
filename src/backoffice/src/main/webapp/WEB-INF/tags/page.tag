@@ -24,6 +24,8 @@
                href="${pageContext.request.contextPath}/stations">Stations</a>
             <a class="${active eq 'history' ? 'on' : ''}"
                href="${pageContext.request.contextPath}/history">History</a>
+            <a class="${active eq 'notifications' ? 'on' : ''}"
+               href="${pageContext.request.contextPath}/notifications">Notifications</a>
             <a class="${active eq 'profile' ? 'on' : ''}"
                href="${pageContext.request.contextPath}/profile">Profile</a>
         </nav>

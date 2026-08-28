@@ -14,6 +14,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.sql.SQLException;
 import java.util.List;
+import java.util.Locale;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -55,8 +56,8 @@ public class HistoryServlet extends HttpServlet {
             }
 
             req.setAttribute("sessions", history);
-            req.setAttribute("totalEuro", String.format("%.2f", totalCents / 100.0));
-            req.setAttribute("totalKwh", String.format("%.2f", totalKwh));
+            req.setAttribute("totalEuro", String.format(Locale.ROOT, "%.2f", totalCents / 100.0));
+            req.setAttribute("totalKwh", String.format(Locale.ROOT, "%.2f", totalKwh));
             // No global overstay rate is passed any more: it is set per station
             // (stations.tariff_cents_min_overstay), so a single figure on a page listing
             // sessions from several sites would be wrong for some of them.

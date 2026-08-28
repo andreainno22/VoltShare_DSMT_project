@@ -81,7 +81,7 @@ claims_test_() ->
         fun late_release_does_not_erase_the_new_claim/1,
         fun own_claim_is_renewed/1,
         fun unknown_claim_is_adopted/1,
-        fun renew_without_granted_at_is_accepted/1,
+        fun renew_with_a_malformed_entry_skips_only_that_entry/1,
         fun adopted_claim_carries_its_user/1,
         fun granted_at_comes_from_the_coordinator/1,
         fun oldest_claim_wins_a_conflict/1
@@ -203,7 +203,7 @@ own_claim_is_renewed(_) ->
         [#{granted_at := GrantedAt}] = vs_coord_srv:claims(),
         timer:sleep(5),
         {renewed, Ok, Revoked, NewExpiry} =
-            vs_coord_srv:renew(?STATION_1, [{ClaimId, ?VEHICLE, 3, GrantedAt}]),
+            vs_coord_srv:renew(?STATION_1, [{ClaimId, ?VEHICLE, 3, ?USER, GrantedAt}]),
         ?assertEqual([ClaimId], Ok),
         ?assertEqual([], Revoked),
         ?assert(NewExpiry >= FirstExpiry)
@@ -216,7 +216,7 @@ unknown_claim_is_adopted(_) ->
         Ghost = <<"c-from-the-previous-leader">>,
         GrantedAt = vs_time:now_ms() - 60000,
         {renewed, Ok, Revoked, _} =
-            vs_coord_srv:renew(?STATION_1, [{Ghost, ?VEHICLE, 3, GrantedAt}]),
+            vs_coord_srv:renew(?STATION_1, [{Ghost, ?VEHICLE, 3, ?USER, GrantedAt}]),
         ?assertEqual([Ghost], Ok),
         ?assertEqual([], Revoked),
         ?assertEqual({error, <<"r-x">>, already_held},
@@ -224,26 +224,40 @@ unknown_claim_is_adopted(_) ->
                      "an adopted claim must protect the vehicle like any other")
     end.
 
-%% Interoperability with a station that still sends the three-field form. It must
-%% keep working: refusing would be bad, crashing on function_clause — which is what
-%% happened before this clause existed — would take the coordinator down and lose
-%% every claim, on a message that arrives every ten seconds.
-renew_without_granted_at_is_accepted(_) ->
+%% A malformed entry costs ONE claim, never the coordinator.
+%%
+%% This test replaces `renew_without_granted_at_is_accepted', which asserted that the
+%% three- and four-field forms were still honoured. Those clauses are gone (agreed with A,
+%% nota-per-B-m2a.md §6): no station has sent them since the contract settled on 24/08, so
+%% they were branches nobody could reach.
+%%
+%% What deliberately did NOT come back with them is the crash. The lesson of 24/08 was not
+%% "support the old tuples" — it was that a single unexpected message killed the process
+%% holding every claim in the network, on a message that arrives every ten seconds. So the
+%% assertions below are about survival: the good entries in the same batch are still
+%% renewed, and the process is still alive afterwards.
+renew_with_a_malformed_entry_skips_only_that_entry(_) ->
     fun() ->
-        {ok, _, ClaimId, _, _} = vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        {ok, _, ClaimId, _, GrantedAt} =
+            vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+        Pid = whereis(vs_coord_srv),
 
+        %% One unusable entry alongside a good one, in the same batch.
         {renewed, Ok, Revoked, _} =
-            vs_coord_srv:renew(?STATION_1, [{ClaimId, ?VEHICLE, 3}]),
+            vs_coord_srv:renew(?STATION_1, [{ClaimId, ?VEHICLE, 3},
+                                            {ClaimId, ?VEHICLE, 3, ?USER, GrantedAt}]),
 
-        ?assertEqual([ClaimId], Ok),
+        ?assertEqual([ClaimId], Ok, "the well-formed entry is renewed"),
         ?assertEqual([], Revoked),
-        ?assertEqual(1, length(vs_coord_srv:claims())),
+        ?assertEqual(1, length(vs_coord_srv:claims()),
+                     "and the malformed one added nothing"),
 
-        %% and an unknown one in the old form is adopted, not dropped
-        Ghost = <<"c-legacy">>,
-        {renewed, [Ghost], [], _} =
-            vs_coord_srv:renew(?STATION_2, [{Ghost, 99, 7}]),
-        ?assertEqual(2, length(vs_coord_srv:claims()))
+        %% The point of the whole change: still the same process, still serving.
+        ?assert(is_process_alive(Pid), "a malformed renewal must not kill the coordinator"),
+        ?assertEqual(serving, vs_coord_srv:mode()),
+        ?assertMatch({error, <<"r-2">>, already_held},
+                     vs_coord_srv:claim(<<"r-2">>, ?VEHICLE, ?USER, ?STATION_2, 7),
+                     "and the claim it still holds is still protected")
     end.
 
 %% Two stations claiming the same vehicle after a failover. Deterministic rule,
@@ -255,10 +269,10 @@ oldest_claim_wins_a_conflict(_) ->
         Older = <<"c-older">>,
 
         {renewed, [Newer], [], _} =
-            vs_coord_srv:renew(?STATION_1, [{Newer, ?VEHICLE, 3, Now - 10000}]),
+            vs_coord_srv:renew(?STATION_1, [{Newer, ?VEHICLE, 3, ?USER, Now - 10000}]),
 
         {renewed, Ok, Revoked, _} =
-            vs_coord_srv:renew(?STATION_2, [{Older, ?VEHICLE, 7, Now - 60000}]),
+            vs_coord_srv:renew(?STATION_2, [{Older, ?VEHICLE, 7, ?USER, Now - 60000}]),
 
         ?assertEqual([Older], Ok, "the older claim wins"),
         ?assertEqual([Newer], Revoked, "the newer one is revoked"),

@@ -1,5 +1,7 @@
 package it.unipi.dsmt.voltshare.model;
 
+import java.util.Locale;
+
 /**
  * One station as the coordinator last described it (contracts/erlang-java.md).
  *
@@ -50,7 +52,7 @@ public class StationView {
     }
 
     public String getTariffEuroKwh() {
-        return String.format("%.2f", tariffCentsKwh / 100.0);
+        return String.format(Locale.ROOT, "%.2f", tariffCentsKwh / 100.0);
     }
 
     public int getId() {

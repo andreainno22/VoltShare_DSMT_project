@@ -12,6 +12,7 @@ import com.ericsson.otp.erlang.OtpNode;
 
 import it.unipi.dsmt.voltshare.model.StationView;
 import it.unipi.dsmt.voltshare.service.BillingService;
+import it.unipi.dsmt.voltshare.service.PenaltyService;
 import it.unipi.dsmt.voltshare.util.Env;
 
 import java.nio.charset.StandardCharsets;
@@ -151,9 +152,56 @@ public final class ErlangBridge {
             case "stations_update" -> onStationsUpdate(tuple.elementAt(1));
             case "leader" -> onLeader(tuple.elementAt(1));
             case "session_closed" -> onSessionClosed(tuple);
+            case "no_show" -> onNoShow(tuple);
+            case "show_up" -> onShowUp(tuple);
+            case "notify" -> onNotify(tuple);
             default -> LOG.log(Level.FINE, "Ignoring message {0}", tag.atomValue());
         }
     }
+
+    /**
+     * {no_show, UserId, StationId, ConnId} — a reservation expired with nobody arriving.
+     *
+     * <p>Unlike {@code session_closed}, the payload IS read: there is no row in the database to
+     * fall back on, because this event is the only record that the reservation was missed. That
+     * makes a lost message a strike never counted — accepted deliberately, see PenaltyService.
+     */
+    private void onNoShow(OtpErlangTuple tuple) {
+        if (tuple.arity() < 4) {
+            LOG.log(Level.WARNING, "Malformed no_show, ignored: {0}", tuple);
+            return;
+        }
+        try {
+            PenaltyService.getInstance().onNoShow(
+                    intOf(tuple.elementAt(1)), intOf(tuple.elementAt(2)), intOf(tuple.elementAt(3)));
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Unparsable no_show, ignored: {0}", e.toString());
+        }
+    }
+
+    /** {show_up, UserId} — the driver arrived, so the consecutive streak resets. */
+    private void onShowUp(OtpErlangTuple tuple) {
+        try {
+            PenaltyService.getInstance().onShowUp(intOf(tuple.elementAt(1)));
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Unparsable show_up, ignored: {0}", e.toString());
+        }
+    }
+
+    /** {notify, UserId, Kind, Text} — something to tell the driver next time they look. */
+    private void onNotify(OtpErlangTuple tuple) {
+        if (tuple.arity() < 4) {
+            LOG.log(Level.WARNING, "Malformed notify, ignored: {0}", tuple);
+            return;
+        }
+        try {
+            PenaltyService.getInstance().onNotify(
+                    intOf(tuple.elementAt(1)), textOf(tuple.elementAt(2)), textOf(tuple.elementAt(3)));
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Unparsable notify, ignored: {0}", e.toString());
+        }
+    }
+
 
     /**
      * A station has closed a session and written its row.
@@ -169,10 +217,36 @@ public final class ErlangBridge {
         BillingService.getInstance().requestSweep();
     }
 
+    /**
+     * A coordinator has announced that it is serving.
+     *
+     * <p>The suspensions are re-sent on <b>every</b> announcement, not only when the node name
+     * changes. That looked like a pointless repetition and was in fact a hole:
+     *
+     * <ul>
+     *   <li>a coordinator that crashes and is restarted comes back with an <em>empty</em>
+     *       suspension map, wins the election again, and announces the same node name. Comparing
+     *       names, nothing "changed" — so nothing was pushed, and it served indefinitely
+     *       letting suspended drivers reserve;</li>
+     *   <li>the same on the other side: a back office that restarts while the leader is the
+     *       first entry of COORD_NODES starts out already believing that name, so the first
+     *       announcement it hears is not a change either.</li>
+     * </ul>
+     *
+     * <p>What the announcement really means is "I have just started serving and my table is
+     * whatever I could rebuild" — which is exactly when the suspensions have to be repeated,
+     * regardless of who is speaking. The push is idempotent and a handful of messages, so
+     * repeating it costs nothing next to the failure it prevents.
+     */
     private void onLeader(OtpErlangObject value) {
         if (value instanceof OtpErlangAtom a) {
             leaderNode = a.atomValue();
             LOG.log(Level.INFO, "Coordinator leader is now {0}", leaderNode);
+
+            // Claims are rebuilt by asking the stations, which hold them. Nobody in the
+            // cluster holds the suspensions — they live only in MySQL — so they can only
+            // arrive from here.
+            PenaltyService.getInstance().pushAllSuspensions();
         }
     }
 

@@ -2,6 +2,8 @@ package it.unipi.dsmt.voltshare.model;
 
 import java.time.LocalDateTime;
 
+import it.unipi.dsmt.voltshare.util.Times;
+
 /**
  * A driver and the single vehicle bound to the account.
  *
@@ -33,6 +35,16 @@ public class User {
         this.maxKw = maxKw;
         this.noShowCount = noShowCount;
         this.suspendedUntil = suspendedUntil;
+    }
+
+    /**
+     * The end of the suspension in local time, for the profile page.
+     *
+     * <p>Stored in UTC like every other instant, so rendering the raw value would tell a driver
+     * in Pisa that their suspension lifts two hours before it does. See {@link Times}.
+     */
+    public String getSuspendedUntilText() {
+        return suspendedUntil == null ? "" : Times.format(suspendedUntil);
     }
 
     public boolean isSuspended() {
