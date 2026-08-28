@@ -209,6 +209,17 @@ meter_readings_accumulate_test() ->
         ?assertEqual(58, maps:get(soc_pct, Session))
     end).
 
+%% ws-driver.md §5.2 divides the battery that is left by the power that is
+%% flowing, so `eta_seconds' needs the size of the battery. It has been in
+%% `#session' since the first `plugged' and only the snapshot was missing
+%% it — the same omission `max_kw' had until M2 step 2.
+the_snapshot_carries_the_battery_size_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        Session = maps:get(session, vs_connector:snapshot(Pid)),
+        ?assertEqual(58.0, maps:get(battery_kwh, Session))
+    end).
+
 %% A meter that resets must not subtract energy already delivered.
 energy_never_goes_backwards_test() ->
     with_connector(fun(Pid) ->

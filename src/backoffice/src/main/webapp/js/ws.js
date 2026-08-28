@@ -59,7 +59,8 @@ function createDriverChannel(config) {
     var backoff  = BACKOFF_MIN_MS;
     var pending  = new Map();   // request_id -> call, in flight right now
     var queue    = [];          // actions raised before the join was acked
-    var handlers = { onState: null, onNotification: null, onStatusChange: null };
+    var handlers = { onState: null, onSession: null,
+                     onNotification: null, onStatusChange: null };
 
     /* ── the endpoint ──────────────────────────────────────────────────── */
 
@@ -252,6 +253,12 @@ function createDriverChannel(config) {
                 /* §5.1, request_id null: a complete snapshot, always. */
                 if (handlers.onState) { handlers.onState(frame.payload); }
                 break;
+            case 'session':
+                /* §5.2, request_id null: the driver's own charge, sent only
+                 * to the owner of a running session.  A page that does not
+                 * register onSession — station.jsp — simply drops it. */
+                if (handlers.onSession) { handlers.onSession(frame.payload); }
+                break;
             case 'notification':
                 if (handlers.onNotification) { handlers.onNotification(frame.payload); }
                 break;
@@ -345,6 +352,7 @@ function createDriverChannel(config) {
         connect: connect,
         send: send,
         set onState(fn)          { handlers.onState = fn; },
+        set onSession(fn)        { handlers.onSession = fn; },
         set onNotification(fn)   { handlers.onNotification = fn; },
         set onStatusChange(fn)   { handlers.onStatusChange = fn; }
     };

@@ -33,12 +33,14 @@ Colgo l'occasione: `cc-probe` non ha lasciato niente in `sessions` — verificat
 
 **La PR su `claim.md`.** Nella tua risposta di M2 dicevi che aprivi la PR per `session_closed` nella forma concordata. Non è ancora arrivata: `claim.md` non la contiene. Non mi ha bloccato — la forma è già in `erlang-java.md` §2.3 e ho implementato contro quella — ma `claim.md` resta l'elenco delle chiamate stazione→coordinatore, e questa manca. Quando vuoi.
 
-**Un servlet gemello per la sessione, se hai dieci minuti.** L'ultimo pezzo di M2-A è la pagina che mostra al driver la sua ricarica in corso: potenza, energia, percentuale, tempo stimato. `station.jsp` è servita dal tuo `StationPageServlet`, che le passa `TOKEN`, `WS_URL` e `STATION` come fissa `jwt.md` §2. Per `session.jsp` servirebbe la stessa identica cosa su una rotta `/session`, con gli stessi tre valori e nient'altro: il resto della pagina è mio.
+**Un servlet gemello per la sessione — è l'unica cosa che manca, e sono dieci righe.** La pagina che mostra al driver la sua ricarica in corso (potenza, energia, percentuale, tempo stimato, fase) è **finita e nell'albero**: `WEB-INF/views/session.jsp`, `js/session.js`, e il frame `session` di `ws-driver.md` §5.2 che la stazione manda già. L'unica cosa che non posso scrivere io è chi la serve.
 
-Se non ti va o non hai tempo, nessun problema — il ripiego è mostrare la sessione dentro `station.jsp`, che è già servita, e non tocco il tuo codice. Fammi sapere quale preferisci, perché la parte Erlang la scrivo comunque e cambia solo dove finisce la vista.
+`station.jsp` è servita dal tuo `StationPageServlet`, che le passa `TOKEN`, `WS_URL` e `STATION` come fissa `jwt.md` §2. Per `session.jsp` serve la stessa identica cosa su una rotta `/session`: gli stessi tre valori e nient'altro, `req.getParameter("id")` per la stazione, forward a `/WEB-INF/views/session.jsp`. Puoi letteralmente copiare `StationPageServlet` e cambiare due stringhe — il commento in testa alla JSP lo dice per esteso. Il resto della pagina è mio e non ti chiede niente.
+
+Finché non c'è, il file non è raggiungibile e non rompe niente: nessuna rotta ci punta. Ho provato tutto su una pagina statica che monta lo stesso markup con le tre costanti messe a mano.
 
 ## 5. Cosa manca a M2-A
 
-La pagina della sessione (sopra) e l'emulatore dei driver per le prove di carico. Poi M2 è chiusa da entrambe le parti.
+Il servlet qui sopra (dieci righe tue) e l'emulatore dei driver per le prove di carico. Poi M2 è chiusa da entrambe le parti.
 
 — A

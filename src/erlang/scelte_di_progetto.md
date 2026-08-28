@@ -1008,6 +1008,11 @@ L'unica cosa che il suo riavvio costa sono le righe ancora in coda dentro di lui
 di perdita di §13.1, e il `terminate/2` la scrive nel log riga per riga invece di lasciarla
 scoprire dopo.
 
+> **Un limite di questa riga, misurato dopo.** Per una sessione che attraversa un riavvio della
+> stazione l'energia è giusta e la **durata no**: `started_at` finisce per essere l'istante
+> dell'adozione, non quello del cavo. Il fatto, il perché e la direzione per chiuderlo stanno
+> in §16.8.
+
 ---
 
 ## 14. Correzioni lotto 1 — quello che il driver paga (M2-A fix 1)
@@ -1268,3 +1273,211 @@ Si farebbe passando al connettore il motivo dalla `terminate/3` di cowboy. È pi
 semantica del contratto e costa un messaggio nuovo sul confine più delicato del passo 1. Non è
 stata scelta ora per una ragione che vale la pena scrivere: **il lotto 2 chiude difetti, non
 introduce meccanismi.**
+
+## 16. Il frame `session` e la pagina della sessione (M2-A passo 4)
+
+`ws-driver.md` §5.2 era dichiarato «non implementato in M1» per una ragione che non vale più:
+portava letture del contatore, e il canale colonnina non esisteva. Ora esiste, i `meter`
+arrivano ogni cinque secondi e nessuno li mostrava a chi sta caricando. Questo passo aggiunge
+un frame al canale driver e una pagina che lo consuma: non tocca connettori, allocatore né
+database, perché tutta la materia era già nello stato che il manager pubblica.
+
+### 16.1 Il frame nasce dallo stesso snapshot del `state`, non da una sottoscrizione propria
+
+Ogni socket driver riceve già lo snapshot completo della stazione — per push e per tick — e
+conosce l'identità del suo utente dal `join`. La sessione di quel driver **è** la voce di
+`connectors` la cui sotto-mappa `session` porta il suo `user_id`: un `lists:search` su un dato
+che passava di lì comunque. Nessuna sottoscrizione nuova, nessuna chiamata al manager, nessuna
+seconda lettura.
+
+La conseguenza importante è sui **tempi**, non sulle righe risparmiate. `SESSION_TICK_MS` è
+dichiarato in §10 con lo stesso default di `STATE_TICK_MS` (5000), e questo permette a un solo
+timer di servirli entrambi: i due frame partono dallo stesso `push/2`, nella stessa lista,
+nella stessa `send`. Un timer proprio avrebbe voluto dire una seconda sveglia per socket e —
+molto peggio — due frame che descrivono **due istanti diversi della stessa stazione**: la
+pagina avrebbe mostrato una potenza letta in un momento accanto a un'energia letta in un
+altro, e la somma dei due non sarebbe stata vera in nessun istante.
+
+Il prezzo, detto per intero: `SESSION_TICK_MS` **non viene letto**. Finché il default coincide
+con quello di `STATE_TICK_MS` la cosa non si vede; se qualcuno lo cambiasse a un valore
+diverso non succederebbe niente. È la variabile a essere ridondante, non il codice a
+ignorarla, ma sta scritto qui perché il contratto la dichiara e qualcuno la cercherà.
+
+### 16.2 Un driver senza sessione non riceve nulla — e l'unico stato del socket
+
+§5.2 si rivolge «al proprietario di una sessione in corso». Un frame di zeri sarebbe peggio del
+silenzio: la pagina non saprebbe distinguere «non stai caricando» da «la tua sessione è ferma»,
+che sono due cose opposte per chi guarda. Quindi `session_frame/2` risponde `undefined` e non
+parte niente.
+
+Questo però lascia scoperto l'ultimo invio che §5.2 chiede, «once more when it ends»: un socket
+si accorge della fine solo perché la sessione che stava riportando **non c'è più** nello
+snapshot. Serve dunque ricordare l'ultimo frame mandato — e ne vale la pena, perché senza la
+pagina resterebbe ferma sull'ultimo aggiornamento senza sapere di essere finita, che è l'unica
+cosa che non può dedurre da sola. È **l'unico stato che il canale driver tiene**, un campo,
+`last_session`.
+
+La transizione sta in `vs_driver_proto:session_push/3` e non nel trasporto, per la ragione per
+cui esiste tutto il modulo: è una decisione, e una decisione è provabile in EUnit solo se non
+c'è un socket di mezzo. `vs_driver_ws` la infila e basta.
+
+Un dettaglio che rende il meccanismo sicuro: quando il manager sta ripartendo, il tick
+**ripete lo snapshot precedente** (`last_state`), che contiene ancora la sessione. Un manager
+che sbatte le palpebre non può quindi fingere la fine di una ricarica. Non è una difesa
+aggiunta apposta: era già così per il `state`, e reggere anche questo caso è ciò che si guadagna
+a derivare il frame dallo stesso dato invece che da una fonte propria.
+
+### 16.3 `complete` viene dal SoC, mai dalla potenza
+
+L'enum di §5.2 è `charging | suspended | complete | overstay | closed`. Tre sono producibili
+oggi: `charging`, `suspended` (lo stato riportato del connettore, dove il passo 2 lo deriva già
+da un limite a zero) e `closed` (§16.2). `overstay` è M4.
+
+`complete` significa «carica finita, cavo ancora attaccato». Si deriva da `soc_pct >= 100`, che
+l'emulatore produce e un'auto vera anche. **Non** da una potenza vicina a zero, ed è §5.2 stessa
+a dare la ragione: zero potenza è ambiguo fra una sospensione e un taper profondo, e le due cose
+significano l'opposto per chi sta aspettando l'auto. Se `soc_pct` non arriva a 100 la fase resta
+`charging`: la stazione non sa che un'auto ha smesso di chiedere, e dirlo è meglio che simularlo.
+
+Una precedenza andava scelta, perché i due casi possono coesistere — una batteria piena chiede
+poco, e sotto scarsità l'allocatore può comunque azzerarla. **`complete` vince su `suspended`:**
+una batteria piena è finita qualunque cosa l'allocatore abbia fatto con gli ultimi kilowatt, e
+dire a un driver che la sua auto carica è «in pausa» sarebbe una risposta peggiore di nessuna.
+
+### 16.4 L'ETA non si smussa, e quando non esiste è `null`
+
+`eta_seconds = battery_kwh × (100 − soc_pct) / 100 / power_kw × 3600`, arrotondato.
+
+Nessuno smoothing, nessuna media mobile, nessuna memoria del valore precedente — ed è una
+scelta, non una semplificazione. Il contratto: «it is advisory and may jump when another car
+arrives and the allocation is recomputed — that jump is the visible proof of P5 and should not
+be smoothed away». Il numero che il driver vede è quello che l'allocazione corrente implica, e
+salta perché è saltata l'allocazione. Misurato dal vivo: 1044 s a 150 kW, 1189 s a 130 kW un
+tick dopo che una seconda auto si è attaccata, con la stessa batteria e un punto di SoC in meno
+da fare.
+
+**`null` quando non c'è niente per cui dividere**, e non un numero enorme: una stima che non
+esiste non è una stima di infinito. Deve essere l'atomo `null` e non `undefined` — jsx rende il
+secondo come la *stringa* "undefined", la stessa trappola che `expires_at` ha in §5.1.
+
+Una batteria di taglia ignota riceve la stessa risposta, e il caso è reale: `ws-chargepoint.md`
+§4.2 rende `max_kw` obbligatorio in un modo in cui non rende `battery_kwh`, quindi una
+colonnina può legittimamente non mandarlo e `vs_cp_proto` legge lo zero. Applicare comunque la
+formula stamperebbe «0 secondi» — cioè «pronta» — sopra un'auto appena attaccata.
+
+**Il divisore è la potenza misurata, non il limite concesso**, e la differenza si vede. Quando
+una seconda auto arriva, l'allocatore si muove in un colpo solo — `allocated_kw` passa da 150 a
+180 in un unico push e il `set_limit` parte subito — ma il contatore ci mette fino a
+`LIMIT_APPLY_SECONDS` (`ws-chargepoint.md` §10, 5 s) ad arrivare al valore nuovo, perché è il
+tempo che il contratto concede all'hardware. L'ETA insegue il contatore, quindi in quei cinque
+secondi passa per un valore intermedio.
+
+Sembra uno smoothing e non lo è: **misurato con un emulatore configurato ad applicare il limite
+di scatto (`--limit-apply 0`), il salto torna in un solo frame** (18 → 21 minuti sulla pagina).
+Dividere per `limit_kw` darebbe un salto sempre istantaneo e una stima sbagliata per tutto il
+tempo della rampa, cioè prometterebbe una potenza che l'auto non sta ancora prendendo. §5.2
+chiede il tempo che ci vuole davvero, e quello lo sa solo il contatore.
+
+`battery_kwh` era in `#session` fin dal primo `plugged` e mancava solo allo snapshot: è
+l'unica aggiunta a `vs_connector:build_snapshot/2`, dello stesso tipo di quella fatta al passo
+2 per `max_kw`. Additiva: `wire_connector`, `vs_cp_proto` e `vs_power` leggono chiavi che
+nominano, quindi la taglia della batteria non trapela nel frame `state` di §5.1, che ha forma
+fissa — e c'è un test che lo tiene fermo.
+
+### 16.5 La pagina non conta da sola
+
+`js/ws.js` non è stato riscritto: era stato costruito al passo M1-4 per essere riusato qui, e
+l'innesto è quello previsto — un caso `session` nel `switch`, il campo nel letterale degli
+handler, un setter accanto agli altri tre. Nove righe. `station.js` non registra `onSession` e
+non vede differenza; una pagina della stazione aperta dal proprietario di una sessione riceve
+comunque il frame e lo lascia cadere.
+
+`js/session.js` obbedisce a §7.1 nel punto in cui sarebbe stato più comodo non farlo:
+**nessun contatore locale.** L'energia non striscia in avanti fra un frame e l'altro, il SoC non
+interpola, la stima non viene mediata con quella di prima. Ogni numero cambia quando arriva un
+frame e in nessun altro momento. Con un frame ogni cinque secondi la pagina è viva abbastanza, e
+un client che avanza per conto suo ha un modello della stazione — che è esattamente ciò che P6
+esiste per impedire.
+
+L'unica cosa che scorre in locale è il tempo trascorso, e non è un'eccezione alla regola: è la
+lettura di un orologio, non un dato della stazione. È **ricalcolato** da `started_at` a ogni
+ripasso invece che incrementato, così non può derivare e una scheda rimasta sospesa torna
+giusta appena si sveglia. Una sessione `closed` lo ferma: ha una fine, e il cronometro non deve
+correrle oltre.
+
+La fase `suspended` è l'unico punto dell'applicazione in cui il riparto della potenza diventa
+visibile alla persona a cui sta capitando, e per questo è spiegata invece che nominata:
+«suspended» da solo si legge come un guasto, e non lo è — la sessione è viva, il cavo è sotto
+tensione, l'auto ricomincerà da sola.
+
+### 16.6 Il socket che cade: l'unico caso che il server non può curare
+
+La pagina della sessione ha un buco che la griglia della stazione non ha, e vale la pena
+scriverlo perché la simmetria fra i due frame lo nasconde.
+
+`station.js` può permettersi di tenere la griglia mentre riconnette: §3 spinge un `state` a ogni
+`join`, quindi la staleness dura esattamente quanto la riconnessione. Per §5.2 quella garanzia
+**non esiste**, ed è una conseguenza diretta di §16.2. Se la ricarica finisce mentre la pagina è
+disconnessa, il frame `closed` è andato a un socket che non c'è più; il socket nuovo parte con
+`last_session` vuoto e a un driver senza sessione non si manda niente. Nessun frame arriverà
+**mai** a dire che è finita.
+
+Tenere la card sarebbe quindi lasciare un «Charging, 130 kW» vivo sopra una sessione chiusa da
+minuti — precisamente la deriva che §7.1 esiste per impedire, e in una pagina il cui commento in
+testa dichiara di obbedirvi. Quindi `session.js` azzera ciò che ha in mano appena il canale non
+è più `online`: la risposta onesta è «non lo so», e il placeholder più la pastiglia la dicono
+insieme. Se invece la ricarica è sopravvissuta, il primo frame dopo il rientro ridisegna la card
+entro un tick.
+
+**Non si è scelto di curarlo lato server**, e la ragione è che le cure disponibili sono peggiori
+del male: mandare un frame di zeri a chi non carica riporta l'ambiguità che §16.2 toglie, e far
+sopravvivere `last_session` alla morte del socket vorrebbe dire uno stato per utente sulla
+stazione — cioè la sessione lato server che §7.5 non ha, tenuta in piedi per un caso di bordo.
+Tre righe nella pagina bastano.
+
+### 16.7 Chi serve la pagina: `session.jsp` esiste, il servlet no
+
+
+`station.jsp` è servita da `StationPageServlet`, che mette in pagina i tre valori di `jwt.md`
+§2. Per `session.jsp` non esiste niente di simile e il servlet è **codice di B**. Verificato
+prima di scrivere: otto servlet in `backoffice/src/main/java/.../web/`, nessuno per la sessione.
+
+La strada scelta è chiedere a B un servlet gemello (`/session`, stesso contratto, dieci righe),
+richiesta già scritta in `contracts/nota-per-B-m2a.md` §4. `session.jsp` è committata **pronta**
+invece che tenuta indietro: è lo stesso scheletro di `station.jsp`, e quando il servlet arriva
+non resta niente da scrivere da questa parte. Fino ad allora il file non è raggiungibile, e le
+prove dal vivo sono girate su una pagina statica che monta lo stesso `<style>` e lo stesso
+markup con le tre costanti messe a mano.
+
+### 16.8 Un artefatto trovato dalle prove: la durata di una sessione che attraversa un riavvio
+
+Non è di questo passo — è della riga su `sessions` (§13) e della riconciliazione (§11) — ma è
+saltato fuori qui, verificando che il frame `closed` e la riga dicessero lo stesso numero, ed è
+annotato dove è stato visto.
+
+**Il fatto.** La riga 18 delle prove porta `12.042 kWh` con `started_at`/`ended_at` che coprono
+**ventitré secondi**. L'energia è giusta — coincide al millesimo con il contatore
+dell'emulatore, e una sola riga, nessun doppio addebito. La durata no: quell'auto aveva caricato
+un'ora, attraversando due spegnimenti della stazione.
+
+**Perché.** `ws-chargepoint.md` §6 fa tornare indietro **l'energia, non l'istante di inizio**.
+Una stazione che riparte ha perso la sua sessione; il `plugged` di riconciliazione le ridà il
+cumulativo del contatore e nient'altro, quindi `started_at` diventa l'istante dell'adozione. È
+la stessa cosa già scritta in §13 sul percorso di adozione — lì suonava come un dettaglio, qui
+si è visto quanto può essere grande lo scarto.
+
+**Cosa non rompe.** Il conto. `BillingService.cost/3` prezza energia, tariffa e secondi di
+overstay: nessuna delle due date entra nel calcolo, verificato leggendo il metodo. Rompe invece
+qualunque lettura di `ended_at - started_at` come «tempo di ricarica», che è una cosa che
+qualcuno prima o poi farà.
+
+**La direzione, concordata e non implementata.** Al `plugged` di riconciliazione la colonnina
+aggiunge **da quanti secondi sta erogando**, e la stazione ricostruisce `started_at` con il
+proprio orologio sottraendoli. La forma è scelta apposta: l'hardware fornisce una **durata**,
+che è un dato fisico misurato da lui, non un orario — quindi §7.4 («i timestamp che contano
+sono quelli della stazione, l'orologio della colonnina è una comodità») resta rispettata alla
+lettera, e due macchine con orologi diversi continuano a non doversi accordare.
+
+`ws-chargepoint.md` è di A da entrambi i lati, quindi la modifica non richiede una PR. **Non si
+fa adesso:** prima il passo 5 (emulatore dei driver e prove di carico), poi un pair piccolo per
+chiuderla. Il passo 4 aggiunge un frame, non rimaneggia il contratto della colonnina.

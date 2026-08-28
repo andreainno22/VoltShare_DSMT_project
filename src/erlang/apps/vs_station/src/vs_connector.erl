@@ -786,19 +786,25 @@ build_snapshot(State, Data = #data{hold = Hold, session = S}) ->
                              end},
     case S of
         undefined -> Base;
-        _ -> Base#{session => #{user_id    => S#session.user_id,
-                                vehicle_id => S#session.vehicle_id,
-                                started_at => S#session.started_at,
-                                energy_kwh => S#session.energy_kwh,
-                                soc_pct    => S#session.soc_pct,
+        _ -> Base#{session => #{user_id     => S#session.user_id,
+                                vehicle_id  => S#session.vehicle_id,
+                                started_at  => S#session.started_at,
+                                energy_kwh  => S#session.energy_kwh,
+                                soc_pct     => S#session.soc_pct,
+                                %% the numerator of `eta_seconds'
+                                %% (ws-driver.md §5.2). Same story as the
+                                %% two below: it has been in #session since
+                                %% the first `plugged' and only the
+                                %% snapshot was missing it.
+                                battery_kwh => S#session.battery_kwh,
                                 %% what the car can take, for the
                                 %% allocator's demand (SCOPE §3.5); it was
                                 %% in #session already and only the
                                 %% snapshot was missing it
-                                max_kw     => S#session.max_kw,
+                                max_kw      => S#session.max_kw,
                                 %% for the `boot' ack of §3.1, which hands
                                 %% the charge point the limit in force
-                                limit_kw   => S#session.limit_kw}}
+                                limit_kw    => S#session.limit_kw}}
     end.
 
 %% M2 step 2 — `suspended' is derived here, and is deliberately **not** a

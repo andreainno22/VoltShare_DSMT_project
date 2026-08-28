@@ -1466,6 +1466,201 @@ revisore, con quella di D-4 diventata tre: due rifiuti e un controllo positivo c
 altre due dal passare per il motivo sbagliato), 2 per l'aritmetica di D-9. I sei scenari della
 potenza: 150 / 130-50 / 80-50-50 / 100-100-100-50 / 127,5-127,5-45-50 / 7,5-7,5-0, identici.
 
+## 7v. M2-A passo 4: il frame `session` e la pagina della sessione — 28 agosto
+
+Branch `a/m2-session`, da `a/m2-fix2` (`ae848d7`) e **non da `main`** — vedi la verifica
+bloccante 1 qui sotto. `vs_driver_proto` guadagna `session_frame/2` e `session_push/3`,
+`vs_driver_ws` un campo di stato e il rinomino di `push_state/2` in `push/2`,
+`vs_connector:build_snapshot/2` la chiave `battery_kwh`. Lato pagina: nove righe in `js/ws.js`,
+`js/session.js` e `session.jsp` nuovi. Nessun contratto toccato: §5.2 si implementa com'è
+scritta, e `SESSION_TICK_MS` era già in §10.
+
+Con questo, chi carica vede la propria ricarica. Fino a ieri la sessione si intravedeva solo di
+sbieco, come `power_kw` nella griglia della stazione.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline 274 test **su `main`** | `git ls-tree main` + `rebar3 eunit` sull'albero corrente | **fallita come premessa, sana come sostanza.** `main` è fermo a `54a03c4` e non ha **nessuno** dei merge di M2-A: niente `vs_cp_proto`, `vs_cp_ws`, `vs_power`, niente `vs_station_db_tests`. I 274 verdi esistono, ma su `a/m2-fix2`. Fermato e segnalato prima di scrivere una riga |
+| Esiste un servlet per `session.jsp` | otto file in `backoffice/src/main/java/.../web/` | **no**, come il piano si aspettava. C'è solo `StationPageServlet` (`@WebServlet("/station")`, forward a `station.jsp`, mette in pagina `station` e `sessionScope.jwt`). Nessuna rotta `/session` |
+| `battery_kwh` non è già nello snapshot | `build_snapshot/2` letto prima di toccarlo | **confermato**: la sotto-mappa aveva `user_id`, `vehicle_id`, `started_at`, `energy_kwh`, `soc_pct`, `max_kw`, `limit_kw`. Nessun doppione da creare |
+
+**Sulla prima.** Non è «i merge sono andati male»: è che non sono mai stati fatti. La sostanza
+che il controllo protegge — una base M2-A completa e verde — c'era, solo su un altro ramo e con
+il lotto 2 ancora non committato. Le due decisioni sono state chieste e prese: committare il
+lotto 2 (`ae848d7`) e ramificare da lì, e chiedere a B il servlet gemello.
+
+### Catena dei chiamanti, cercata prima di toccare il codice
+
+| Funzione | Chiamanti trovati | Conseguenza |
+|---|---|---|
+| `vs_connector:build_snapshot/2` (+`battery_kwh`) | `vs_station_mgr:connector_entry/1` → `build_state/1`; `vs_cp_proto:limit_kw/2` (legge `limit_kw`); `vs_power:demand_kw/3` (`max_kw`, `soc_pct`, `limit_kw`), `demands/1` (`started_at`), `is_live/1` (`session` è una mappa); `vs_driver_proto:wire_connector/2` (`user_id`); 15 punti nei test | **additiva**: ogni lettura nomina la sua chiave. Cercate anche le asserzioni su mappa intera (`?assertEqual(#{`) per escludere una rottura silenziosa: nessuna riguarda la sotto-mappa `session` |
+| `vs_driver_ws:push_state/2` → `push/2` | privata, due chiamanti nello stesso modulo (`{station_state, _}` e `state_tick`) | cambia il tipo di ritorno in `{Frames, State}`, perché ora aggiorna `last_session`. Nessun chiamante fuori dal modulo |
+| `vs_driver_ws:websocket_info/2` | cowboy | due frame invece di uno, dallo stesso snapshot e nella stessa `send` |
+| `vs_driver_proto` (+ due funzioni) | `vs_driver_ws` | additiva |
+| `js/ws.js` (+ caso `session`) | `station.js`, `session.js` | additiva. **`station.js` non registra `onSession`**: una pagina della stazione aperta dal proprietario di una sessione riceve il frame e lo lascia cadere, senza differenza visibile |
+
+### Verificato — girato davvero
+
+- **Suite: 286 test, 0 fallimenti** (`rebar3 eunit`, mai `--app`). 274 di baseline + 12 nuovi:
+  11 su `vs_driver_proto` (gli otto campi del contratto e nessuno in più, il silenzio per chi
+  non carica, la proprietà del frame, `suspended` dal connettore, `complete` dal SoC e non dalla
+  potenza, il salto dell'ETA, i tre casi di `null`, il frame `closed` e il silenzio dopo, il
+  giro attraverso jsx, e la non-fuga di `battery_kwh` nel frame `state`) e 1 su `vs_connector`.
+  Tutti su mappe costruite a mano: nessun manager, nessun connettore, nessun socket.
+- **I due frame partono nella stessa `send`.** Sul nodo vivo, timestamp del socket driver:
+  `09:17:39.691 state` / `09:17:39.691 session`, per venti tick di fila. Non è una coincidenza
+  di arrotondamento: è la stessa lista di frame.
+- **Energia e potenza avanzano ogni cinque secondi.** St. 2 / conn 5, veicolo 2, batteria 58
+  kWh: `0.333 → 0.541 → 0.749 → 0.958 → 1.166 → 1.374 kWh` a 150 kW, un frame ogni 5 s.
+- **L'ETA salta, misurato.** Con la sola auto a 150 kW: `eta = 1044 s` (soc 25 %). Una seconda
+  auto si attacca sul conn 6 (50 kW su un sito da 180): il riparto scende a 130 kW e un tick
+  dopo `eta = 1189 s` (soc 26 %). **+145 secondi in un tick**, con un punto di SoC *in meno* da
+  fare. È P5 che si vede, ed è la ragione per cui non c'è smoothing. Nessun `SITE_POWER_KW`
+  ritoccato: la stazione 2 è seminata a 180 kW contro 250 installati proprio per questo.
+  Rifatto poi nel browser e letto sulla pagina — vedi sotto.
+- **`suspended` dal vivo.** `SITE_POWER_KW` di st. 2 portato a 10 con un override di compose
+  (file di scratch, non committato): due auto, quota 5 kW a testa, sotto `MIN_CHARGE_KW`.
+  Il frame: `phase=suspended power=0 kW eta=null`. La vittima è l'ultima arrivata, come vuole
+  `victim/1`.
+- **Il frame finale, per due strade diverse.** (a) `stop_session` dal canale driver → la
+  stazione manda `stop` → `cp.js` stacca il cavo e riporta il totale → nell'istante in cui il
+  connettore torna `free` arriva `phase=closed energy=5.97 kWh soc=32%`, e **niente dopo**.
+  (b) `--unplug-at-soc 24`, cioè il cavo che esce da solo senza che il driver tocchi niente →
+  `phase=closed energy=1.083 kWh soc=24%`, di nuovo una volta sola.
+- **Il canale colonnina regge il riavvio.** Le stazioni sono state riavviate due volte durante
+  le prove e l'emulatore ha riconciliato da solo ogni volta (§6): `boot` + `plugged` con il
+  cumulativo, sessione riaperta senza intervento.
+- **Il rendering di `js/session.js`** contro i payload reali dei sei casi, sotto un DOM di
+  prova: placeholder senza sessione, «Charging / 130.0 kW / 5.970 kWh / 18 min», «Paused» con
+  la spiegazione al posto della parola, «Charge complete», «Session ended» con potenza e stima
+  a `—` e i totali al loro posto, e il socket che cade (sotto).
+
+### Nel Chrome vero — cosa è stato visto con gli occhi
+
+Tutto il blocco qui sopra è misurato **sul filo**: un client WebSocket Node che parla il
+contratto e stampa i frame uno per uno. Il giro nel browser è arrivato dopo, sulla pagina
+statica servita da `python -m http.server` (stesso `<style>`, stesso markup e gli stessi
+`js/ws.js` e `js/session.js` della JSP, con le tre costanti di `jwt.md` §2 messe a mano).
+Distinguere le due cose è il punto di questa sezione.
+
+- **Card `charging`, vista**: connettore #5, badge *Charging*, barra del SoC, potenza, energia
+  ed ETA che avanzano ogni cinque secondi, pastiglia *live*. La prima lettura è caduta dentro
+  la rampa del limite (≈77 kW → «40 min»), che è la risposta giusta: l'ETA insegue il contatore
+  e non lo smussa.
+- **Card `suspended`, vista**: badge *Paused*, `Power 0.0 kW`, `Energy 0.000 kWh`,
+  `Estimated time left unavailable`, e la nota ambra al posto della parola. **Con l'energia
+  ferma e il Time che continuava a scorrere** — che è la dimostrazione visiva di §7.1: la
+  pagina fa scorrere l'orologio, non il contatore.
+- **La fase `suspended` ha tenuto per un'ora esatta**, ~720 frame consecutivi a
+  `power=0 eta=null`, senza un solo rimbalzo. È il D-3 del lotto 2 (si sospende solo per
+  scarsità) confermato dal vivo su una finestra che i test unitari coprono per sei tick.
+- **Card `closed`, vista**: *Session ended*, potenza e stima a `—`, i totali al loro posto.
+- **Il reset del reconnect, verificato per via indiretta ma conclusiva**: `docker stop` +
+  `docker start` di `station2` e la sessione è ricomparsa con il **Time ripartito da zero**.
+  Il socket è caduto davvero e la card si è svuotata per la durata del riavvio — troppo breve
+  per coglierla a occhio, ma il cronometro azzerato lo dimostra. *Nota metodologica:* il
+  throttling «Offline» di DevTools **non** chiude i WebSocket già aperti, quindi non serve come
+  prova; l'unico modo è far cadere il socket sul serio.
+- **Il salto dell'ETA, letto sulla pagina**: `18 min` → `21 min` in **un solo frame**, cinque
+  secondi l'uno dall'altro, con il SoC fermo al 23 %. Sul filo: `eta 1072 s` a 150 kW,
+  `eta 1237 s` a 130 kW.
+
+### La rampa non è smoothing, e la differenza è stata misurata
+
+Al primo tentativo il salto è arrivato in **due** frame (`15 min → 16 min → 18 min`), e la
+domanda giusta era se ci fosse uno smoothing nascosto. Non c'è, e la prova è in due pezzi.
+
+**Primo:** l'allocatore si muove in un colpo solo. Al `plugged` della seconda auto,
+`allocated_kw` passa **150 → 180 in un unico push** e il `set_limit(130)` parte subito. Ciò che
+sale gradualmente è il **contatore**, perché `ws-chargepoint.md` §5 concede alla colonnina
+`LIMIT_APPLY_SECONDS` (§10, 5 s) per onorare un limite nuovo, e l'emulatore interpola su quella
+finestra proprio per non far sembrare lo scenario migliore di com'è. L'ETA insegue il contatore
+istante per istante, senza memoria del valore precedente.
+
+**Secondo, ed è la prova decisiva:** rifatta la scena con `--limit-apply 0` — cioè con una
+colonnina che applica il limite di scatto — il salto è tornato in **un frame solo**, `18 → 21
+min`. Se ci fosse uno smoothing da qualche parte, quel parametro dell'emulatore non avrebbe
+potuto toglierlo.
+
+### La riga scritta, verificata a tre voci
+
+Quattro sessioni chiuse nel giro finale (righe 18-21), **una riga per sessione, nessun
+doppione**, e per ognuna i tre numeri coincidono:
+
+| Riga | Frame `closed` | Contatore dell'emulatore | `sessions.energy_kwh` |
+|---|---|---|---|
+| 21 (conn 5, utente 2) | `3.986 kWh` | `final energy_kwh = 3.986` | `3.986` |
+| 18 (conn 6, utente 1) | — (non è il driver della pagina) | `final energy_kwh = 12.042` | `12.042` |
+
+La riga **18 è la prova dell'offset**: la sessione era nata al riavvio delle 10:43 ed è vissuta
+23 secondi, ma porta **12.042 kWh** — un'ora di ricarica erogata *prima* di due spegnimenti
+della stazione, restituita dall'emulatore con il `plugged` della riconciliazione (§6) e non
+contata due volte. Il totale non è mai risultato superiore al contatore, che era la condizione
+per fermarsi.
+
+**Un artefatto onesto da mettere agli atti:** su quella riga `started_at`/`ended_at` coprono 23
+secondi mentre l'energia ne copre sessanta minuti. Una stazione che riparte perde la sua
+sessione e §6 le restituisce **l'energia, non l'istante di inizio**; la riga registra quindi la
+sessione post-riavvio. Non tocca il conto — `BillingService.cost/3` prezza energia e secondi di
+overstay, mai le due date — ma la durata di una sessione che ha attraversato uno spegnimento
+non è quella vera, e chi leggesse `ended_at - started_at` come tempo di ricarica sbaglierebbe.
+
+### Un difetto trovato in revisione, che nessuna delle prove copriva
+
+Tutte le prove del rendering davano frame a una pagina connessa. Nessuna faceva **cadere il
+socket**, ed è lì che stava il buco: se la ricarica finisce mentre la pagina è disconnessa — cioè
+esattamente ciò che è successo due volte oggi, riavviando `station2` — il frame `closed` va a un
+socket che non esiste più, il socket nuovo riparte con `last_session` vuoto, e a un driver senza
+sessione **non si manda niente**. Nessun frame sarebbe mai arrivato a dire che era finita: la
+pagina sarebbe rimasta su «Charging, 130 kW» con il cronometro che correva, sopra una sessione
+chiusa da minuti.
+
+È la deriva che §7.1 esiste per impedire, in una pagina il cui commento in testa dichiara di
+obbedirvi. `station.js` non ce l'ha solo perché §3 spinge un `state` a ogni `join`, e per §5.2
+quella garanzia non esiste.
+
+Corretto lato pagina, tre righe: appena il canale non è `online`, `session.js` butta ciò che ha
+in mano e torna al placeholder. La cura lato server sarebbe stata peggiore — un frame di zeri
+riporta l'ambiguità che si era tolta, e far sopravvivere `last_session` alla morte del socket
+vuol dire uno stato per utente sulla stazione, cioè la sessione lato server che §7.5 non ha.
+Motivazione per esteso in `scelte_di_progetto.md` §16.6; il caso è ora nella prova di rendering.
+
+### Una scelta di formato, presa guardando l'output
+
+La stima usciva come `18:12`, che un lettore prende per un'ora del giorno. Ora è scritta a
+parole e arrotondata al minuto (`18 min`, `1 h 22 min`): il secondo è rumore su un numero che è
+dichiaratamente advisory e che salta. Il tempo trascorso resta a `mm:ss`, perché lì è un
+cronometro.
+
+### Non provato — e perché
+
+1. **`session.jsp` non è mai stata renderizzata da Tomcat**, perché nessun servlet la serve. È
+   committata pronta; il rischio residuo è un errore JSP che solo il compilatore di pagine
+   troverebbe. Lo `<style>` e il markup sono però esattamente quelli girati nel browser sulla
+   pagina statica, e la parte JSP è tre righe di taglib più il blocco di `jwt.md` §2 copiato da
+   `station.jsp`.
+2. **La barra del SoC non è stata guardata a percentuali diverse.** È stata vista disegnata,
+   ma non c'è una lettura fatta apposta a 0 %, 50 % e 100 % per confermare che la larghezza
+   segua. Il calcolo è ritagliato in `[0, 100]` ed è provato dal DOM di prova, non dall'occhio.
+3. **`SESSION_TICK_MS` non viene letto** (scelte §16.1). Finché il default coincide con quello
+   di `STATE_TICK_MS` non si vede; cambiarlo non produrrebbe alcun effetto.
+4. **`overstay` e `complete` non sono stati visti dal vivo.** Il primo è M4. Il secondo
+   richiede un'auto che arrivi al 100 %, cioè una ventina di minuti di emulatore: è provato in
+   EUnit, sui tre casi che contano (taper al 94 % → `charging`, 100 % → `complete`, 100 % con
+   il connettore sospeso → `complete`), e nel browser solo attraverso il DOM di prova.
+5. **Lo svuotamento della card alla caduta del socket non è stato colto a occhio**, perché dura
+   i due secondi del riavvio: è dimostrato dal cronometro ripartito da zero, non da un
+   fotogramma. Il throttling «Offline» di DevTools non serve come prova — non chiude i
+   WebSocket già aperti.
+6. **Effetti sull'ambiente vivo.** `station1` e `station2` sono state ricostruite dal codice di
+   questo passo (station2 era rimasta al lotto 1). Le prove hanno prodotto le righe sintetiche
+   **13-21** in `sessions` per gli utenti 1 e 2, come le precedenti, tutte con `cost_cents`
+   NULL perché il back office non era in piedi; `station2` è stata riavviata cinque volte, due
+   delle quali con un `SITE_POWER_KW` a 10 che **non** è nel compose committato. Alla fine
+   `docker compose down`: nessun container e nessun emulatore lasciati in giro.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
