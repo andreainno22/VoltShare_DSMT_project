@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 25 agosto 2026 — M1-B, M2-B e **M3-B** chiuse. Tre coordinatori con elezione bully, quorum e ricostruzione: failover provato in Docker uccidendo due leader di fila. 132 test, 0 fallimenti.
+**Ultimo aggiornamento:** 28 agosto 2026 — M1-B, M2-B, M3-B e **M4-B** chiuse. Penalità verificate end-to-end, comprese le sospensioni che sopravvivono a un failover. Partizione di rete vera dimostrata su un host solo. 133 test, 0 fallimenti.
 
 ---
 
@@ -15,7 +15,7 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 | **M1** percorso base | ✅ **chiusa e verificata in Docker il 27/08**: 7 container, token emesso da Tomcat e verificato dalla stazione, `reserve` fino al coordinatore vero e ritorno, dedup provata dentro `vs_coord_srv`, lease che libera da solo, riconnessione dopo `stop station1`. Resta fuori solo la resa visiva in un browser vero (estensione non disponibile): la logica del rendering è provata con un DOM minimale, non i pixel | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
 | **M2** sessione e potenza | ⬜ canale colonnina, potenza, INSERT sessione, `session.jsp` | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
 | **M3** tolleranza ai guasti | ⬜ rinnovo contro il nuovo leader, revoca, riconnessione client | ✅ **elezione, quorum, ricostruzione** — failover provato in Docker (§7m) |
-| **M4** regole di dominio | ⬜ | ⬜ |
+| **M4** regole di dominio | ⬜ overstay, lista d'attesa, segnalazione no_show | ✅ **penalità, notifiche, profilo** — provate contro il cluster (§7r) |
 | **M5** consegna | ⬜ | ⬜ |
 
 ### Cosa è stato realmente eseguito
@@ -775,6 +775,72 @@ percorso dell'erogazione.
 - `vs_coord_membership_tests` (9) — un nodo solo è sempre in maggioranza, 1 di 3 no, l'avvio è
   ottimista di proposito (altrimenti a un riavvio simultaneo tutti e tre si eleggono), e
   **un estraneo non fa quorum**.
+
+---
+
+## 7r. M4-B: penalità, notifiche, profilo — 28 agosto
+
+Fatta e verificata end-to-end contro il cluster vero.
+
+| File | Ruolo |
+|---|---|
+| `service/PenaltyService.java` | N=2 no-show consecutivi → K=1 giorno di sospensione |
+| `dao/NotificationDao.java`, `model/Notification.java` | la tabella `notifications`, di sola B |
+| `UserDao` (+5 metodi) | contatore e sospensione, con la riga bloccata |
+| `web/NotificationsServlet`, `web/ProfileServlet` + le due JSP | le pagine, e la voce nel menu |
+| `vs_coord_srv`, `vs_coord_bo` | inoltro di `no_show` / `show_up` / `notify` verso Java |
+
+### La prova
+
+```
+1º no_show  → no_show_count = 1, notifica "reservation_expired"
+2º no_show  → suspended_until = domani, contatore azzerato,
+              notifica "suspended"
+
+prenotazione per l'utente sospeso  : {error, <<"r-susp">>, suspended}
+prenotazione per un utente normale : {ok, <<"r-ok">>, <<"c-5615...">>, ...}
+```
+
+La seconda riga è quella che conta: la sospensione è **mirata**, non un rifiuto generalizzato. E
+la pagina profilo dice al conducente fino a quando, e che **può comunque caricare a un connettore
+libero** — perché è la prenotazione a essergli tolta, non la ricarica.
+
+### L'interazione con M3, progettata apposta
+
+I claim sopravvivono a un failover perché il nuovo leader può **chiederli alle stazioni**, che li
+possiedono. Le sospensioni no: nessuno nel cluster le ha, vivono solo in MySQL. Un nuovo leader
+partirebbe quindi senza saperne nulla, e l'utente sospeso potrebbe riprenotare dopo ogni elezione.
+
+Risolto con un **push**, non con una domanda: il ponte, quando scopre un leader nuovo, gli rimanda
+tutte le sospensioni attive. Provato uccidendo il leader:
+
+```
+backoffice | Coordinator leader is now vs@coord2
+backoffice | Re-sent 1 suspension(s) to the new leader
+
+utente sospeso sul NUOVO leader: {error, <<"r-fo">>, suspended}
+```
+
+È lo stesso problema del rebuild ma con la sorgente **dall'altra parte del confine**, e per questo
+si risolve nella direzione opposta. Vale la pena raccontarlo così all'orale: la regola non è "il
+nuovo leader chiede", è "chi possiede lo stato lo ripropone", e le stazioni e il back office lo
+possiedono in due modi diversi.
+
+### Due scelte da difendere
+
+**Il contatore è scritto solo dal back office.** La stazione osserva e segnala; non conta e non
+sospende. "Due *consecutivi*" richiede storia, e la storia in una stazione si perde al riavvio —
+mentre il senso della regola è che si accumuli.
+
+**L'inoltro di `no_show` è gated su `serving`**, a differenza di `session_closed`. Due
+coordinatori che relayano lo stesso evento lo farebbero contare due volte, e il contatore non ha
+modo di distinguere i duplicati — mentre una sessione fatturata due volte è impossibile per via
+della UPDATE condizionata. Stessa forma, garanzie diverse, quindi trattamento diverso.
+
+E una concorrenza che **non** abbiamo introdotto: la sospensione è decisa in un posto solo e il
+coordinatore ne è la cache, così non diventa un secondo oggetto conteso accanto al connettore
+(`DESIGN-NOTES` §4b). L'unica corsa possibile è due `no_show` per lo stesso utente nello stesso
+istante, ed è gestita dove va gestita — `recordNoShow` incrementa e rilegge con la riga bloccata.
 
 ---
 
