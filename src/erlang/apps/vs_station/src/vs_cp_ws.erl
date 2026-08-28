@@ -113,10 +113,28 @@ text_frames(Frames) ->
 %%% configuration — ws-chargepoint.md §10
 %%%===================================================================
 
-%% §3.2, read as a duration: three missed heartbeats. The same number the
-%% connector uses for its grace timer (`vs_connector:cp_grace_ms/0'), so
-%% "the socket timed out" and "the socket was never there" expire on the
-%% same clock instead of on two that can disagree.
+%% D-9 — the first half of the three missed heartbeats of §3.2.
+%%
+%% This used to compute the whole product, and so did
+%% `vs_connector:cp_grace_ms/0'; the old comment here claimed the two
+%% expired "on the same clock". They compute the same *duration*, which is
+%% not the same instant: they run **in series**. Cowboy waits out the
+%% silence and closes the socket; only then does the connector see the
+%% `DOWN' and start its own grace. Three missed heartbeats became six, and
+%% a charge point that had gone quiet stayed reservable for three minutes.
+%%
+%% The ninety seconds are one budget, split: `CP_HEARTBEAT_MISSED - 1'
+%% intervals here, the last interval as the connector's grace. Sixty plus
+%% thirty is ninety, which is what §3.2 asks for.
+%%
+%% The more faithful alternative was to tell the two deaths of the socket
+%% apart — closed for idle timeout means the heartbeats are already spent
+%% and `out_of_service' is due at once; closed for anything else deserves
+%% the full grace — by passing cowboy's `terminate/3' reason on to the
+%% connector. It is the better model and it costs a new message on the most
+%% delicate boundary of step 1; it is written up in
+%% `scelte_di_progetto.md' as the road to take if this split turns out too
+%% rigid. Not now: this batch closes defects, it does not add mechanisms.
 idle_timeout_ms() ->
-    vs_env:get_int("CP_HEARTBEAT_MISSED", 3)
+    (vs_env:get_int("CP_HEARTBEAT_MISSED", 3) - 1)
         * vs_env:get_int("CP_HEARTBEAT_INTERVAL_S", 30) * 1000.

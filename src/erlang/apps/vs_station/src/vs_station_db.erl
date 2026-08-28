@@ -189,11 +189,32 @@ start_link(Opts) ->
 %%
 %% A cast on purpose — see the module doc. `gen_server:cast/2' to a name
 %% that is not registered is dropped silently rather than raising, which
-%% is the behaviour wanted here too: a station whose database process is
+%% is half of what is wanted here: a station whose database process is
 %% restarting must still free its connectors.
+%%
+%% The other half is that it must not do so **in silence**. Dropped
+%% silently, this was the one place in the system where a finished session
+%% could vanish leaving nothing behind at all: the connector matches on the
+%% `ok' and carries on believing it delivered the row, and no log line
+%% anywhere says otherwise. So the writer is checked first, and if it is
+%% not there the row is written to the log in the same form the queue cap
+%% already uses — where the line is declaredly the last copy of what is
+%% being lost.
+%%
+%% What is deliberately **not** done: neither a second queue outside the
+%% writer (it would have to be kept in step with the first) nor waiting for
+%% the writer to come back. The rule of step 3 stands — the connector never
+%% waits for the database — and this check costs one `whereis'.
 -spec insert_session(map()) -> ok.
 insert_session(Row) ->
-    gen_server:cast(?SERVER, {insert_session, Row}).
+    case whereis(?SERVER) of
+        undefined ->
+            logger:error("station db: no writer is running, losing an unwritten "
+                         "session (this line is its last copy): ~p", [Row]),
+            ok;
+        Pid ->
+            gen_server:cast(Pid, {insert_session, Row})
+    end.
 
 %% @doc The account a vehicle belongs to (ws-chargepoint.md §4.2 — the
 %% charge point identifies the car, the station bills the person).

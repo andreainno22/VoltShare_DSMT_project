@@ -150,18 +150,29 @@ no_session_gets_more_than_it_asked_for_test() ->
                 end, Sessions)
       end, cases()).
 
-%% The floor is a floor: an allocation is either zero — suspended, and the
-%% contract's own way of saying so — or at least MIN_CHARGE_KW. Nothing
-%% trickles.
-nothing_is_allocated_between_zero_and_the_floor_test() ->
+%% Nobody is left trickling. An allocation is either zero — suspended, and
+%% the contract's own way of saying so — or at least MIN_CHARGE_KW, or
+%% exactly what the session asked for.
+%%
+%% M2 fix 2 (D-3): the third arm is new, and it is the property said
+%% properly rather than a weakening of it. The floor protects a session
+%% from being **throttled** to a useless trickle by scarcity; it was never
+%% meant to forbid a car from wanting little. Before, a session asking
+%% 3 kW was zeroed to satisfy the letter of "nothing between 0 and 6" —
+%% and that zeroing is what oscillated.
+nothing_is_starved_to_a_trickle_test() ->
     lists:foreach(
       fun({Budget, Demands}) ->
-              Alloc = vs_power:allocate(Budget, sessions(Demands), ?MIN_KW),
-              maps:foreach(
-                fun(Id, Kw) ->
-                        check({trickle, Budget, Demands, Id, Kw},
-                              Kw =:= +0.0 orelse Kw >= ?MIN_KW - ?EPS)
-                end, Alloc)
+              Sessions = sessions(Demands),
+              Alloc = vs_power:allocate(Budget, Sessions, ?MIN_KW),
+              lists:foreach(
+                fun(#{conn_id := Id, demand_kw := Demand}) ->
+                        Kw = maps:get(Id, Alloc),
+                        check({trickle, Budget, Demands, Id, Kw, Demand},
+                              Kw =:= +0.0
+                              orelse Kw >= ?MIN_KW - ?EPS
+                              orelse Kw + ?EPS >= float(Demand))
+                end, Sessions)
       end, cases()).
 
 %% Every session gets an answer, suspended ones included: the manager
@@ -191,23 +202,27 @@ a_zero_budget_suspends_everyone_test() ->
     Alloc = vs_power:allocate(0, sessions([150, 50]), ?MIN_KW),
     assert_alloc([0.0, 0.0], Alloc).
 
-%% The refinement of the plan's rule. A session whose *own demand* is
-%% below the floor cannot be helped by suspending anybody else — no
-%% amount of freed budget lifts it above what it is asking for. So it is
-%% the one that goes, and the 50 kW car keeps charging. Under the literal
-%% "always the most recent" rule the 50 would be suspended first, the 3
-%% would still be under the floor, and the site would end up allocating
-%% nothing at all with 180 kW free.
-a_session_asking_less_than_the_floor_suspends_itself_test() ->
-    %% the small one arrived *first*: the literal rule would take the 50
+%% M2 fix 2 (D-3/D-4). These two used to assert `[0.0, 50.0]' and
+%% `[50.0, 0.0]': a session asking 3 kW on a 180 kW site was suspended
+%% because 3 is under the floor. That was the demand-bound rule, and it
+%% was wrong at the root — the floor is about **scarcity**, and nobody is
+%% short here. Suspending the small car freed 3 kW that no one wanted and
+%% left the site delivering 50 instead of 53; worse, it is the dynamic
+%% that made a tapering car flap between zero and full power for ever.
+%%
+%% A session that receives exactly what it asks for is not starved,
+%% whatever the figure.
+a_session_asking_less_than_the_floor_is_not_starved_test() ->
+    %% the small one arrived *first*, which under any victim order is the
+    %% one the old rule would have taken
     Alloc = vs_power:allocate(180, sessions([3, 50]), ?MIN_KW),
-    assert_alloc([0.0, 50.0], Alloc),
-    ?assert(abs(total(Alloc) - 50.0) =< ?EPS).
+    assert_alloc([3.0, 50.0], Alloc),
+    ?assert(abs(total(Alloc) - 53.0) =< ?EPS).
 
 %% Same shape, the other arrival order: the answer must not depend on it.
-a_session_asking_less_than_the_floor_suspends_itself_either_order_test() ->
+a_session_asking_less_than_the_floor_is_not_starved_either_order_test() ->
     Alloc = vs_power:allocate(180, sessions([50, 3]), ?MIN_KW),
-    assert_alloc([50.0, 0.0], Alloc).
+    assert_alloc([50.0, 3.0], Alloc).
 
 %% Budget contention is still resolved by arrival: this is the plan's
 %% rule, untouched, in the case it was designed for. 17/3 is 5.67, under

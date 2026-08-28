@@ -1393,6 +1393,79 @@ misure di adesso, e i beam dei container hanno lo stesso md5 di `_build`. Vale l
 ricordarsene: `docker compose up -d` non ricostruisce, e un'immagine vecchia misura il codice
 sbagliato senza dirlo.
 
+## 7u. Lotto 2 delle correzioni della review — 28 agosto
+
+Le cinque prove ancora rosse del revisore: D-3 (oscillazione del taper), D-4 (sessione senza
+`max_kw`), D-5 (riga persa in silenzio), D-8 (prenotazione che trapela nello snapshot), D-9
+(novanta secondi che diventavano centottanta). Nessuno di questi tocca quanto si paga — quelli
+erano il lotto 1 — ma due toccano cosa il driver vede e uno il tempo di reazione a un guasto.
+
+**Le tre verifiche bloccanti, tutte e tre confermate.** Baseline 261/0, e 271 con esattamente
+le cinque rosse attese. `release/2` trova il `claim_id` nella sessione quando l'hold è
+`undefined` — riletta sul codice **dopo** il lotto 1, che aveva rimaneggiato `closing`, perché
+se fosse stato falso azzerare l'hold avrebbe fatto perdere il rilascio dei claim. E sì,
+**esisteva** un test che dava per buono un `plugged` senza `max_kw`.
+
+**D-3 e D-4 erano lo stesso difetto visto da due lati, e la toppa precedente li aveva creati
+entrambi.** La regola «si sospende chi sta sotto il minimo» non distingueva chi è sotto perché
+il sito è a corto da chi è sotto perché chiede poco. Il secondo non è affamato da nessuno:
+portarlo a zero non libera niente per nessuno. Da lì l'oscillazione — sospendi, il limite va a
+zero, il limite a zero riporta la domanda al massimo, il massimo la fa rientrare, si
+ricomincia — su un sito **vuoto**, con 350 kW liberi. Adesso si sospende solo per scarsità:
+quota sotto il minimo **e** sotto la domanda. I sei scenari di `PIANO_POTENZA.md` §8 danno
+numeri identici a prima, che era la prova richiesta: la regola nuova non cambia i casi
+ordinari, toglie solo una sospensione inutile.
+
+D-4 si è chiuso a monte e non nell'allocatore: `max_kw` è obbligatorio in §4.2, quindi un
+`plugged` che non ce l'ha viene rifiutato da `vs_cp_proto` e non apre nessuna sessione.
+Metterci una pezza nell'allocatore avrebbe voluto dire decidere noi cosa può prendere un
+hardware che non l'ha detto — esattamente lo split che §7.2 vieta.
+
+**Tre test esistenti codificavano il difetto, e vanno detti.** Due di `vs_power` asserivano che
+un'auto che chiede 3 kW su un sito da 180 debba essere sospesa (era la specifica della toppa
+precedente); una proprietà del sweep diceva «zero oppure almeno `MIN_CHARGE_KW`» e ora dice
+«zero, almeno `MIN_CHARGE_KW`, **oppure esattamente ciò che ha chiesto**». E
+`a_session_with_no_max_kw_starts_suspended_test` trattava come «segnalato onestamente» il
+risultato che teneva l'auto a zero per sempre: resta, perché documenta la difesa del
+connettore, ma con il commento corretto — dopo la correzione un payload del genere non arriva
+più fin lì.
+
+**Tre delle cinque prove del revisore sono state ri-puntate**, ed è la parte del lotto che
+merita più attenzione. Quella di D-3 asseriva *prima* che il tick 1 sospendesse l'auto (cioè
+osservava il difetto) e *poi* che il tick 2 fosse d'accordo: la prima asserzione non era un
+invariante. Ora la prova gira il ciclo per sei tick e chiede un punto fisso, che è più forte.
+Quelle di D-4 osservavano il difetto dentro l'allocatore, chiedendo che una sessione con
+`max_kw = 0` ricevesse 350 kW — cosa che nessun allocatore deve fare: erano l'unico posto da
+cui il difetto era ancora visibile, perché a quel punto era già successo. Adesso guardano dove
+il difetto si chiude, cioè il payload. **Ognuna delle tre è stata rieseguita contro i sorgenti
+non corretti e deve ancora fallire**: la regola seguita è che un'asserzione può spostarsi dove
+il difetto viene davvero chiuso, ma non può essere indebolita.
+
+**D-9 era il difetto più semplice e il più imbarazzante:** due funzioni che calcolano lo stesso
+prodotto e agiscono in serie. Cowboy aspetta 90 s di silenzio, chiude il socket, e solo allora
+il connettore ne aspetta altri 90. Tre heartbeat mancati ne facevano sei, e i commenti di
+entrambi i moduli sostenevano che i due scadessero «sullo stesso orologio» — stessa durata, non
+stesso istante. Adesso i novanta secondi sono un budget ripartito: 60 al socket, 30 alla
+grazia. La grazia non poteva sparire — serve al blip di rete di §1, il socket che cade per un
+FIN e non per silenzio — e trenta secondi bastano per una riconnessione che il contratto dà a
+un secondo.
+
+L'alternativa più fedele era distinguere le due morti del socket passando al connettore il
+motivo dalla `terminate/3` di cowboy. Costa un messaggio nuovo sul confine più delicato del
+passo 1, ed è annotata in `scelte_di_progetto.md` §15.5 come la strada da prendere se la
+ripartizione si rivelasse rigida. Non ora: **il lotto 2 chiude difetti, non introduce
+meccanismi.**
+
+**Le dieci prove del revisore sono verdi e sono entrate nel commit**, rinominate
+`vs_m2a_regression_tests.erl` con lo stub che le accompagna: da qui in avanti sono test di
+regressione come tutti gli altri, e il nome lo dice. Ognuna delle tre ri-puntate porta una NOTE
+che spiega cosa è cambiato e perché.
+
+**Numeri.** Suite 274 test, 0 fallimenti — 261 del lotto 1, 11 di regressione (le dieci del
+revisore, con quella di D-4 diventata tre: due rifiuti e un controllo positivo che tiene le
+altre due dal passare per il motivo sbagliato), 2 per l'aritmetica di D-9. I sei scenari della
+potenza: 150 / 130-50 / 80-50-50 / 100-100-100-50 / 127,5-127,5-45-50 / 7,5-7,5-0, identici.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha

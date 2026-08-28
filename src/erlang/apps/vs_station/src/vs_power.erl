@@ -30,33 +30,42 @@
 %%% ## The floor, and who gets suspended
 %%%
 %%% §3.5 asks for a minimum viable power below which a session is
-%%% suspended rather than starved. While some share is under
-%%% `MIN_CHARGE_KW' one session leaves the split and is given `0.0' —
-%%% suspended, which is exactly how ws-chargepoint.md §5 expresses it:
-%%% the session stays open and draws nothing.
+%%% suspended rather than starved. A session is suspended — given `0.0',
+%%% which is exactly how ws-chargepoint.md §5 expresses it: the session
+%%% stays open and draws nothing — when its share is under
+%%% `MIN_CHARGE_KW' **and under what it asked for**. Both halves.
 %%%
-%%% *Which* session, in two cases, because starvation has two causes:
+%%% The floor talks about **scarcity**, not about demand. It is there so
+%%% that a site with too many cars stops twenty of them trickling at 3 kW
+%%% and lets ten charge properly. A session that receives exactly what it
+%%% asks for is not being starved by anyone: a nearly full car drawing
+%%% 4 kW, or a small one that can only take 5, is getting its charge, and
+%%% taking it to zero frees nothing for anybody — the budget removed from
+%%% it was not wanted by anyone else.
 %%%
-%%%   * **the budget is short** — the share is under the floor because
-%%%     there are too many cars for the site. The most recent arrival
-%%%     goes (`started_at' greatest). Stable by construction:
-%%%     `started_at' never changes, so the suspended set cannot oscillate
-%%%     between two ticks while nobody arrives or leaves. A rule based on
-%%%     SoC would change its own mind at every meter reading.
+%%% *Which* session, when the budget really is short: the most recent
+%%% arrival (`started_at' greatest, `conn_id' breaking a tie on the
+%%% millisecond). Stable by construction — `started_at' never changes, so
+%%% the suspended set cannot oscillate between two ticks while nobody
+%%% arrives or leaves. A rule based on SoC would change its own mind at
+%%% every meter reading.
 %%%
-%%%   * **the session itself asks for less than the floor** — a car whose
-%%%     `max_kw' is tiny, or one tapering towards the end of its charge.
-%%%     Suspending anybody else cannot help it: no amount of freed budget
-%%%     lifts a session above what it is asking for. So it is the one
-%%%     that goes, whenever it arrived.
+%%% **What was here before, and why it was wrong.** An earlier version
+%%% split the starved in two — short of budget, or short by their own
+%%% demand — and suspended the demand-bound ones first, on the argument
+%%% that no amount of freed budget can lift a session above what it is
+%%% asking for. The argument is true and the conclusion does not follow:
+%%% such a session does not need lifting, because nobody is holding it
+%%% down. Making it suspendable produced a two-tick oscillation on an
+%%% empty site — suspending zeroed the limit, a zero limit put the demand
+%%% back to the ceiling (see `tapering/2'), the ceiling let the session
+%%% straight back in, and the round began again. The fix is not a better
+%%% victim order: it is that there was never a victim to choose.
 %%%
-%%% The second case is a refinement of the plan's rule, agreed before
-%%% writing this. Under "always the most recent", demands of 3 and 50 kW
-%%% against a 180 kW budget suspend the 50 first, leave the 3 still under
-%%% the floor, suspend that too, and end with the whole site allocating
-%%% nothing — the wrong party punished, and then everybody. The six
-%%% scenarios of the plan's §8 are the same under either reading; only
-%%% this corner differs.
+%%% The corner that motivated the old rule — demands of 3 and 50 kW
+%%% against 180 kW of budget — comes out right without it: the 3 kW car
+%%% receives its 3 kW and the 50 kW car its 50. Nobody is suspended,
+%%% because nobody is short.
 %%%
 %%% ## The demand of a session, and the taper
 %%%
@@ -194,35 +203,41 @@ allocate(BudgetKw, Sessions, MinChargeKw, Suspended) ->
                      Suspended#{conn_id(Victim) => 0.0})
     end.
 
-%% Everyone whose share landed under the floor, each tagged with whether
-%% it is the budget that is short (`budget') or the session's own demand
-%% (`demand'). The distinction is what picks the victim.
+%% Starved means **starved by scarcity**: the share landed under the floor
+%% *and* under what the session was asking for. Both halves are the rule,
+%% and the second one is the whole correction of D-3/D-4.
+%%
+%% `MIN_CHARGE_KW' exists because a session throttled by scarcity is better
+%% suspended than starved: under 6 kW a car does not charge usefully, and
+%% twenty cars trickling at 3 kW serve nobody. But that threshold talks
+%% about **scarcity**, not about demand. A session receiving exactly what
+%% it asks — a nearly full car drawing 4 kW, a small one that can take 5 —
+%% is being starved by nobody, and taking it to zero frees nothing for
+%% anybody: the budget removed from it was not wanted by anyone else.
 starved(Sessions, Alloc, MinChargeKw) ->
-    lists:filtermap(
-      fun(S) ->
-              Got = maps:get(conn_id(S), Alloc),
-              case {Got < MinChargeKw - ?EPS, Got + ?EPS >= demand(S)} of
-                  {false, _}    -> false;
-                  {true, true}  -> {true, {demand, S}};   %% got all it asked for
-                  {true, false} -> {true, {budget, S}}    %% the site is short
-              end
-      end, Sessions).
+    [S || S <- Sessions, starving(S, Alloc, MinChargeKw)].
 
-%% A session starved by its own demand can never be lifted by suspending
-%% anyone else, so it goes first — and freeing its share can only help
-%% the ones that are short of budget. Among equals, the most recent
-%% arrival, with the connector id breaking a tie on the millisecond so
-%% that the rule is a total order and the same input always allocates the
-%% same way.
+starving(S, Alloc, MinChargeKw) ->
+    Got = maps:get(conn_id(S), Alloc),
+    Got < MinChargeKw - ?EPS andalso Got + ?EPS < demand(S).
+
+%% Among the starved, the most recent arrival, with the connector id
+%% breaking a tie on the millisecond so that the rule is a total order and
+%% the same input always allocates the same way.
+%%
+%% There used to be a precedence here: sessions under the floor because of
+%% their *own* demand went first, on the argument that no freed budget can
+%% lift them. The argument was right and the conclusion was wrong — such a
+%% session does not need lifting, because nobody is holding it down. That
+%% precedence is what produced the flapping of D-3: suspending zeroed the
+%% limit, a zero limit put the demand back to the ceiling, the ceiling let
+%% the session back in, and the round started again. Sessions that are not
+%% starved are no longer suspendable, so there is nothing left to flap.
 victim(Starved) ->
-    Ordered = case [S || {demand, S} <- Starved] of
-                  []          -> [S || {budget, S} <- Starved];
-                  DemandBound -> DemandBound
-              end,
     hd(lists:sort(fun(A, B) ->
                           {maps:get(started_at, A), conn_id(A)} >
                               {maps:get(started_at, B), conn_id(B)}
-                  end, Ordered)).
+                  end, Starved)).
 
 %%%===================================================================
 %%% internal — one split, with the hand-back

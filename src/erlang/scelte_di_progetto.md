@@ -1142,3 +1142,129 @@ lettura faceva uscire l'eccezione dal gen_server, e il writer si portava dietro 
 I due guasti non valgono lo stesso: un annuncio perso costa **una ricevuta prezzata un minuto
 dopo** (B spazza `cost_cents IS NULL`), un writer morto costa **tutte le righe in coda**. La
 differenza di prezzo è il motivo per cui adesso hanno una rete per uno.
+
+---
+
+## 15. Correzioni lotto 2 — potenza, tempi, cosmetica (M2-A fix 2)
+
+I cinque difetti restanti della review. Nessuno tocca quanto si paga: due toccano cosa il
+driver vede, uno il tempo di reazione a un guasto, uno l'onestà di un log, e il primo è una
+regola sbagliata alla radice.
+
+### 15.1 Si sospende solo per scarsità — e perché la versione precedente era sbagliata
+
+`MIN_CHARGE_KW` esiste perché una sessione **strozzata dalla scarsità** è meglio sospesa che
+affamata: sotto i 6 kW un'auto non carica in modo utile, e tenere venti sessioni a 3 kW non
+serve a nessuno. Quella soglia parla della scarsità, non della domanda.
+
+La versione precedente non faceva questa distinzione. Divideva le affamate in due — a corto di
+budget, oppure a corto per domanda propria — e sospendeva per prime le seconde, con
+l'argomento che nessun budget liberato può alzare una sessione sopra ciò che chiede.
+**L'argomento è vero e la conclusione non ne segue:** una sessione così non ha bisogno di
+essere alzata, perché nessuno la sta tenendo giù. Il budget che le si toglie non serviva a
+nessun altro, e portarla a zero non libera niente.
+
+Da lì nascevano due difetti, che sono lo stesso visto da due lati:
+
+* **D-3, l'oscillazione.** Un'auto quasi carica che assorbe 0,5 kW ha domanda `0,5 + margine
+  = 5,5`, sotto il minimo → sospesa → limite zero → `tapering/2` vede il limite a zero e
+  riporta la domanda al massimo → rientra a piena potenza → l'auto torna ad assorbire 0,5 →
+  sospesa di nuovo. Due tick, per sempre, **su un sito vuoto con 350 kW liberi.** È la stessa
+  dinamica del lock-in già corretto una volta in `demand_kw/3`: la toppa di allora l'aveva
+  trasformata da blocco in oscillazione invece di rimuoverla.
+* **D-4, la sessione senza `max_kw`.** Domanda zero → sotto il minimo e pari alla domanda →
+  `victim/1` la preferiva a chiunque → sospesa a ogni ricalcolo, con qualunque budget.
+
+**La regola adesso.** Una sessione è affamata se la quota è sotto `MIN_CHARGE_KW` **e** sotto
+ciò che chiede. Chi riceve tutto quello che domanda non è sospendibile, qualunque cifra sia.
+Sparisce la distinzione in `starved/3` e con essa la precedenza in `victim/1`, che torna alla
+regola semplice: fra le affamate, l'ultima arrivata, `conn_id` a spezzare la parità.
+
+Il caso limite resta stabile: budget 3 kW e una sola auto → quota 3, sotto il minimo **e**
+sotto la domanda → sospesa; al tick dopo il limite è zero, la domanda torna al massimo, la
+quota è ancora 3 → sospesa di nuovo. Stessa decisione a ogni giro: con tre kW non si carica
+nessuno, ed è la risposta giusta.
+
+Il corner che aveva motivato la vecchia regola — domande di 3 e 50 kW contro 180 di budget —
+viene fuori giusto senza di essa: la piccola prende 3, la grande 50, nessuno è sospeso perché
+nessuno è a corto. I sei scenari di `PIANO_POTENZA.md` §8 danno numeri **identici** a prima
+(150 / 130-50 / 80-50-50 / 100-100-100-50 / 127,5-127,5-45-50 / 7,5-7,5-0): la nuova regola
+non cambia i casi ordinari, toglie solo una sospensione che non serviva.
+
+Una proprietà del sweep è stata riformulata di conseguenza. Era «un'allocazione è zero oppure
+almeno `MIN_CHARGE_KW`»; ora è «zero, oppure almeno `MIN_CHARGE_KW`, **oppure esattamente ciò
+che la sessione ha chiesto**». Non è un indebolimento: è la proprietà detta bene. Nessuno
+viene ridotto a un rivolo; chi vuole un rivolo lo ottiene.
+
+`demand_kw/3` non è stata toccata, e il ramo del taper con il suo margine resta com'è: la
+correzione non era lì.
+
+### 15.2 `max_kw` è obbligatorio, e si fa rispettare a monte
+
+Con la nuova regola una sessione senza `max_kw` non viene più *sospesa* — ma la sua domanda
+resta zero, quindi resta a zero lo stesso, e senza che nessuno lo dica. La regola di
+sospensione non era il posto giusto per accorgersene.
+
+`ws-chargepoint.md` §4.2 rende `max_kw` obbligatorio, e il posto per farlo rispettare è la
+validazione del payload in `vs_cp_proto`, non l'allocatore: un `plugged` senza `max_kw`, o con
+un valore non positivo, è **rifiutato** — `logger:error` con il payload intero, nessuna
+sessione aperta, nessun frame di risposta. Rifiutato esattamente come `invalid_state`: §5 non
+ha una reason `stop` per «il tuo payload è incompleto», e inventarne una allargherebbe un
+contratto che è di A. Il prossimo `status` riconcilia (§7.6).
+
+Il commento di `vs_connector` che prometteva «the next `set_limit' — one tick, in M2 step 2 —
+corrects it» è stato corretto: non poteva correggerlo, perché `demand_kw/3` legge lo stesso
+campo. Il connettore mantiene la sua difesa (`min` con uno zero è zero, detto onestamente), ma
+adesso è una difesa per un payload che non dovrebbe più arrivarci.
+
+### 15.3 Nessuna riga sparisce in silenzio
+
+`insert_session/1` è un cast, e una cast a un nome non registrato ritorna `ok` e sparisce. Era
+l'unico punto del sistema in cui una sessione finita poteva svanire **senza lasciare niente**:
+il connettore fa match sull'`ok' e prosegue convinto di aver consegnato.
+
+Ora il writer viene cercato prima, e se non c'è la riga finisce in un `logger:error` nella
+stessa forma già usata dal cap della coda, dove la riga di log è dichiaratamente l'ultima
+copia. Non si tenta di consegnarla comunque — una coda fuori dal writer sarebbe una seconda
+coda da tenere allineata alla prima — né di far aspettare il connettore: la regola del passo 3
+resta che il connettore non aspetta mai il database, e questo controllo costa un `whereis`.
+
+### 15.4 L'hold sparisce quando la prenotazione è stata consumata
+
+Passando da `held` a `charging` il `#hold` restava nel `#data`, e `build_snapshot/2`
+continuava a leggerlo: la pagina vedeva `held_by_me: true` e l'`expires_at` di una
+prenotazione ormai consumata su un connettore che stava caricando. Non è cosmetica innocua —
+`held_by_me` è uno dei due campi che `ws-driver.md` §5.1 fa calcolare al server *proprio*
+perché il client non debba ragionare sull'identità, e dargli un dato falso è peggio che
+farglielo dedurre.
+
+Ora `hold` viene azzerato nella transizione. Il claim non si perde con lui: `session_from/3`
+ha appena copiato il `claim_id` nella sessione, e `release/2` lo cerca lì quando l'hold è
+`undefined` — verificato prima di toccare il codice, perché se fosse stato falso si sarebbe
+perso il rilascio dei claim.
+
+### 15.5 I tre heartbeat sono un budget unico, non due
+
+`vs_cp_ws:idle_timeout_ms/0` e `vs_connector:cp_grace_ms/0` calcolavano **lo stesso prodotto**
+(`CP_HEARTBEAT_MISSED × CP_HEARTBEAT_INTERVAL_S` = 90 s) e agiscono **in serie**: cowboy
+aspetta 90 s di silenzio e chiude il socket, e solo allora il connettore vede il `DOWN` e ne
+aspetta altri 90 prima di dichiarare `out_of_service`. Il contratto §3.2 dice tre heartbeat, il
+sistema ne faceva sei: una colonnina guasta restava prenotabile per tre minuti. I commenti di
+entrambi i moduli affermavano che i due scadevano «sullo stesso orologio» — stessa *durata*,
+non stesso *istante*.
+
+Ripartiti: `(CP_HEARTBEAT_MISSED - 1)` intervalli al socket (60 s), l'ultimo intervallo alla
+grazia (30 s). Somma 90, come il contratto.
+
+Perché ripartire e non azzerare la grazia: la grazia non è ridondante, serve al blip di rete di
+§1 — il socket che cade per un FIN o un errore, **non** per silenzio, con la colonnina che
+riconnette in circa un secondo. Trenta secondi bastano per quella riconnessione e restano
+dentro il budget.
+
+**L'alternativa scartata, annotata perché è la strada da prendere se questa ripartizione si
+rivelasse troppo rigida:** distinguere le due morti del socket. Chiuso per idle timeout → i tre
+heartbeat sono già passati e `out_of_service` è dovuto subito; caduto per altro → grazia piena.
+Si farebbe passando al connettore il motivo dalla `terminate/3` di cowboy. È più fedele alla
+semantica del contratto e costa un messaggio nuovo sul confine più delicato del passo 1. Non è
+stata scelta ora per una ragione che vale la pena scrivere: **il lotto 2 chiude difetti, non
+introduce meccanismi.**

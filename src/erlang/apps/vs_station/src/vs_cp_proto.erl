@@ -373,25 +373,61 @@ plugged(Payload, Session = #{connector_id := ConnId}) ->
                          "vehicle_id", [ConnId]),
             {[], Session};
         VehicleId ->
-            case user_for_vehicle(Session, VehicleId) of
-                {ok, UserId} ->
-                    authorise(Payload, VehicleId, UserId, Session);
-                {error, Reason} ->
-                    %% Nothing to answer with: refusing would need a `stop'
-                    %% reason the contract does not have, and the fault is
-                    %% on this side of the cable. §7.6 — logged, loudly.
-                    logger:error("charge point channel (connector ~p): no account "
-                                 "for vehicle ~p (~p)", [ConnId, VehicleId, Reason]),
+            case max_kw(Payload) of
+                {ok, MaxKw} ->
+                    with_account(Payload, VehicleId, MaxKw, Session);
+                error ->
+                    %% §4.2 makes `max_kw' mandatory, and this is the place
+                    %% that enforces it. Without it the session would open
+                    %% with a ceiling of zero, the allocator would compute a
+                    %% demand of zero from it, and the car would sit at zero
+                    %% kW for ever with nothing in any log to say why — a
+                    %% charge point that is silently broken looking exactly
+                    %% like one that is charging.
+                    %%
+                    %% Refused the way `invalid_state' is refused: loudly,
+                    %% with the payload, and with no frame. There is no
+                    %% `stop' reason in §5 for "your payload is incomplete",
+                    %% and inventing one would widen a contract that is A's;
+                    %% the next `status' reconciles (§7.6).
+                    logger:error("charge point channel (connector ~p): plugged "
+                                 "with no usable max_kw - refused, no session "
+                                 "opened. Payload: ~p", [ConnId, Payload]),
                     {[], Session}
             end
     end.
 
-authorise(Payload, VehicleId, UserId, Session = #{connector_id := ConnId}) ->
+with_account(Payload, VehicleId, MaxKw, Session = #{connector_id := ConnId}) ->
+    case user_for_vehicle(Session, VehicleId) of
+        {ok, UserId} ->
+            authorise(Payload, VehicleId, UserId, MaxKw, Session);
+        {error, Reason} ->
+            %% Nothing to answer with: refusing would need a `stop'
+            %% reason the contract does not have, and the fault is
+            %% on this side of the cable. §7.6 — logged, loudly.
+            logger:error("charge point channel (connector ~p): no account "
+                         "for vehicle ~p (~p)", [ConnId, VehicleId, Reason]),
+            {[], Session}
+    end.
+
+%% §4.2 — `max_kw' is what the car can take, and it drives both the
+%% charging curve and the ceiling of the allocation. Absent, non-numeric or
+%% not positive are the same answer: this payload does not say what the
+%% hardware can do, so the station has nothing to authorise.
+max_kw(Payload) ->
+    case int(<<"max_kw">>, Payload, undefined) of
+        undefined            -> error;
+        Kw when Kw =< 0      -> error;
+        Kw                   -> {ok, Kw}
+    end.
+
+authorise(Payload, VehicleId, UserId, MaxKw, Session = #{connector_id := ConnId}) ->
     Info = #{user_id     => UserId,
              vehicle_id  => VehicleId,
              soc_pct     => int(<<"soc_pct">>, Payload, 0),
              battery_kwh => num(<<"battery_kwh">>, Payload, 0.0),
-             max_kw      => int(<<"max_kw">>, Payload, 0),
+             %% validated by max_kw/1 above: never absent, never <= 0
+             max_kw      => MaxKw,
              %% §6: a charge point that reconnects after a station restart
              %% brings the energy it has counted, and it is the only side
              %% that counted it.

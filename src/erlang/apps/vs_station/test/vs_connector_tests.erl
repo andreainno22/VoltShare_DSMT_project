@@ -481,9 +481,19 @@ a_zero_limit_is_reported_as_suspended_test() ->
 
 %% A car that never declared what it can take starts at min(rated, 0),
 %% which is zero — D5 says so in words, and the derived state is what
-%% makes it visible. §4.2 makes `max_kw' mandatory, so this is a
-%% misbehaving charge point being reported honestly, not a supported way
-%% to plug in.
+%% makes it visible.
+%%
+%% M2 fix 2 (D-4): this comment used to end by calling the result "a
+%% misbehaving charge point being reported honestly". It was not being
+%% reported at all. `vs_power:demand_kw/3' reads the same `max_kw', so the
+%% demand was zero too and no later `set_limit' could lift it: the car sat
+%% at zero for ever with nothing in any log to say why. §4.2 makes the
+%% field mandatory, and `vs_cp_proto' now refuses such a `plugged'
+%% outright — see `vs_m2a_regression_tests'.
+%%
+%% What is asserted here is therefore the connector's own defence, for a
+%% payload that should no longer be able to reach it: `min' with a zero is
+%% zero, and it says so rather than inventing a ceiling (§7.2).
 a_session_with_no_max_kw_starts_suspended_test() ->
     with_connector(fun(Pid) ->
         ok = vs_connector:plugged(Pid, #{user_id => ?USER, vehicle_id => ?VEHICLE}),

@@ -417,3 +417,39 @@ ws_shutdown_stops_the_car_before_closing() ->
     ?assertEqual(#{<<"command">> => <<"stop">>,
                    <<"reason">> => <<"station_shutdown">>},
                  maps:get(<<"payload">>, Decoded)).
+
+%%%===================================================================
+%%% M2 fix 2 (D-9) — three missed heartbeats are one budget, split
+%%%===================================================================
+
+%% §3.2 says three missed heartbeats. The socket timeout and the
+%% connector's grace act in series — cowboy waits out the silence, and only
+%% when it gives up does the connector see the DOWN and start its own
+%% clock — so as long as both computed the whole product the contract's
+%% ninety seconds took a hundred and eighty, and a faulted connector stayed
+%% reservable for three minutes.
+the_socket_timeout_and_the_grace_add_up_to_three_heartbeats_test() ->
+    Interval = vs_env:get_int("CP_HEARTBEAT_INTERVAL_S", 30),
+    Missed   = vs_env:get_int("CP_HEARTBEAT_MISSED", 3),
+    Idle     = socket_idle_timeout_ms(),
+    Grace    = vs_connector:cp_grace_ms(),
+    %% the two halves, and the sum the contract asks for
+    ?assertEqual((Missed - 1) * Interval * 1000, Idle),
+    ?assertEqual(Interval * 1000, Grace),
+    ?assertEqual(Missed * Interval * 1000, Idle + Grace),
+    %% with the shipped defaults: 60 + 30 = 90 s
+    ?assertEqual(60000, Idle),
+    ?assertEqual(30000, Grace).
+
+%% The grace is not decoration and must not be squeezed to nothing: §1
+%% plans for the network blip, a socket that dies of a FIN rather than of
+%% silence with the charge point back in about a second.
+the_grace_still_covers_a_reconnection_test() ->
+    ?assert(vs_connector:cp_grace_ms() >= 5000).
+
+%% Read through the only caller, so the assertion is on what cowboy is
+%% actually handed rather than on a formula copied into the test.
+socket_idle_timeout_ms() ->
+    Req = #{qs => <<"station_id=1&connector_id=3">>},
+    {cowboy_websocket, _Req, _State, Opts} = vs_cp_ws:init(Req, []),
+    maps:get(idle_timeout, Opts).

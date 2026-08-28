@@ -61,6 +61,10 @@
          attach_cp/2, set_limit/2, cp_status/2]).
 %% gen_statem
 -export([init/1, callback_mode/0, terminate/3]).
+%% pure — exported so that the halving of the heartbeat budget (D-9) can be
+%% asserted against `vs_cp_ws:idle_timeout_ms/0' rather than restated in a
+%% test, the same way vs_station_db exports its row and clock helpers.
+-export([cp_grace_ms/0]).
 %% state functions
 -export([free/3, held/3, charging/3, closing/3, out_of_service/3]).
 
@@ -389,7 +393,20 @@ held({call, From}, {plugged, Info}, Data = #data{hold = Hold}) ->
             Session = adopt(Info#{user_id => Hold#hold.user_id},
                             Hold#hold.claim_id, Data),
             notify(Data, {session_started, Hold#hold.user_id}),
-            {next_state, charging, consumed(Data#data{session = Session}),
+            %% D-8: the reservation has done its work and is discarded
+            %% here. Left in place it went on being reported by
+            %% `build_snapshot/2', so a connector that was charging still
+            %% showed `held_by_me: true' and the `expires_at' of a lease
+            %% that had already been consumed — and ws-driver.md §5.1
+            %% computes `held_by_me' server-side precisely so that the
+            %% page never has to reason about identity. Feeding it a false
+            %% one is worse than making it think.
+            %%
+            %% The claim is not lost with it: `session_from/3' has just
+            %% copied the claim id into the session, and `release/2' looks
+            %% there when the hold is `undefined'.
+            {next_state, charging,
+             consumed(Data#data{session = Session, hold = undefined}),
              [{reply, From, ok}]};
         false ->
             %% The reservation survives: someone else's car at the cable is
@@ -448,11 +465,20 @@ held(EventType, Event, Data) ->
 %% `set_limit/2' on every arrival and departure; the *transport* below
 %% does not change again.
 %%
-%% A `plugged' payload with no `max_kw' therefore starts suspended. That is
-%% the honest reading of `min' and the contract makes the field mandatory
-%% (§4.2); inventing a limit for a car that never declared one would be the
-%% station deciding what hardware can take, which is exactly the split §7.2
-%% forbids. The next `set_limit' — one tick, in M2 step 2 — corrects it.
+%% A `plugged' payload with no `max_kw' would therefore start suspended,
+%% and **stay** suspended: `vs_power:demand_kw/3' reads the same field, so
+%% the demand is zero too and no later `set_limit' can lift it. An earlier
+%% version of this comment promised that the next tick would correct it.
+%% It never could, and the car sat at zero for ever with nothing in any log
+%% to say why (D-4).
+%%
+%% The field is mandatory in §4.2, so the place to insist on it is the
+%% payload validation in `vs_cp_proto' — which now refuses such a `plugged'
+%% outright, and never opens a session at all. Inventing a limit for a car
+%% that never declared one would instead be the station deciding what
+%% hardware can take, which is exactly the split §7.2 forbids. What is left
+%% here is the connector's own defence: `min' with a zero is zero, said
+%% honestly, for a payload that should no longer be able to reach it.
 charging(enter, _Old, Data = #data{session = S, rated_kw = Rated}) ->
     Limit = float(min(Rated, S#session.max_kw)),
     Data1 = Data#data{session = S#session{limit_kw = Limit}},
@@ -936,13 +962,27 @@ notify(#data{notify_to = To, conn_id = ConnId}, Event) ->
 %%% configuration — ws-chargepoint.md §10
 %%%===================================================================
 
-%% "Three missed heartbeats and the connector is marked out_of_service"
-%% (§3.2), read as a duration. The same number is cowboy's `idle_timeout'
-%% on the charge point socket, so the two halves of the rule — no frames
-%% arriving, no socket at all — expire together.
+%% D-9 — the second half of the three missed heartbeats of §3.2, not a
+%% second copy of them.
+%%
+%% This timer and cowboy's `idle_timeout' on the charge point socket used
+%% to compute the same product, and they act **in series**: cowboy waits
+%% for the silence, and only when it gives up does the `DOWN' arrive here
+%% and start this. Three missed heartbeats therefore took six — a faulted
+%% connector stayed reservable for three minutes instead of ninety
+%% seconds. The comment that used to sit here said the two expired
+%% together; they never did.
+%%
+%% So the ninety seconds are one budget, split rather than paid twice:
+%% `CP_HEARTBEAT_MISSED - 1' intervals go to the socket
+%% (`vs_cp_ws:idle_timeout_ms/0') and the last one to this grace. The
+%% grace is not redundant and cannot simply go: §1 plans for the network
+%% blip — a socket that dies of a FIN or an error rather than of silence,
+%% with the charge point reconnecting in about a second — and one
+%% heartbeat interval is ample for that reconnection while staying inside
+%% the budget.
 cp_grace_ms() ->
-    vs_env:get_int("CP_HEARTBEAT_MISSED", 3)
-        * vs_env:get_int("CP_HEARTBEAT_INTERVAL_S", 30) * 1000.
+    vs_env:get_int("CP_HEARTBEAT_INTERVAL_S", 30) * 1000.
 
 %% D-2 — how long `closing' waits for the charge point's last word before
 %% writing the row without it. §5 gives the equipment `LIMIT_APPLY_SECONDS'
