@@ -54,6 +54,8 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | ③ Novanta secondi di inattività senza scollegarsi | ✅ **chiusa il 27/08** — **101 secondi** senza inviare nulla: socket sempre aperto, `["connecting","online"]` e nessuna riconnessione, 23 push di stato ricevuti. Il `pong` automatico tiene davvero fermo l'`idle_timeout` (60 s) di cowboy. Misurato con un client Node, che risponde ai ping esattamente come un browser |
 | ④ JWT in transito (B firma con `JwtUtil`, A verifica con `vs_jwt`) | ✅ **chiusa il 27/08** — registrato un utente vero da Tomcat, letto il `TOKEN` dalla pagina renderizzata (`sub:"1"`, `vehicle_id:1`, `iss:voltshare-backoffice`, 60 min) e usato per il `join`: accettato. È l'ultimo pezzo del confine fra le due metà, ed era l'unico mai provato |
 
+| **Suite completa dopo il merge di `a/m2-cp-touchups` (P11)** | ✅ **307 test** — misurati il 29/08 su `a/p11-suite-flake`: **stesso totale su 26 giri della suite completa**, e 0 fallimenti su 25 di quei 26 (l'unico rosso è il terzo difetto di §7zb, prima della sua correzione; dopo la correzione, 13 giri su 13 verdi). Da oggi il numero non è più una nota: `src/scripts/eunit_check.sh` lo confronta e fallisce se cambia (§7zb) |
+
 **Prerequisiti ancora da installare:** solo Docker Desktop. Erlang/OTP 29 (erts 17.0.5) + rebar3 3.27, JDK 17 e Maven 3.9.9 ci sono e funzionano.
 
 **PATH:** risolto il 24/08. `erl`, `erlc`, `escript` e `rebar3` si invocano direttamente sia da bash sia da PowerShell — non serve più il prefisso `export PATH="/c/Program Files/Erlang OTP/bin:$PATH"` che compariva nelle istruzioni precedenti.
@@ -205,7 +207,15 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
 rebar3 compile                         # quattro applicazioni, nessun warning
-rebar3 eunit                           # 109 test (96 stazione+common lato A, 13 coordinatore)
+rebar3 eunit                           # 307 test, 0 fallimenti (29/08, dopo il merge di M2-A)
+#
+# Dal 29/08 il controllo vero prima di un push è lo script, non il comando nudo.
+# Si posiziona da sé, quindi gira da qualunque directory (qui dalla radice):
+#
+#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "307 tests, 0 failures"
+#
+# `rebar3 eunit' da solo non basta: un giro può stampare "0 failures" e avere
+# ventidue test cancellati, o perderne otto dal conteggio (§7zb).
 #
 # Nota di misura (24/08, macchina A): `rebar3 eunit --app vs_coord` conta **13**
 # test, non i 22 riportati sopra per M1-B — il file ha due generatori con 13
@@ -2233,6 +2243,53 @@ il motivo per cui la prova sopra è stata rifatta lasciandolo ripartire.
   pagina richiede il login di B.
 - **Il fuso.** Le date sopra sono UTC in MySQL e ora locale nei log dell'emulatore; le due corse
   cadono a cavallo della mezzanotte del 28/29 e i confronti sono fatti su durate, non su istanti.
+
+## 7zb. P11: un test che misurava la macchina, e un conteggio che può mentire — 29 agosto
+
+Segnalazione di B su cinque giri della suite (`src/contracts/risposta-per-A-m2a.md`): un giro con
+`acquire_happy_path_test` rosso per `{badmatch, {error, no_claim}}`, e un giro che contava **274
+test invece di 298**. Due difetti distinti. Report completo in `REPORT_P11.md`.
+
+**Il totale della suite è N = 307**, misurato su 26 giri della suite completa (3 di baseline, 10
+di riproduzione, 10 di chiusura più 3 di prova dello script), sempre identico.
+
+**P11-A — chiuso.** Il file di test del claim client fissava `timeout_ms => 500` per la
+`gen_server:call` verso il coordinatore. Il mock risponde in modo sincrono senza lavoro lento: se
+500 ms non bastano è perché gli scheduler sono saturi, e il test finisce per misurare la macchina
+invece del codice. Portato a 60000, con `wait_until` da 100 a 300 tentativi e l'`after` di
+`holds()` da 1 s a 5 s — stessa famiglia, costo zero sul verde.
+
+Una deviazione dal piano, misurata e ratificata: `rebar.config` dichiara `{dist_node, [{sname,
+vs}]}` e il nodo di test **è distribuito** (`node() = vs@BaLo`), quindi
+`no_coordinator_at_all_refuses_with_no_claim_test` non prende il `badarg` immediato che il piano
+gli attribuiva — paga una risoluzione DNS/epmd che fallisce come `nodedown` dopo ~2,5 s. Con
+60000 quel test sarebbe passato da 0,5 s a ~2,7 s contro i **5 s** del `?DEFAULT_TEST_TIMEOUT` di
+eunit, e un test ucciso da eunit finisce fra i *cancelled*: avremmo fabbricato noi il difetto B.
+Quel solo test tiene quindi un override esplicito a 500 ms, con il perché scritto accanto.
+
+**Un terzo difetto, trovato per strada e corretto.** Il giro 1 della baseline è fallito su
+`vs_connector_tests:an_adopted_session_is_dated_from_the_charging_seconds_test` (1 volta su 13).
+L'asserzione `?assert(StartedAt =< Before - 3600000)`, con `StartedAt` calcolato dal connettore
+come `now_ms() - 3600000`, equivale a chiedere che le due letture dell'orologio cadano nello
+**stesso millisecondo**. Tetto spostato su `vs_time:now_ms() - 3600000`, cioè letto dopo il
+fatto, come già facevano i due test gemelli dello stesso file. La proprietà asserita non cambia.
+
+**P11-B — non riprodotto, ma reso rumoroso.** Dieci giri consecutivi col report surefire attivo:
+307 ogni volta, e le liste dei singoli testcase identiche fra tutti e dieci. Non c'è quindi
+niente da attribuire a nessuno. Quello che invece è stato **misurato** è come un giro rotto
+riesce a sembrare verde, sabotando la suite apposta in tre modi diversi:
+
+| rottura | totale | `failures` | coda |
+|---|---|---|---|
+| `setup/0` di una fixture solleva | **invariato** (307) | 0 | `, 22 cancelled` |
+| `exit` nel processo di un test | **299** | 0 | `, 6 cancelled` |
+| un `_test_()` solleva mentre eunit enumera | **286** | 0 | `, 5 cancelled` |
+
+Tre lezioni: `0 failures` non vuol dire verde; il totale non è una costante della suite ma quanto
+lontano eunit è arrivato a enumerarla; e il totale da solo non basta, perché il primo caso lo
+lascia intatto. Da qui `src/scripts/eunit_check.sh`, che è verde **solo** se rebar3 esce 0 **e** il
+sommario è esattamente `307 tests, 0 failures` — ancorato, così che qualunque coda `cancelled`
+lo faccia fallire. Aggiornare quel numero è parte dell'aggiungere un test.
 
 ## 9. Prossimo passo
 

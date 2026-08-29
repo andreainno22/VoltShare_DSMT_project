@@ -1853,3 +1853,77 @@ tre. È `PROBLEMI_TROVATI.md` P10: tocca `vs_station_mgr`, che è fuori perimetr
 decisione di contratto — la risposta giusta probabilmente esiste già in §3.1 (`accepted: false`
 con un `reason`, «the charge point closes and retries with backoff») e non richiede un codice
 nuovo. Segnalata e lasciata a chi decide il contratto, come §17.7 aveva fatto con questa.
+## 19. La suite come asserzione (P11)
+
+Due decisioni prese il 29/08 dopo la segnalazione di B — un giro rosso su
+`acquire_happy_path_test` e un giro che contava 274 test invece di 298. Misure e
+sabotaggi in `REPORT_P11.md`.
+
+### 19.1 Il conteggio dei test è un'asserzione, non una nota
+
+`rebar3 eunit` non dice se il giro è andato bene. Provato rompendo la suite apposta in tre
+modi diversi, su questo albero:
+
+| rottura controllata | totale | `failures` | coda del sommario | exit |
+|---|---|---|---|---|
+| il `setup/0` di una fixture solleva | **invariato** (307) | 0 | `, 22 cancelled` | 1 |
+| un `exit` nel processo di un test | **299** | 0 | `, 6 cancelled` | 1 |
+| un `_test_()` solleva mentre eunit **enumera** | **286** | 0 | `, 5 cancelled` | 1 |
+
+Tre cose che non si sapevano e che cambiano il rito:
+
+1. **`0 failures` non vuol dire verde.** Lo stampa anche un giro che ha perso ventidue test.
+   La parola che conta è quella dopo, e non c'è quando tutto va bene.
+2. **Il totale non è una costante della suite**: è quanto lontano eunit è arrivato a
+   *enumerare* l'albero dei test. Un'eccezione dentro una funzione generatrice ferma
+   `eunit_data:iter_next/1` e fa sparire dal conteggio molti più test di quanti ne contenesse
+   quel generatore — 21 per un generatore da 6.
+3. **Il totale da solo non basta**: il primo caso lo lascia a 307.
+
+Da qui `src/scripts/eunit_check.sh`, che è verde **solo** se rebar3 esce 0 **e** il sommario è
+esattamente `307 tests, 0 failures`, ancorato a fine riga così che qualunque coda `cancelled`
+o `skipped` lo faccia fallire. Il numero sta scritto in testa allo script e aggiornarlo è
+parte dell'aggiungere un test.
+
+L'alternativa scartata era documentare il totale solo in `PROGRESS.md`. È dove stava già, ed è
+esattamente il motivo per cui B ha dovuto contare a occhio: un numero che nessuno confronta
+automaticamente non è un'asserzione, è una speranza.
+
+### 19.2 Il timeout di una chiamata di test non deve poter scattare
+
+`vs_claim_client_tests` teneva `timeout_ms => 500` per la `gen_server:call` verso il
+coordinatore. Il mock risponde in modo sincrono dal proprio `handle_call`, senza lavoro lento:
+se 500 ms non bastano non è il codice a essere lento, sono gli scheduler a essere saturi — e
+`call_one` traduce il timeout in `unreachable`, la lista dei nodi si esaurisce e il test riceve
+`{error, no_claim}`. Il test misurava la macchina. Portato a 60000: nessun percorso di quel
+file **aspetta** davvero, perché i rifiuti arrivano come risposte esplicite e i nodi morti come
+`noproc` — il valore serve solo a rendere impossibile che lo scheduling lo faccia scattare.
+
+Lo stesso ragionamento vale per i due altri orologi del file, che sono **retry limitati e non
+asserzioni sul tempo**: `wait_until` esce alla prima verità, quindi il suo tetto (da 100 a 300
+tentativi) non si paga sul verde, e l'`after` di `holds()` (da 1 s a 5 s) è raggiungibile solo
+in un giro già rosso. Alzarli non rallenta niente e toglie il prossimo flake della stessa
+famiglia.
+
+**C'è però un'eccezione, ed è il motivo per cui la regola va scritta con il suo limite.**
+`rebar.config` dichiara `{dist_node, [{setcookie, voltshare}, {sname, vs}]}`, e il provider
+`eunit` di rebar3 lo onora: il nodo di test **è distribuito** (`node() = vs@<host>`). Quindi
+`no_coordinator_at_all_refuses_with_no_claim_test`, che chiama `'nonexistent@nowhere'`, non
+prende il `badarg` immediato che il commento in `call_one` promette per i nodi non distribuiti:
+paga una risoluzione DNS/epmd che fallisce come `nodedown` dopo ~2,5 s. Misurato:
+
+| `timeout_ms` | esito | durata |
+|---|---|---|
+| 500 | `{timeout, …}` | 511 ms |
+| 5000 | `{nodedown, nonexistent@nowhere}` | 2278 ms |
+| 60000 | `{nodedown, nonexistent@nowhere}` | 2704 ms |
+
+L'esito del test è lo stesso nei tre casi — `call_one` fa `catch _:_ -> unreachable` — ma la
+durata no, e eunit uccide un singolo test dopo **5000 ms** (`?DEFAULT_TEST_TIMEOUT`,
+`eunit_internal.hrl:38`), mettendolo fra i *cancelled*, cioè togliendolo dal conteggio. Alzare
+il timeout **anche lì** avrebbe fabbricato il difetto B con le nostre mani.
+
+Quel solo test tiene quindi un override esplicito a 500 ms. La regola completa è: *il timeout
+di una chiamata di test non deve poter scattare per scheduling; dove la chiamata è fatta apposta
+per non raggiungere nessuno, il timeout diventa un tetto deterministico su una latenza che non
+controlliamo, e va tenuto ben sotto i 5 s di eunit.*

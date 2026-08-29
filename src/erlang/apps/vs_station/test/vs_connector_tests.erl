@@ -813,8 +813,15 @@ an_adopted_session_is_dated_from_the_charging_seconds_test() ->
                                          charging_seconds => 3600}),
         StartedAt = maps:get(started_at,
                              maps:get(session, vs_connector:snapshot(Pid))),
-        %% an hour back, on the station's own clock and nobody else's
-        ?assert(StartedAt =< Before - 3600000),
+        %% an hour back, on the station's own clock and nobody else's.
+        %% P11: the ceiling is read AFTER the fact, not from `Before'. The
+        %% connector stamps `now_ms() - 3600000' when it handles the plug,
+        %% which is at or after `Before', so `=< Before - 3600000' asked the
+        %% two clock readings to land in the SAME millisecond and failed
+        %% whenever they did not. The pair of bounds still catches both
+        %% regressions: no subtraction sails past the ceiling, too much
+        %% subtraction falls through the floor below.
+        ?assert(StartedAt =< vs_time:now_ms() - 3600000),
         ?assert(StartedAt >= Before - 3600000 - 2000),
         %% and the row that comes out of it is readable: the energy and the
         %% window it covers agree, which is the whole point

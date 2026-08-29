@@ -19,7 +19,15 @@
 client_opts() ->
     #{station_id           => 1,
       coord_nodes          => [node()],       %% the mock lives on this node
-      timeout_ms           => 500,
+      %% P11: not a wait anybody is meant to sit through, but a value the
+      %% scheduler must never be able to trip. The mock answers synchronously
+      %% from its handle_call, and the error paths of this file are driven by
+      %% explicit replies, `noproc' and `nodedown' — never by the clock. So a
+      %% short timeout buys nothing here, while a saturated machine can make
+      %% it fire on the happy path: that is exactly the {error, no_claim} out
+      %% of nowhere that B saw. The one call that really reaches nothing
+      %% overrides this value below, and says why.
+      timeout_ms           => 60000,
       renew_interval_ms    => 50,             %% contract says 10 s; shortened
       announce_interval_ms => 60000,          %% out of the tests' way
       station_info         => #{name             => <<"Test Station">>,
@@ -65,7 +73,11 @@ wait_gone(Names) ->
                        lists:all(fun(N) -> whereis(N) =:= undefined end, Names)
                end).
 
-wait_until(F) -> wait_until(F, 100).
+%% P11: a bounded retry, not an assertion about time. On the green path this
+%% leaves at the first truth and never spends the ceiling, so raising it from
+%% 100 to 300 (3 s) costs nothing there and only makes an already-red run take
+%% longer to say so. Nothing in this file asserts that the ceiling is reached.
+wait_until(F) -> wait_until(F, 300).
 
 wait_until(_F, 0) -> erlang:error(timed_out_waiting);
 wait_until(F, N) ->
@@ -88,7 +100,10 @@ holds() ->
     vs_claim_client ! {who_do_you_hold, self(), node()},
     receive
         {holds, StationId, Holds} -> {StationId, Holds}
-    after 1000 ->
+    after 5000 ->
+        %% P11: same class as wait_until's ceiling — the reply comes straight
+        %% out of the client's handle_info, so this branch is only ever
+        %% reached in a run that is already red.
         erlang:error(no_holds_reply)
     end.
 
@@ -142,10 +157,22 @@ exhausted_discovery_refuses_with_no_claim_test() ->
         ?assertEqual({1, []}, holds())
     end).
 
+%% P11: the one call in this file that is meant to reach nothing, and the
+%% only one that pays for it in wall clock. The comment in `call_one' says a
+%% non-distributed node raises `badarg' for a remote name — but our test node
+%% IS distributed (`{dist_node, [{sname, vs}]}' in rebar.config: node() is
+%% `vs@<host>'), so the name costs a DNS/epmd lookup that fails as `nodedown'
+%% after ~2.5 s instead. The outcome does not depend on which of the two
+%% happens — `call_one' catches everything into `unreachable' — so the short
+%% timeout asserts nothing about time: it is a deterministic bound on a
+%% lookup latency this suite does not control, kept well under eunit's 5 s
+%% ?DEFAULT_TEST_TIMEOUT (eunit_internal.hrl), which would otherwise cancel
+%% this test and take its count with it.
 no_coordinator_at_all_refuses_with_no_claim_test() ->
     {ok, Client} = vs_claim_client:start_link(
                      maps:merge(client_opts(),
-                                #{coord_nodes => ['nonexistent@nowhere']})),
+                                #{coord_nodes => ['nonexistent@nowhere'],
+                                  timeout_ms  => 500})),
     try
         ?assertEqual({error, no_claim}, acquire())
     after
