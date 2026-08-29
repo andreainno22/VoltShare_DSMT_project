@@ -1008,10 +1008,10 @@ L'unica cosa che il suo riavvio costa sono le righe ancora in coda dentro di lui
 di perdita di §13.1, e il `terminate/2` la scrive nel log riga per riga invece di lasciarla
 scoprire dopo.
 
-> **Un limite di questa riga, misurato dopo.** Per una sessione che attraversa un riavvio della
-> stazione l'energia è giusta e la **durata no**: `started_at` finisce per essere l'istante
-> dell'adozione, non quello del cavo. Il fatto, il perché e la direzione per chiuderlo stanno
-> in §16.8.
+> **Un limite di questa riga, misurato dopo e poi chiuso.** Per una sessione che attraversava un
+> riavvio della stazione l'energia era giusta e la **durata no**: `started_at` finiva per essere
+> l'istante dell'adozione, non quello del cavo. Il fatto e il perché stanno in §16.8, la
+> correzione — una durata che arriva dall'hardware, mai un istante — in §18.1.
 
 ---
 
@@ -1471,16 +1471,40 @@ overstay: nessuna delle due date entra nel calcolo, verificato leggendo il metod
 qualunque lettura di `ended_at - started_at` come «tempo di ricarica», che è una cosa che
 qualcuno prima o poi farà.
 
-**La direzione, concordata e non implementata.** Al `plugged` di riconciliazione la colonnina
-aggiunge **da quanti secondi sta erogando**, e la stazione ricostruisce `started_at` con il
-proprio orologio sottraendoli. La forma è scelta apposta: l'hardware fornisce una **durata**,
-che è un dato fisico misurato da lui, non un orario — quindi §7.4 («i timestamp che contano
-sono quelli della stazione, l'orologio della colonnina è una comodità») resta rispettata alla
-lettera, e due macchine con orologi diversi continuano a non doversi accordare.
+**Chiuso.** Al `plugged` di riconciliazione la colonnina aggiunge `charging_seconds`, **da
+quanti secondi sta erogando**, e la stazione ricostruisce `started_at` con il proprio orologio
+sottraendoli.
 
-`ws-chargepoint.md` è di A da entrambi i lati, quindi la modifica non richiede una PR. **Non si
-fa adesso:** prima il passo 5 (emulatore dei driver e prove di carico), poi un pair piccolo per
-chiuderla. Il passo 4 aggiunge un frame, non rimaneggia il contratto della colonnina.
+**Perché una durata è ammissibile dove un istante non lo sarebbe** — è il punto della
+correzione, non un dettaglio della sua forma. §7.4 non dice «la colonnina non mandi dati»: dice
+che i timestamp che contano sono quelli della stazione, perché un orario prodotto dalla
+colonnina obbligherebbe due orologi a essere d'accordo su *che ora è*, e non lo sono. Una
+durata non chiede niente del genere. È una grandezza che l'hardware ha **misurato**, della
+stessa specie di `energy_kwh` — che il contratto gli fa già mandare e sul quale gli crede senza
+esitazioni, perché è l'unico che l'abbia contata. La stazione legge il proprio orologio e
+sottrae: due macchine sfasate di dieci minuti scrivono la stessa riga. Un `started_at` assoluto
+mandato dall'hardware, esattamente sulla stessa informazione, ne scriverebbe due diverse. La
+distinzione fra durata e istante è ciò che tiene la modifica dentro §7.4 alla lettera, non un
+cavillo per farcela entrare.
+
+Ed è misurata dallo stesso istante da cui è contata l'energia — il cavo che entra — quindi i
+due numeri della riga coprono la stessa finestra: è questo che li rende coerenti fra loro, che
+era tutto il problema.
+
+Il campo è **facoltativo e resta tale**: assente o non positivo, `started_at` è l'istante
+dell'adozione e la stazione si comporta come prima che il campo esistesse. Una colonnina che
+non sa rispondere non è una colonnina rotta, ed è la ragione per cui il contratto dichiara di
+essere implementabile da hardware vero (§7 del SCOPE).
+
+**Scartate.** Far mandare all'hardware un `started_at` assoluto: è il caso di sopra, due
+orologi che devono accordarsi. Dedurre la durata dall'energia e dalla potenza nominale: darebbe
+un numero plausibile e **falso** — plausibile è peggio, perché un numero visibilmente sbagliato
+si trova, uno verosimile no.
+
+`ws-chargepoint.md` è di A da entrambi i lati, quindi la modifica non ha richiesto una PR. Cosa
+è cambiato e cosa sopravvive: §18.1. Misurato sulla stessa scena, prima e dopo:
+**65 s contro 148 s** per 5,956 e 5,957 kWh, cioè **329,9 kW impliciti contro 144,9** su una presa
+da 150.
 
 ---
 
@@ -1627,11 +1651,14 @@ una configurazione sbagliata, e riprovare all'infinito una configurazione sbagli
 ciclo. Ma vuol dire che l'ipotesi «lascia riconnettere la colonnina col suo backoff» **è falsa
 per il nostro emulatore su quel percorso**.
 
-Segnalato e non corretto: `cp.js` è fuori dal perimetro di questo passo, e la scelta fra
-«cambiare il codice della resa» e «insegnare a `cp.js` a distinguere il 4404 dell'handshake da
-quello a metà vita» è una decisione di contratto, che è di Caleb. Il percorso è comunque quasi
-irraggiungibile — richiede che il supervisore abbia rinunciato del tutto — e nelle prove non è
-mai stato imboccato.
+Segnalato e non corretto **allora**: `cp.js` era fuori dal perimetro di quel passo, e la scelta
+fra «cambiare il codice della resa» e «insegnare a `cp.js` a distinguere il 4404 dell'handshake
+da quello a metà vita» è una decisione di contratto, che è di Caleb.
+
+**Deciso poi, e nel primo dei due modi: §18.2.** La resa chiude `1012`, `cp.js` non è stato
+toccato. Il percorso, che qui era descritto come «quasi irraggiungibile» e non era mai stato
+imboccato nelle prove, è stato poi forzato apposta su un socket vero: l'emulatore moriva
+davvero, e l'errore era per intero dalla parte della stazione.
 
 ### 17.8 L'emulatore dei driver: perché firma i token da sé
 
@@ -1722,3 +1749,107 @@ docker logs --since 5m station1 | grep -B1 "ping vs@" | grep NOTICE
 Due timestamp consecutivi a più di sei secondi vogliono dire che la VM si è fermata, e quella
 corsa va rifatta invece che spiegata. Tutti i **tempi** riportati per il passo 5 sono stati
 presi con questo controllo eseguito **dopo** la corsa, e nessuno di essi attraversa una pausa.
+
+---
+
+## 18. Due ritocchi al contratto della colonnina (M2-A, dopo il passo 5)
+
+Due modifiche piccole a `ws-chargepoint.md`, e nessuna delle due introduce un meccanismo: una
+aggiunge un campo facoltativo, l'altra corregge un numero. Sono qui insieme perché condividono
+la stessa regola di lavorazione — il contratto è di A da entrambi i lati, quindi cambia senza
+PR, ma **testo e implementazioni cambiano nello stesso commit**. Un contratto che descrive un
+campo che il codice non manda è peggio di nessuno dei due: il primo si scopre provando, il
+secondo si scopre leggendo, e leggere è quello che fa chi arriva dopo.
+
+### 18.1 `charging_seconds`: dove entra, e le due cose che non tocca
+
+Il fatto, la misura e la ragione per cui una **durata** è ammissibile dove un **istante** non lo
+sarebbe stanno in §16.8, dove il difetto era stato annotato. Qui c'è cosa è cambiato.
+
+Il campo entra in un punto solo. `vs_cp_proto` lo legge dal payload del `plugged` e lo mette
+nella mappa `Info` **solo se è positivo e sottraendolo non si finisce prima dell'epoca**;
+altrimenti la chiave non c'è. `vs_connector:session_from/3` calcola `started_at` da quella
+chiave se c'è, dall'orologio se non c'è. Nessun'altra data cambia.
+
+**Perché la chiave si aggiunge invece di avere un default a zero.** È la differenza fra una
+promessa strutturale e una convenzione. Con un default, ogni payload costruirebbe una mappa che
+*contiene* il campo, e nulla impedirebbe a un percorso futuro di leggerlo credendolo sempre
+significativo; senza, un `plugged` ordinario costruisce **la stessa mappa, chiave per chiave**,
+che costruiva prima che il campo esistesse, e la facoltatività è una proprietà del codice invece
+che di una riga di documentazione. Il test lo asserisce come assenza della chiave, non come
+zero, apposta.
+
+**I tre ingressi in `charging`, e perché solo l'adozione cambia.** `free`, `held` e
+`out_of_service` passano tutti da `adopt/3` → `session_from/3`, e nessuno dei tre è stato
+toccato: cambia il **dato**, non il percorso. Solo un `plugged` di riconciliazione porta una
+durata, perché è l'unico che la colonnina abbia motivo di mandare. Il punto meritava una
+verifica e non un'assunzione: la scena che conta — riavvio della stazione — **non** passa da
+`out_of_service` ma da `free`, perché una stazione che riparte lo fa con processi connettore
+**nuovi**, che nascono liberi. Legare la correzione strutturalmente a `out_of_service` avrebbe
+prodotto codice che supera i test unitari e non corregge niente sul compose.
+
+**Non è accoppiato a `energy_offset` (§14.2), e non deve diventarlo.** L'offset risponde a
+«quanto di questo cumulativo appartiene a una riga che esiste già», la durata risponde a «quando
+è cominciata l'erogazione»: sono due domande diverse e nessuna delle due si deduce dall'altra.
+Stanno affiancate e non si leggono a vicenda.
+
+**Cosa sopravvive, e va detto.** Due residui, entrambi noti e nessuno dei due chiuso qui.
+
+1. **La copia del riaggancio non riporta la durata.** Quando muore il *connettore* sotto un
+   socket vivo (§17.4), il socket rigioca il `plugged` che aveva messo da parte. Ogni campo di
+   quella copia regge la traduzione tranne questo: l'energia si aggiorna dal `meter` arrivato
+   un attimo prima, una durata non si aggiorna da niente e nel frattempo è cresciuta di quanto
+   la copia è rimasta lì. Rigiocarla daterebbe la sessione troppo tardi di esattamente quel
+   tanto — un numero plausibile e falso, che è la cosa che §16.8 sceglie di evitare. Viene
+   tolta, e quel percorso torna al comportamento di prima (`started_at` = istante
+   dell'adozione). Chiuderlo vorrebbe dire che il socket si annota **quando** ha ricevuto il
+   frame: un pezzo di stato in più sul confine più delicato del milestone, per un percorso che
+   l'hardware non vede nemmeno. Non adesso.
+2. **Guasti incatenati sullo stesso cavo.** Se una sessione è già stata chiusa con il cavo
+   dentro (§14.2, D-1) e la successiva adotta con un offset, l'energia della seconda riga è la
+   fetta nuova mentre la durata che l'hardware dichiara copre **tutto** il cavo: le due righe si
+   sovrappongono nel tempo. È il prezzo di tenere le due grandezze indipendenti, ed è stato
+   pagato consapevolmente. Chiuderlo vorrebbe dire ricordare *fino a quando* si è fatturato, non
+   solo *quanto*: un secondo offset, e un meccanismo nuovo dove questo lotto chiude difetti.
+
+### 18.2 La resa del riaggancio chiude `1012`, e l'emulatore non si tocca
+
+Il difetto è in §17.7: la resa chiudeva `4404`, e `cp.js` su `4404` muore. La correzione è di
+una cifra, ma la ragione è la parte che conta.
+
+`4404` è **permanente**: §1 gliel'ha assegnato all'handshake, dove significa «questo connettore
+non è di questa stazione», e su una configurazione sbagliata riprovare all'infinito è un ciclo.
+Una colonnina che lo tratta come fatale sta obbedendo al contratto, non sbagliando. La resa del
+riaggancio è **temporanea**: un processo connettore è morto e il suo supervisore è indietro. Il
+piano del passo 5 aveva riusato il codice permanente per una condizione passeggera, e la frase
+con cui quel ramo si chiudeva — «the charge point will reconnect» — era falsa contro l'unica
+colonnina che abbiamo.
+
+`1012` (Service Restart) è il codice standard per «torna, sto ripartendo». La scelta però non è
+stata fatta soltanto perché il nome è quello giusto: **`cp.js` non è stato toccato**, e questo è
+l'argomento. Un `1012` cade da solo nel suo ramo generico di riconnessione con backoff, che
+esisteva già e non sa niente di connettori e supervisori. Un codice che obbliga il client a
+imparare un caso speciale della stazione è un codice scelto male; uno di fronte al quale un
+client che non sa niente fa la cosa giusta da sé è la prova che dice quello che intende dire.
+L'alternativa — insegnare a `cp.js` a distinguere il `4404` dell'handshake da quello a metà
+vita — è stata scartata proprio per questo: avrebbe messo nell'emulatore una conoscenza che
+l'hardware vero non ha nessun motivo di avere, e avrebbe lasciato il contratto a dire una cosa
+falsa.
+
+Il percorso, che §17.7 dava per «quasi irraggiungibile» e mai imboccato nelle prove, è stato
+forzato apposta su un socket vero prima e dopo la correzione (`CP_REATTACH_TRIES` a 1,
+supervisore sospeso con `sys:suspend`, connettore ucciso): prima l'emulatore usciva con codice
+2, dopo si riconnette col backoff, riannuncia il cavo e la sessione viene fatturata. È la prima
+volta che quel ramo gira su un socket vero — il passo 5 lo aveva solo nei test unitari.
+
+**Ha trovato un terzo posto dove lo stesso errore è ancora dentro**, e non è stato corretto qui.
+Tenendo il supervisore sospeso *a tempo indefinito* — che non è il caso vero, ma è quello che
+rende la prova deterministica — l'emulatore riceve il `1012`, si riconnette come previsto, e
+sull'**handshake** trova il registro ancora senza quel connettore: `4404`, e muore lo stesso.
+`vs_station_mgr:lookup_pid/1` collassa in un solo `{error, unknown_connector}` tre situazioni di
+cui due sono temporanee (manager non avviato, connettore senza pid in questo istante) e una sola
+è permanente (id che non è di questa stazione), e il socket manda il codice permanente a tutte e
+tre. È `PROBLEMI_TROVATI.md` P10: tocca `vs_station_mgr`, che è fuori perimetro, ed è una terza
+decisione di contratto — la risposta giusta probabilmente esiste già in §3.1 (`accepted: false`
+con un `reason`, «the charge point closes and retries with backoff») e non richiede un codice
+nuovo. Segnalata e lasciata a chi decide il contratto, come §17.7 aveva fatto con questa.

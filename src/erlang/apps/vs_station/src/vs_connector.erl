@@ -881,15 +881,47 @@ session_from(Info, ClaimId, Offset) ->
     #session{user_id     = maps:get(user_id, Info),
              vehicle_id  = maps:get(vehicle_id, Info),
              claim_id    = ClaimId,
-             %% The adoption instant, not the plug instant: the station has
-             %% no memory of what happened before the crash, and §6 makes
-             %% the meter total the thing that is billed, not the duration.
-             started_at  = vs_time:now_ms(),
+             started_at  = started_at_from(Info),
              energy_kwh  = Energy,
              energy_offset = Offset1,
              soc_pct     = maps:get(soc_pct, Info, 0),
              battery_kwh = maps:get(battery_kwh, Info, 0.0),
              max_kw      = maps:get(max_kw, Info, 0)}.
+
+%% §6 — when the session began, and the one date the reconciliation is
+%% allowed to move. It used to be the adoption instant unconditionally, on
+%% the argument that the station has no memory of what happened before the
+%% crash and that §6 bills the meter total, not the duration. Both halves
+%% are still true and the conclusion was wrong: nothing was miscounted, but
+%% the row said twenty-three seconds over energy that took an hour, and a
+%% document of record whose own two numbers contradict each other is a
+%% defect whether or not anybody prices it (measured: 5.956 kWh over 65
+%% recorded seconds, 330 kW implied on a 150 kW outlet).
+%%
+%% The hardware now sends how long it has been delivering, and the station
+%% subtracts that from **its own** clock. A duration is a quantity the
+%% equipment measured, like `energy_kwh'; an absolute start would be a
+%% reading of the equipment's clock, which §7.4 keeps out of anything that
+%% counts. That is the whole reason the field is a duration, and it is why
+%% two boxes whose clocks disagree still write the same row.
+%%
+%% Nothing here is coupled to `energy_offset': the offset answers "how much
+%% of this cumulative belongs to a row that exists already", this answers
+%% "when did the delivery start", and one is not derivable from the other.
+%% They are applied side by side and neither reads the other.
+%%
+%% The key is absent for every payload that does not carry a usable
+%% duration — `vs_cp_proto' does not put it there — so a walk-in, a
+%% reserved plug and a charge point that has never heard of the field all
+%% fall through to the clock, which is exactly what they did before.
+started_at_from(Info) ->
+    Now = vs_time:now_ms(),
+    case maps:get(charging_seconds, Info, undefined) of
+        Secs when is_integer(Secs), Secs > 0, Secs * 1000 < Now ->
+            Now - Secs * 1000;
+        _NoneOrUnusable ->
+            Now
+    end.
 
 %% Monitor the newcomer, drop the incumbent. `demonitor(..., [flush])'
 %% matters more than it looks: without the flush, the DOWN of the socket

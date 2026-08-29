@@ -96,11 +96,18 @@ if (major < MIN_NODE_MAJOR || typeof WebSocket !== 'function') {
 //               restart cannot reconstruct (§6.4).
 //   socPct    — the car's, not the station's.
 //   plugged   — the cable does not come out because a socket died.
+//   chargingSinceMs — §6.2, the other half of what only this side knows:
+//               when the current delivery began. It is what the station
+//               cannot reconstruct after a restart, exactly as the energy
+//               is, and for the same reason — this is the box that was
+//               there. Sent as a *duration*, never as an instant: see the
+//               `charging_seconds` note in plugged() below.
 const car = {
   energyKwh: 0,
   socPct: cfg.soc,
   plugged: false,
   delivering: false,
+  chargingSinceMs: null,
 };
 
 // What the station told us at boot. Replaced on every boot ack, never
@@ -257,8 +264,12 @@ function heartbeat() {
 }
 
 function plugged(why) {
+  // The cable going in starts the transaction timer; a socket dying does
+  // not, which is the whole point of it surviving here.
+  if (car.chargingSinceMs === null) car.chargingSinceMs = Date.now();
   car.plugged = true;
   car.delivering = true;
+  const chargingSeconds = Math.round((Date.now() - car.chargingSinceMs) / 1000);
   const id = send('plugged', {
     vehicle_id: cfg.vehicle,
     soc_pct: Math.round(car.socPct),
@@ -267,9 +278,20 @@ function plugged(why) {
     // §6.2: "a plugged with the vehicle and the cumulative energy it has
     // counted". Zero on a first plug, which is the same statement.
     energy_kwh: round3(car.energyKwh),
+    // §6.2 again, and the reason the station can date a session it never
+    // saw start. A **duration**, not a timestamp: this clock is a
+    // convenience (§3.2) and the station subtracts on its own, so the two
+    // never have to agree on what time it is — only on how long it has
+    // been. Measured from the same instant the energy above is, which is
+    // what keeps the two numbers of one `sessions` row consistent.
+    //
+    // Zero on a first plug, which §6 reads as "nothing to declare" and
+    // treats exactly as an absent field: the ordinary path is untouched.
+    charging_seconds: chargingSeconds,
   });
   log(`plugged (${id}): vehicle ${cfg.vehicle}, soc ${Math.round(car.socPct)}%, `
-      + `carried energy ${round3(car.energyKwh)} kWh — ${why}`);
+      + `carried energy ${round3(car.energyKwh)} kWh, `
+      + `charging for ${chargingSeconds}s — ${why}`);
 }
 
 // ---------------------------------------------------------------- charging
@@ -369,6 +391,8 @@ function unplug(why) {
   if (!car.plugged) return finish(0, why);
   car.plugged = false;
   car.delivering = false;
+  // The cable is out: the next one starts a new transaction, and a new timer.
+  car.chargingSinceMs = null;
   // §4.4: the final total, the number the sessions row is written with.
   const id = send('unplugged', { energy_kwh: round3(car.energyKwh) });
   log(`unplugged (${id}): ${round3(car.energyKwh)} kWh — ${why}`);

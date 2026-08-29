@@ -134,6 +134,10 @@ terminate(_Reason, _Req, _State) ->
 %%% internal
 %%%===================================================================
 
+%% The close code is `vs_cp_proto''s verdict, not this module's: the only
+%% one that reaches here today is the 1012 of §1, sent when the reattach
+%% gives up. It is written out as it comes, the same way the frames are —
+%% deciding it here would put half of §6 on this side of the split.
 from_info(Info, Session, State) ->
     case vs_cp_proto:handle_info(Info, Session) of
         {Frames, Session1} ->

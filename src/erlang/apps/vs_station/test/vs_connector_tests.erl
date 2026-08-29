@@ -792,6 +792,85 @@ an_out_of_service_connector_adopts_a_reconnected_session_test() ->
     end).
 
 %%%===================================================================
+%%% §6 — how long the hardware had been delivering
+%%%===================================================================
+
+%% The defect this closes, measured on the compose before it was: a car
+%% that had charged for two and a half minutes across a station restart
+%% produced a row covering sixty-five seconds and 5.956 kWh — 330 kW on a
+%% 150 kW outlet. `started_at' was the instant of the adoption, because it
+%% was the only instant the station had.
+%%
+%% This is the walk-in door, and it is the one that matters: a station that
+%% restarts comes back with **fresh** connector processes in `free', so the
+%% reconciliation of §6 arrives here and not at `out_of_service'.
+an_adopted_session_is_dated_from_the_charging_seconds_test() ->
+    with_connector(fun(Pid) ->
+        Before = vs_time:now_ms(),
+        ok = vs_connector:plugged(Pid, #{user_id => ?USER, vehicle_id => ?VEHICLE,
+                                         soc_pct => 58, battery_kwh => 58.0,
+                                         max_kw => 150, energy_kwh => 12.042,
+                                         charging_seconds => 3600}),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        %% an hour back, on the station's own clock and nobody else's
+        ?assert(StartedAt =< Before - 3600000),
+        ?assert(StartedAt >= Before - 3600000 - 2000),
+        %% and the row that comes out of it is readable: the energy and the
+        %% window it covers agree, which is the whole point
+        vs_connector:unplugged(Pid, 12.042),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        [Row] = vs_db_stub:rows(),
+        Seconds = (maps:get(ended_at, Row) - maps:get(started_at, Row)) / 1000,
+        ?assert(Seconds >= 3600),
+        ?assert(Seconds < 3610)
+    end).
+
+%% The controprova, at the unit the E2E measures on a real socket: a plug
+%% that says nothing about durations starts now, exactly as every plug did
+%% before the field existed. Both doors that a charge point can walk in
+%% through with no reconciliation behind it.
+a_plug_without_charging_seconds_still_starts_now_test() ->
+    with_connector(fun(Pid) ->
+        Before = vs_time:now_ms(),
+        ok = plug(Pid, ?VEHICLE),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        ?assert(StartedAt >= Before),
+        ?assert(StartedAt =< vs_time:now_ms())
+    end).
+
+a_reserved_plug_is_untouched_by_the_new_field_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        Before = vs_time:now_ms(),
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(charging, state_of(Pid)),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        ?assert(StartedAt >= Before),
+        ?assert(StartedAt =< vs_time:now_ms())
+    end).
+
+%% `vs_cp_proto' filters the field before it ever gets here, so this is the
+%% connector's own guard and not a second copy of the contract's rule: a
+%% duration longer than the epoch would date a session in 1969 and break
+%% the `epoch_ms()' the row is written with. It falls back rather than
+%% clamping, for the same reason the wire does — a clamped duration is a
+%% plausible number that is false.
+an_impossible_charging_seconds_falls_back_to_now_test() ->
+    with_connector(fun(Pid) ->
+        Before = vs_time:now_ms(),
+        ok = vs_connector:plugged(Pid, #{user_id => ?USER, vehicle_id => ?VEHICLE,
+                                         soc_pct => 22, battery_kwh => 58.0,
+                                         max_kw => 150,
+                                         charging_seconds => 4000000000}),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        ?assert(StartedAt >= Before)
+    end).
+
+%%%===================================================================
 %%% M2 fix 1 (D-2) — the row is written when the hardware has finished
 %%%                  talking, not when the station stops listening
 %%%===================================================================

@@ -1866,6 +1866,134 @@ Il resto delle prove non ha prodotto difetti: zero crash, zero report di supervi
   sono documentate in `src/emulator/README.md` invece di essere aggiunte a un contratto che non
   è nostro.
 
+## 7x. Due ritocchi a `ws-chargepoint.md`: `charging_seconds` e il codice della resa — 29 agosto
+
+Branch `a/m2-cp-touchups`, da `a/m2-load` (`cccf8f1`, passo 5 committato davvero — verificato con
+`git log` prima di ramificare). Questa volta **il contratto si modifica**: `ws-chargepoint.md` è
+di A da entrambi i lati, quindi niente PR, ma testo e implementazioni cambiano nello stesso
+commit. Nessun meccanismo nuovo: un campo facoltativo in più, un numero corretto.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline 298 test | `rebar3 eunit` (mai `--app`) su `cccf8f1` | **298 test, 0 fallimenti**. Confermata |
+| Dove sta davvero il `4404` della resa | `grep` su tutto il repo, poi lettura del commit | **c'è, ma non dove il piano lo cercava.** Il numero è in `vs_cp_proto:retry/2`, e il commento che motiva la scelta sbagliata è lì e nel doc di modulo, **non** in `vs_cp_ws` — che ha solo la citazione del 4404 di handshake, che resta giusta. Corretto dove sta |
+| Nessun test difende il comportamento sbagliato | `grep 4404` e `grep started_at` nei test | **due test lo difendevano** (sotto). Sul `started_at` di una sessione adottata: **nessuno**, e l'unica asserzione vicina (`ended_at >= started_at`, `vs_connector_tests`) regge la retrodatazione |
+
+### I due test che difendevano il difetto
+
+`vs_cp_proto_tests:five_attempts_with_no_connector_close_4404/0` e `ws_give_up_closes_the_socket/0`
+asserivano `4404` sul percorso della resa — uno sul protocollo, uno sul trasporto. Segnalati e non
+aggiustati in silenzio: il numero **è** il contenuto di quel ramo, perché è l'unica cosa che
+l'apparecchiatura dall'altra parte può leggere, quindi un test che lo asserisce non è un dettaglio
+d'implementazione ma la codifica della scelta. Rinominati in `..._1012`, con il commento che dice
+cosa asserivano prima e perché era sbagliato — che è il solo modo perché la prossima persona non
+lo rimetta a posto «com'era».
+
+### Catena dei chiamanti, cercata prima di toccare il codice
+
+| Funzione | Chiamanti | Conseguenza |
+|---|---|---|
+| `vs_connector:session_from/3` | `adopt/3`, chiamata dai **tre** ingressi in `charging`: `free`, `held`, `out_of_service` | Cambia il **dato**, non il percorso: nessuno dei tre è stato toccato, e solo un `plugged` di riconciliazione porta una durata |
+| `vs_cp_proto:authorise/5` | `with_account/4` ← `plugged/2` ← l'evento `plugged` **e** `reconcile/2` | Il replay del riaggancio passa dalla stessa funzione, ed è il motivo per cui la durata stantia va tolta lì (sotto) |
+| `vs_cp_proto:retry/2` | `handle_info(cp_reattach, ...)`, due clausole | Cambia un numero e il commento che lo motivava |
+| `#session.started_at` (letto) | `settle/1` (la riga), `build_snapshot/2` → `vs_driver_proto` (§5.2) e `vs_power:victim/1` | Tre conseguenze, tutte volute — sotto |
+| `cp.js` | — | **nessuna modifica**, che è l'argomento del ritocco 2 |
+
+**Il punto che il piano dava per scontato e che non lo era.** «Solo l'adozione deve cambiare» è
+vero come *comportamento*, non come *struttura*: la scena che conta — riavvio della stazione —
+**non** passa da `out_of_service` ma da `free`, perché una stazione che riparte lo fa con processi
+connettore nuovi, che nascono liberi. Confermato dal log della prova: `connector 3 walk-in session
+for user 12`. Legare la correzione strutturalmente a `out_of_service` avrebbe prodotto codice che
+passa i test unitari e non corregge niente sul compose.
+
+**Le tre conseguenze della retrodatazione, cercate e non subite.**
+
+1. `vs_power:victim/1` sospende **l'ultimo arrivato**, ordinando per `started_at`. Una sessione
+   adottata ora è anziana invece che appena arrivata: sotto scarsità viene sospesa **per ultima**
+   invece che per prima. È il verso giusto — un'auto che carica da un'ora *è* arrivata prima di
+   una attaccata un minuto fa — e la stabilità regge, perché `started_at` continua a essere
+   scritto una volta sola e a non cambiare più.
+2. La pagina del driver (`ws-driver.md` §5.2, campo `started_at`) mostra da quando si carica: dopo
+   un riavvio diceva «da 23 secondi» a chi caricava da un'ora, adesso dice la verità. Il contratto
+   del driver non cambia, cambia il valore che ci passa.
+3. La riga su `sessions` — il difetto che si stava chiudendo.
+
+### Verificato — girato davvero
+
+**Suite.** `rebar3 eunit` senza `--app`: **307 test, 0 fallimenti** (298 + 9 nuovi — quattro sul
+campo al confine del filo, uno sul replay che lo lascia cadere, quattro sul `started_at` delle tre
+porte).
+
+**Le due durate, sulla stessa scena.** Emulatore su conn 3, carica, `docker restart station1`,
+sessione riadottata, stacco a SoC raggiunto. Immagine ricostruita fra le due corse, stessi
+parametri, energia finale a un millesimo di distanza:
+
+| | `started_at` → `ended_at` | durata | energia | kW impliciti |
+|---|---|---|---|---|
+| **prima** (riga 1) | 13:56:54 → 13:57:59 | **65 s** | 5.956 kWh | **329.9** su una presa da 150 |
+| **dopo** (riga 3) | 08:18:20 → 08:20:48 | **148 s** | 5.957 kWh | **144.9** |
+
+Il `started_at` di dopo è **l'istante in cui il cavo è entrato** (log dell'emulatore:
+`08:18:20.465 plugged … cable in`), al secondo. I 144.9 invece di 150 sono le due rampe da cinque
+secondi (partenza e ripartenza) più i tre secondi di socket giù: fisicamente coerenti. La
+riconnessione ha portato `charging for 88s`, e il cavo era entrato 88 s prima.
+
+**La controprova.** Sessione ordinaria, nessun riavvio, stessi parametri prima e dopo:
+
+| | durata | energia | kW impliciti |
+|---|---|---|---|
+| **prima** (riga 2) | 43 s | 1.791 kWh | 149.9 |
+| **dopo** (riga 4) | 43 s | 1.791 kWh | 149.9 |
+
+Identica in ogni campo che non sia l'orologio a muro. E non è identica perché il campo non
+arriva: l'emulatore lo manda anche al primo `plugged` (`charging for 0s`), e la stazione lo legge
+come «niente da dichiarare» — quindi la controprova prova la cosa giusta, cioè che il percorso
+ordinario è inerte **con** il campo sul filo.
+
+**Il ritocco 2, prima e dopo, su un socket vero.** `CP_REATTACH_TRIES` a 1 via `os:putenv` sul
+nodo, `sys:suspend` sul supervisore dei connettori, connettore ucciso. È **la prima volta che quel
+ramo gira su un socket vero**: il passo 5 lo aveva solo nei test unitari, e lo dichiarava.
+
+* **prima** — stazione: `… did not come back in 1 attempts … - closing 4404`; emulatore: `the
+  station refused connector 3 (4404): it does not belong to station 1` → **uscita con codice 2**.
+  La sessione non viene mai riconciliata né fatturata.
+* **dopo** — stazione: `… - closing 1012`; emulatore: `disconnected (code 1012); retrying in
+  1000 ms` → si riconnette, riannuncia il cavo con `charging for 21s`, la stazione riadotta e la
+  riga viene scritta (`session 5 written: connector 3, user 12, 2.417 kWh`, uscita 0). `cp.js` non
+  è stato toccato: è la prova che il codice scelto dice quello che intende dire.
+
+### Un difetto nuovo, trovato provando questo — e non corretto
+
+Tenendo il supervisore sospeso **a tempo indefinito** (deterministico, ma non il caso vero),
+l'emulatore riceve il `1012`, si riconnette come previsto, e sull'**handshake** trova il registro
+ancora senza quel connettore: `4404`, e muore lo stesso. È lo stesso errore di P4 un gradino più
+in là: `vs_station_mgr:lookup_pid/1` collassa in un unico `{error, unknown_connector}` tre
+situazioni di cui **due sono temporanee** (manager non avviato; connettore senza pid in questo
+istante) e una sola è permanente. Segnalato in `PROBLEMI_TROVATI.md` **P10** e in
+`scelte_di_progetto.md` §18.2: tocca `vs_station_mgr`, che è fuori perimetro, ed è una terza
+decisione di contratto. Col supervisore che riparte davvero — il caso vero — non si presenta, ed è
+il motivo per cui la prova sopra è stata rifatta lasciandolo ripartire.
+
+### Ragionato, non provato — e perché
+
+- **I due residui del campo facoltativo** (`scelte_di_progetto.md` §18.1) sono *decisi* e coperti
+  da test unitari, non osservati sul compose. (a) La copia del riaggancio non riporta la durata,
+  perché è l'unico campo che invecchia: quel percorso torna al comportamento di prima. Nella prova
+  E2E non si è visto perché lì è stata la **colonnina** a rimandare il `plugged`, con un numero
+  fresco — che è il progetto, non un caso fortunato. (b) Guasti incatenati sullo stesso cavo: la
+  seconda riga porta l'energia della fetta nuova e una durata che copre tutto il cavo, quindi le
+  due righe si sovrappongono nel tempo. È il prezzo di tenere durata ed energia indipendenti, ed è
+  stato pagato consapevolmente.
+- **Una colonnina che non manda il campo** è coperta da tre test (assenza, zero, valore
+  impossibile) e da tutta la suite preesistente, ma non da una prova E2E con un emulatore
+  modificato apposta: l'unica colonnina che abbiamo ora lo manda sempre.
+- **`history.jsp`** non è stata riaperta: la riga adesso è internamente coerente, ma vederla nella
+  pagina richiede il login di B.
+- **Il fuso.** Le date sopra sono UTC in MySQL e ora locale nei log dell'emulatore; le due corse
+  cadono a cavallo della mezzanotte del 28/29 e i confronti sono fatti su durate, non su istanti.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
@@ -1896,8 +2024,8 @@ server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il s
 `vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
 
 **M2-A è completo**: canale colonnina (§7p), allocazione della potenza (§7q), INSERT su
-`sessions` (§7s), il frame `session` con la sua pagina (§7v) e il riaggancio del socket con
-l'emulatore dei driver (§7w). La fatturazione non gira più su righe inserite a mano: l'auto
+`sessions` (§7s), il frame `session` con la sua pagina (§7v), il riaggancio del socket con
+l'emulatore dei driver (§7w) e i due ritocchi al contratto della colonnina (§7x). La fatturazione non gira più su righe inserite a mano: l'auto
 carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
 fine della sessione. Quello che resta di M2-A è la verifica del fuso in `history.jsp`, che
 richiede un browser e una password che non ho.
