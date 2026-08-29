@@ -14,7 +14,7 @@ ws://<station-host>:8081/ws/cp?station_id=<id>&connector_id=<n>
 
 The charge point is the **client** and dials the station — the same way real equipment dials the operator's backend, because the hardware sits behind NAT on a site network and cannot be dialled into. One connection per connector: it keeps the routing trivial (the socket *is* the connector) and mirrors the way a multi-outlet unit reports each outlet separately.
 
-`connector_id` is globally unique, as everywhere else in the system (schema.sql). A connector id that does not belong to `station_id` is refused at the handshake with close code `4404`.
+`connector_id` is globally unique, as everywhere else in the system (schema.sql). A connector id that does not belong to `station_id` is refused at the handshake with close code `4404`. Only that one: a connector that this station **does** have but that has no process behind it at that instant — the station is still starting, or the connector process is between a crash and its restart — is **admitted**, and the answer comes at the `boot` (§3.1). `4404` at the handshake says "not a connector of this station", never "not right now".
 
 A second connection for a connector that already has one **replaces** it: hardware that reconnects after a network blip must not be locked out by its own stale socket. The old socket is closed with `4409`.
 
@@ -63,7 +63,12 @@ The station replies with everything the charge point needs to behave, so that th
                "server_time": 1755790000000, "limit_kw": 0 } }
 ```
 
-`accepted: false` with a `reason` means the station does not recognise this connector; the charge point closes and retries with backoff.
+`accepted: false` with a `reason` means the station does not recognise this connector **or cannot serve it right now**; the charge point closes and retries with backoff. The two are told apart by the `reason`, which is the only part of the refusal the equipment reads:
+
+| `reason` | what it means |
+|---|---|
+| `"unknown connector"` | this station has no such connector: permanent, and the next handshake will close `4404` (§1) |
+| `"connector not ready"` | the connector is this station's, but has no process behind it at this instant: temporary, and retrying is what fixes it |
 
 **Booting resets nothing.** A charge point that reconnects sends `boot` again and reports its true physical `status`; the station reconciles that against what it believes (§6). The hardware is the authority on what is plugged in, the station is the authority on what is authorised — keeping those two straight is the whole difficulty of this interface.
 

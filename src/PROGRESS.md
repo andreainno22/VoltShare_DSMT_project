@@ -54,7 +54,7 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | ③ Novanta secondi di inattività senza scollegarsi | ✅ **chiusa il 27/08** — **101 secondi** senza inviare nulla: socket sempre aperto, `["connecting","online"]` e nessuna riconnessione, 23 push di stato ricevuti. Il `pong` automatico tiene davvero fermo l'`idle_timeout` (60 s) di cowboy. Misurato con un client Node, che risponde ai ping esattamente come un browser |
 | ④ JWT in transito (B firma con `JwtUtil`, A verifica con `vs_jwt`) | ✅ **chiusa il 27/08** — registrato un utente vero da Tomcat, letto il `TOKEN` dalla pagina renderizzata (`sub:"1"`, `vehicle_id:1`, `iss:voltshare-backoffice`, 60 min) e usato per il `join`: accettato. È l'ultimo pezzo del confine fra le due metà, ed era l'unico mai provato |
 
-| **Suite completa dopo il merge di `a/m2-cp-touchups` (P11)** | ✅ **307 test** — misurati il 29/08 su `a/p11-suite-flake`: **stesso totale su 26 giri della suite completa**, e 0 fallimenti su 25 di quei 26 (l'unico rosso è il terzo difetto di §7zb, prima della sua correzione; dopo la correzione, 13 giri su 13 verdi). Da oggi il numero non è più una nota: `src/scripts/eunit_check.sh` lo confronta e fallisce se cambia (§7zb) |
+| **Suite completa dopo il merge di `a/m2-cp-touchups` (P11)** | ✅ **307 test** — misurati il 29/08 su `a/p11-suite-flake`: **stesso totale su 26 giri della suite completa**, e 0 fallimenti su 25 di quei 26 (l'unico rosso è il terzo difetto di §7zb, prima della sua correzione; dopo la correzione, 13 giri su 13 verdi). Da oggi il numero non è più una nota: `src/scripts/eunit_check.sh` lo confronta e fallisce se cambia (§7zb). **311 dal 29/08 con i quattro test di P10** (§7zc) |
 
 **Prerequisiti ancora da installare:** solo Docker Desktop. Erlang/OTP 29 (erts 17.0.5) + rebar3 3.27, JDK 17 e Maven 3.9.9 ci sono e funzionano.
 
@@ -207,12 +207,12 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
 rebar3 compile                         # quattro applicazioni, nessun warning
-rebar3 eunit                           # 307 test, 0 fallimenti (29/08, dopo il merge di M2-A)
+rebar3 eunit                           # 311 test, 0 fallimenti (29/08, dopo P10)
 #
 # Dal 29/08 il controllo vero prima di un push è lo script, non il comando nudo.
 # Si posiziona da sé, quindi gira da qualunque directory (qui dalla radice):
 #
-#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "307 tests, 0 failures"
+#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "311 tests, 0 failures"
 #
 # `rebar3 eunit' da solo non basta: un giro può stampare "0 failures" e avere
 # ventidue test cancellati, o perderne otto dal conteggio (§7zb).
@@ -2290,6 +2290,43 @@ lontano eunit è arrivato a enumerarla; e il totale da solo non basta, perché i
 lascia intatto. Da qui `src/scripts/eunit_check.sh`, che è verde **solo** se rebar3 esce 0 **e** il
 sommario è esattamente `307 tests, 0 failures` — ancorato, così che qualunque coda `cancelled`
 lo faccia fallire. Aggiornare quel numero è parte dell'aggiungere un test.
+
+## 7zc. P10: l'handshake diceva «mai più» per un fatto che dura un secondo — 29 agosto
+
+Il difetto lasciato aperto da §7x, chiuso. `vs_station_mgr:lookup_pid/1` collassava in un unico
+`{error, unknown_connector}` tre situazioni — tabella ETS assente (manager non ancora su), riga
+presente col pid a `undefined` (connettore fra la morte e il riavvio), riga assente (id non di
+questa stazione) — di cui **solo la terza è permanente**. L'handshake della colonnina rispondeva
+a tutte e tre col `4404` che §1 del contratto dichiara permanente, e su cui `cp.js` muore,
+correttamente.
+
+Adesso `lookup_pid/1` ne restituisce quattro (`{ok, Pid}`, `no_pid`, `no_manager`,
+`unknown_connector`), l'handshake **ammette** i due temporanei e la risposta la dà il boot con
+l'`accepted: false` di §3.1, che esisteva già: `reason` `"connector not ready"` per il
+temporaneo, `"unknown connector"` per il permanente. `cp.js` non è stato toccato — di nuovo, è
+l'argomento della scelta e non una comodità. Contratto aggiornato (§1 e §3.1) nello stesso
+commit di codice e test.
+
+Il chiamante che sarebbe morto: `vs_claim_client:revoke/2` aveva due sole clausole, `{ok, Pid}` e
+`{error, unknown_connector}`. Una revoca arrivata durante il riavvio di un connettore avrebbe
+prodotto `{error, no_pid}` → `case_clause` dentro `handle_info` → **muore il processo che tiene
+tutti i claim della stazione**. Allargata a `{error, _}`, e riprodotta prima di correggerla:
+rimettendo la clausola vecchia la suite non dice «1 rosso», dice `17 tests, 0 failures,
+6 cancelled` — la firma di §7zb, cioè esattamente il giro che `rebar3 eunit` da solo avrebbe
+fatto passare per innocuo.
+
+**Suite: 311 test** (307 + 4), tre giri consecutivi verdi con `eunit_check.sh` aggiornato nello
+stesso momento.
+
+**E2E sul compose, la scena di §7x che era rimasta rossa.** Emulatore in carica su conn 3,
+supervisore dei connettori sospeso con `sys:suspend` a tempo indefinito, connettore ucciso:
+resa `1012` (2,5 s) → riconnessione → **handshake ammesso** (`no_pid`) → boot
+`accepted:false (connector not ready)` → l'emulatore ritenta ~1/s per 45 s → `sys:resume`, il
+supervisore rifà il connettore in **10 ms** → boot accettato, `plugged` con `charging for 76s` e
+1.166 kWh già contati → sessione **riconciliata, non ricominciata** (`started_at` è l'ora del
+primo cavo) → `EXIT=0`, riga 6 in `sessions`: 13:30:08 → 13:33:19, 5.957 kWh, 268 cent.
+Controprova del permanente: emulatore su un connettore non configurato (9) → `4404`, morte
+immediata, `EXIT=2`. Report completo in `REPORT_P10.md`.
 
 ## 9. Prossimo passo
 

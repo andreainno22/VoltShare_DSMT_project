@@ -281,6 +281,49 @@ revocation_travels_from_coordinator_to_connector_test() ->
         ?assertEqual({1, []}, holds())
     end).
 
+%% P10 — the revocation that used to kill the process holding every claim
+%% of the station.
+%%
+%% `revoke/2' asks the registry for the connector's pid and had exactly two
+%% clauses, `{ok, Pid}' and `{error, unknown_connector}'. Since
+%% `vs_station_mgr:lookup_pid/1' tells the three cases apart, a revocation
+%% that lands while the connector is between its death and its restart
+%% answers `{error, no_pid}' — a case_clause inside `handle_info', i.e. the
+%% claim client dies and takes every claim of the station with it. The
+%% clause is `{error, _}' now, and this is the window in which that matters.
+%%
+%% Deterministic by construction: the connector supervisor is held with
+%% `sys:suspend' so that it cannot restart the child, which is exactly how
+%% the E2E of REPORT_CP_TOUCHUPS §6 forces the same window on a real socket.
+a_revocation_while_the_connector_restarts_does_not_kill_the_client_test() ->
+    with_station(fun() ->
+        Client = whereis(vs_claim_client),
+        {ok, Pid} = vs_station_mgr:connector_pid(?CONN),
+        {ok, _ExpiresAt} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ok = sys:suspend(vs_connector_sup),
+        try
+            exit(Pid, kill),
+            %% wait for the registry to be in the P10 state itself, rather
+            %% than for the kill: the row is there, the pid is not
+            ok = wait_until(fun() ->
+                {error, no_pid} =:= vs_station_mgr:lookup_pid(?CONN)
+            end),
+            %% ... and only then let the coordinator revoke everything
+            ok = vs_mock_coord:set_renew(revoke_all),
+            ok = wait_until(fun() -> {1, []} =:= holds() end),
+            %% the claim is gone AND the client is the same process it was:
+            %% "it survived" is an assertion here, not something inferred
+            %% from the fact that it answered
+            ?assertEqual(Client, whereis(vs_claim_client)),
+            ?assert(is_process_alive(Client))
+        after
+            %% a suspended supervisor would queue the shutdown of the
+            %% fixture too, and `wait_gone' would sit there until eunit
+            %% cancelled the whole group
+            ok = sys:resume(vs_connector_sup)
+        end
+    end).
+
 %%%===================================================================
 %%% the reachability flag the driver channel shows (ws-driver.md §5.1)
 %%%===================================================================

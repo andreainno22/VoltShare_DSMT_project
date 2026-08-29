@@ -443,7 +443,13 @@ revoke(ClaimId, Claims) ->
             case vs_station_mgr:lookup_pid(C#claim.conn_id) of
                 {ok, Pid} ->
                     vs_connector:revoke(Pid, ClaimId);   %% a cast — no cycle
-                {error, unknown_connector} ->
+                {error, _} ->
+                    %% P10: `no_pid' | `no_manager' | `unknown_connector' — the
+                    %% three the dirty read can now tell apart, and this
+                    %% answer is right for all three. A named clause here
+                    %% would be a case_clause that kills the process
+                    %% holding every claim of the station, the moment a
+                    %% revocation lands during a connector restart.
                     ok   %% connector down: its restart comes back claimless anyway
             end,
             maps:remove(ClaimId, Claims);

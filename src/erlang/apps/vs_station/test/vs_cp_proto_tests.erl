@@ -32,6 +32,10 @@ cases() ->
       fun a_connector_of_another_station_is_refused_4404/0},
      {"another station's id is refused 4404",
       fun another_stations_id_is_refused_4404/0},
+     {"a connector with no process behind it is admitted, not refused",
+      fun a_connector_with_no_pid_is_admitted/0},
+     {"a connector looked up while the manager is down is admitted",
+      fun a_connector_is_admitted_while_the_manager_is_down/0},
      {"a query string that does not parse is refused 4404",
       fun an_unparsable_query_string_is_refused_4404/0},
      {"boot is acked with everything the equipment needs",
@@ -42,6 +46,8 @@ cases() ->
       fun boot_hands_the_reported_status_over/0},
      {"boot carries the limit of a session already running",
       fun boot_carries_the_limit_of_a_running_session/0},
+     {"a connector not ready at boot says so in the reason",
+      fun a_connector_not_ready_at_boot_says_so/0},
      {"a connector lost between handshake and boot is not accepted",
       fun a_connector_lost_before_boot_is_not_accepted/0},
      {"heartbeat is acked with the station's clock",
@@ -147,6 +153,31 @@ an_unparsable_query_string_is_refused_4404() ->
                                         {<<"connector_id">>, <<"3">>}], opts())),
     ?assertEqual({refuse, 4404}, vs_cp_proto:handshake([], opts())).
 
+%% P10 — §1: "a connector that this station **does** have but that has no
+%% process behind it at that instant ... is **admitted**". The row is in
+%% the registry with `undefined' in it, which is what the manager writes
+%% at init and writes back on the connector's `DOWN'. Refusing here sent
+%% 4404 — the permanent code — for a fact that lasts a supervisor restart,
+%% and our own emulator dies on 4404, correctly.
+a_connector_with_no_pid_is_admitted() ->
+    vs_cp_stub:set_pid(undefined),
+    ?assertMatch({ok, #{connector_id := ?CONN}},
+                 vs_cp_proto:handshake(qs(1, ?CONN), opts())),
+    %% and it really did ask the registry: the admission is a decision
+    %% about the ANSWER, not a check that was skipped
+    ?assertEqual(1, vs_cp_stub:count(lookup_pid)).
+
+%% The other temporary one: no table at all, because this manager has not
+%% finished booting. Same verdict, and for the same reason — a charge
+%% point that dials in during the station's own start-up is early, not
+%% wrong.
+a_connector_is_admitted_while_the_manager_is_down() ->
+    vs_cp_stub:set_connectors(manager_down),
+    ?assertMatch({ok, #{connector_id := ?CONN}},
+                 vs_cp_proto:handshake(qs(1, ?CONN), opts())),
+    %% nothing was bound: §3.1 does the binding, and it has not run
+    ?assertEqual(0, vs_cp_stub:count(attach_cp)).
+
 %%%===================================================================
 %%% §3 — bring-up
 %%%===================================================================
@@ -201,14 +232,38 @@ boot_carries_the_limit_of_a_running_session() ->
     ?assertEqual(60.0, maps:get(limit_kw, payload_of(Ack))).
 
 %% §3.1: "accepted: false with a reason means the station does not
-%% recognise this connector; the charge point closes and retries with
-%% backoff." The handshake already checked, so this is the manager having
-%% gone away in between — a restart, and backoff is the right answer.
+%% recognise this connector or cannot serve it right now; the charge point
+%% closes and retries with backoff."
+%%
+%% The arrangement here is the PERMANENT one: the registry no longer holds
+%% this id at all, which since P10 means "not a connector of this station"
+%% and nothing else. It can only be reached with a manager that came back
+%% with a different configuration between the upgrade and this frame — the
+%% boot refuses it all the same, and the 4404 lands at the next handshake
+%% (vs_cp_proto §3.3). The assertion stays on the presence of a `reason'
+%% rather than its text, because the text is the other test's subject.
 a_connector_lost_before_boot_is_not_accepted() ->
     vs_cp_stub:set_connectors([]),
     {[Ack], S} = handle(frame(<<"boot">>, <<"cp-1">>, boot_payload()), session()),
     ?assertEqual(false, maps:get(accepted, payload_of(Ack))),
     ?assert(maps:is_key(reason, payload_of(Ack))),
+    ?assertEqual(false, maps:get(booted, S)),
+    ?assertEqual(0, vs_cp_stub:count(attach_cp)).
+
+%% P10 — the other half of §3.1's table, and the whole point of admitting
+%% the socket at the handshake: a charge point let in while its connector
+%% has no process must be told WHY in a word it can tell apart from the
+%% permanent one. Same `accepted: false', different `reason'.
+a_connector_not_ready_at_boot_says_so() ->
+    vs_cp_stub:set_pid(undefined),
+    {[Ack], S} = handle(frame(<<"boot">>, <<"cp-1">>, boot_payload()), session()),
+    ?assertEqual(false, maps:get(accepted, payload_of(Ack))),
+    ?assertEqual(<<"connector not ready">>, maps:get(reason, payload_of(Ack))),
+    %% and the permanent one still reads the way §3.1 says it does
+    vs_cp_stub:set_connectors([]),
+    {[Ack2], _} = handle(frame(<<"boot">>, <<"cp-2">>, boot_payload()), session()),
+    ?assertEqual(<<"unknown connector">>, maps:get(reason, payload_of(Ack2))),
+    %% nothing was attached on either path
     ?assertEqual(false, maps:get(booted, S)),
     ?assertEqual(0, vs_cp_stub:count(attach_cp)).
 

@@ -176,13 +176,24 @@ opt(Key, Opts, Default) ->
 %% @doc The verdict on `?station_id=<id>&connector_id=<n>'.
 %%
 %% "A connector id that does not belong to `station_id' is refused at the
-%% handshake with close code 4404" (§1). Three ways to earn it, and the
-%% log line says which: a query string that does not parse, a station that
-%% is not this node, and a connector this station does not own. The last
-%% is decided by the dirty read, never by a call to the manager: a charge
-%% point dialling in while the manager is booting must not queue behind
-%% it, and the honest answer for "the registry is not there yet" is the
-%% same one as for "not mine" — come back later.
+%% handshake with close code 4404" (§1) — and P10 made that sentence true
+%% of the code as well. Three ways to earn the refusal, and the log line
+%% says which: a query string that does not parse, a station that is not
+%% this node, and a connector this station does not own.
+%%
+%% The last is decided by the dirty read, never by a call to the manager:
+%% a charge point dialling in while the manager is booting must not queue
+%% behind it. That read used to answer "not mine" to "the registry is not
+%% there yet" and to "the connector died a moment ago" too, and the socket
+%% turned all three into 4404 — the permanent code, the one cp.js dies on.
+%% The comment here argued, correctly, that the honest answer to a
+%% temporary fact is "come back later"; the code sent "never come back".
+%%
+%% Now `no_pid' and `no_manager' are ADMITTED: the socket is opened and
+%% the boot of §3.1 answers, which is the one place in this contract that
+%% can say `accepted: false' with a reason and let the equipment retry on
+%% its own backoff. In the ordinary case the supervisor has rebuilt the
+%% connector by then and the boot simply attaches.
 -spec handshake([{binary(), binary() | true}], map()) ->
           {ok, session()} | {refuse, 4404}.
 handshake(Qs, Opts) ->
@@ -193,6 +204,14 @@ handshake(Qs, Opts) ->
             Session1 = Session#{connector_id := ConnId},
             case connector(Session1) of
                 {ok, _Pid} ->
+                    {ok, Session1};
+                {error, Temporary} when Temporary =:= no_pid;
+                                        Temporary =:= no_manager ->
+                    %% Configured, just not servable this instant. §3.1 is
+                    %% the answer, not §1: admit and let the boot speak.
+                    logger:notice("charge point channel: connector ~p admitted "
+                                  "with nothing behind it yet (~p) - the boot "
+                                  "will answer", [ConnId, Temporary]),
                     {ok, Session1};
                 {error, _} ->
                     logger:notice("charge point channel: refused connector ~p - "
@@ -386,18 +405,34 @@ boot(ReqId, Payload, Session = #{connector_id := ConnId}) ->
             {[boot_ack(ReqId, limit_kw(Session2, Pid), Session2)],
              Session2#{booted := true}};
         {error, Reason} ->
-            %% §3.1: "`accepted: false' with a `reason' means the station
-            %% does not recognise this connector; the charge point closes
-            %% and retries with backoff". The handshake already checked
-            %% this, so reaching here means the manager went away between
-            %% the upgrade and the first frame — a restart, and backoff is
-            %% exactly the right answer to it.
+            %% §3.1: "`accepted: false' with a `reason' ... the charge
+            %% point closes and retries with backoff". Since P10 this is
+            %% not only the manager-vanished-between-upgrade-and-boot
+            %% race: the handshake now ADMITS a connector that is merely
+            %% without a process, and this is where that socket gets its
+            %% answer.
+            %%
+            %% `accepted: false' for all three reasons on purpose, the
+            %% permanent one included. `unknown_connector' can only reach
+            %% here if the manager restarted with a different
+            %% configuration between the upgrade and the first frame;
+            %% refusing the boot and letting the 4404 arrive at the NEXT
+            %% handshake is simpler than a second place in this module
+            %% that closes 4404, and costs the equipment one reconnect.
+            %% The `reason' is what tells the two apart, and it is the
+            %% only part of the ack a charge point can read: cp.js logs
+            %% it and closes either way (§3.1).
             logger:warning("charge point channel: connector ~p unreachable at "
                            "boot (~p)", [ConnId, Reason]),
             {[ack(ReqId, #{accepted => false,
-                           reason   => <<"unknown connector">>})],
+                           reason   => boot_refusal(Reason)})],
              Session}
     end.
+
+%% The two natures of §3.1's `reason', in the contract's own words.
+boot_refusal(no_pid)     -> <<"connector not ready">>;
+boot_refusal(no_manager) -> <<"connector not ready">>;
+boot_refusal(_Permanent) -> <<"unknown connector">>.
 
 %% @doc The `boot' ack of §3.1. Public so the tests read it from the
 %% contract's own vocabulary rather than from a literal in two places.

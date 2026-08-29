@@ -1853,6 +1853,59 @@ tre. È `PROBLEMI_TROVATI.md` P10: tocca `vs_station_mgr`, che è fuori perimetr
 decisione di contratto — la risposta giusta probabilmente esiste già in §3.1 (`accepted: false`
 con un `reason`, «the charge point closes and retries with backoff») e non richiede un codice
 nuovo. Segnalata e lasciata a chi decide il contratto, come §17.7 aveva fatto con questa.
+
+**Decisa e chiusa lo stesso giorno: §18.3.**
+
+### 18.3 L'handshake ammette il temporaneo, e a rispondere è il boot (P10)
+
+Il terzo posto che §18.2 aveva trovato e lasciato aperto. `vs_station_mgr:lookup_pid/1`
+collassava tre situazioni in un `{error, unknown_connector}` solo, e l'handshake della colonnina
+mandava a tutte e tre il `4404` che §1 destina al permanente. Adesso ne dice quattro:
+
+| ETS | ritorno | natura |
+|---|---|---|
+| riga con pid vivo | `{ok, Pid}` | — |
+| riga con `undefined` | `{error, no_pid}` | temporanea: fra il DOWN e il restart |
+| tabella assente (`badarg`) | `{error, no_manager}` | temporanea: manager non ancora su |
+| riga assente | `{error, unknown_connector}` | **permanente**: non è di questa stazione |
+
+La distinzione è pulita e non ha finestre grigie perché `init/1` inserisce **tutti** i connettori
+configurati con pid `undefined` prima di qualunque altra cosa, e il `DOWN` rimette `undefined`
+invece di cancellare la riga: una riga che c'è vuol dire "questo connettore è mio" per tutta la
+vita di quel manager.
+
+**La correzione non inventa un meccanismo, ne toglie uno di troppo.** I due temporanei sono
+*ammessi* all'handshake e la risposta la dà il `boot`, cioè l'unico punto del contratto che sa
+già dire «non adesso» senza dire «mai più»: `accepted: false` con un `reason`, e «the charge
+point closes and retries with backoff». Il ramo esisteva dal passo 5 e ci si arrivava quasi mai;
+oggi è la strada normale del riavvio di un connettore. Il `reason` distingue i due casi —
+`"connector not ready"` contro `"unknown connector"` — ed è l'unica parte del rifiuto che
+l'apparecchiatura legge.
+
+Il `4404` torna a essere esattamente ciò che §1 dichiara e nient'altro, e il `logger:notice` che
+lo accompagna («not a connector of station N») smette di mentire in due casi su tre. Come per il
+`1012` di §18.2, **`cp.js` non è stato toccato**: un `accepted: false` cade da solo nel suo ramo
+di chiusura-e-backoff, che non sa niente di supervisori.
+
+**Il chiamante che la modifica avrebbe ucciso, e che il piano aveva ragione a cercare.**
+`vs_claim_client:revoke/2` faceva `case vs_station_mgr:lookup_pid(...)` con **due sole clausole**.
+Allargare il tipo di ritorno senza toccarlo avrebbe fatto sì che una revoca del coordinatore
+arrivata durante il riavvio di un connettore producesse un `case_clause` dentro `handle_info`, e
+morisse il processo che tiene *tutti* i claim della stazione. Vale la pena scriverlo perché è il
+tipo di danno che una modifica "innocua" fa: nessuna delle due funzioni è sbagliata da sola.
+Riprodotto prima di correggerlo, e la forma del rosso è quella di §19.1 — `17 tests, 0 failures,
+6 cancelled`, non «1 fallimento».
+
+**Il backoff piatto dell'emulatore nel giro del boot rifiutato — osservato, accettato, non
+corretto.** `cp.js` azzera `backoffMs` in `onOpen`, e nel giro "connetti → boot rifiutato →
+chiudi" la connessione **riesce** ogni volta: quindi il backoff non cresce mai e l'emulatore
+ritenta a ~1/s finché il connettore non torna (misurato: 45 riconnessioni in 45 s). Non è un
+difetto del contratto — §6.1 parla del backoff della *riconnessione*, e la riconnessione qui
+riesce davvero — ed è l'emulatore, non l'hardware: una colonnina vera fa §3.1 per conto suo.
+Correggerlo vorrebbe dire insegnare a `cp.js` a distinguere "aperto" da "aperto e servito", che
+è la stessa conoscenza speciale della stazione che §18.2 ha rifiutato di metterci dentro.
+Annotato e basta.
+
 ## 19. La suite come asserzione (P11)
 
 Due decisioni prese il 29/08 dopo la segnalazione di B — un giro rosso su
