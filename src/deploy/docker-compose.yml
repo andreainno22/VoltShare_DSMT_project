@@ -39,6 +39,12 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.erlang
+    # One image name for both stations, for the same reason the coordinators
+    # share theirs: compose otherwise derives voltshare-station1 and
+    # voltshare-station2, and rebuilding one leaves the other on older code.
+    # That is not hypothetical — it is how a fixed refusal message went on
+    # showing the old wording for two days after the fix was merged.
+    image: voltshare-station:local
     container_name: station1
     hostname: station1
     environment:
@@ -75,6 +81,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.erlang
+    image: voltshare-station:local
     container_name: station2
     hostname: station2
     environment:

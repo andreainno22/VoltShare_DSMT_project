@@ -2,7 +2,8 @@ package it.unipi.dsmt.voltshare.model;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
+import it.unipi.dsmt.voltshare.util.Times;
+import java.util.Locale;
 
 /**
  * One completed charging session, as the history page shows it.
@@ -16,8 +17,6 @@ import java.time.format.DateTimeFormatter;
  * as far as the back office is concerned.
  */
 public class SessionView {
-
-    private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
 
     private final long id;
     private final int stationId;
@@ -50,13 +49,21 @@ public class SessionView {
         return costCents != null;
     }
 
-    /** Euro with two decimals, or a dash while the sweep has not run yet. */
+    /**
+     * Euro with two decimals, or a dash while the sweep has not run yet.
+     *
+     * <p>{@code Locale.ROOT}, not the JVM default. Without it the same amount rendered as
+     * "12,34" on an Italian developer machine and "12.34" inside the container, so the page a
+     * driver saw depended on where Tomcat happened to be running. Fixing the locale makes the
+     * output deterministic and consistent with the rest of the interface, which is in English.
+     * The same applies to every other figure the pages show.
+     */
     public String getCostEuro() {
-        return costCents == null ? "—" : String.format("%.2f", costCents / 100.0);
+        return costCents == null ? "—" : String.format(Locale.ROOT, "%.2f", costCents / 100.0);
     }
 
     public String getEnergyText() {
-        return String.format("%.2f", energyKwh);
+        return String.format(Locale.ROOT, "%.2f", energyKwh);
     }
 
     public long getDurationMinutes() {
@@ -75,12 +82,13 @@ public class SessionView {
         return overstaySeconds > 0;
     }
 
+    /** Stored in UTC, shown in local time — see {@link Times}. */
     public String getStartedText() {
-        return STAMP.format(startedAt);
+        return Times.format(startedAt);
     }
 
     public String getEndedText() {
-        return STAMP.format(endedAt);
+        return Times.format(endedAt);
     }
 
     // ---- plain accessors --------------------------------------------------------

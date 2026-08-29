@@ -18,7 +18,7 @@ Owners: **B** signs (`util.JwtUtil`), **A** verifies (`vs_driver_ws`).
 | Library, Java | `io.jsonwebtoken:jjwt` |
 | Library, Erlang | `jose` |
 
-Claims — exactly these, no others:
+Claims — these, plus `iat`:
 
 ```json
 {
@@ -31,6 +31,12 @@ Claims — exactly these, no others:
 ```
 
 `sub` is the user id as a **string** (the JWT spec requires it); `vehicle_id` is a number. The station needs both: `sub` to attribute the session, `vehicle_id` because the claim is per vehicle.
+
+`JwtUtil` also sets **`iat`**, the standard issued-at claim. This section used to say "exactly
+these, no others", which was false the day it was written — the station ignores `iat` and `nbf`
+deliberately, so nothing ever broke, but a frozen contract that does not match the code teaches
+people to stop trusting it. The claim stays: removing a standard, harmless field to satisfy a
+sentence would be the wrong repair. Spotted by A on 28/08.
 
 There is no refresh token. The login session lives in Tomcat's `HttpSession`; when it is still valid and the token is close to expiry, the servlet mints a new one. A driver whose token expires mid-session is not disconnected — expiry is checked only when the WebSocket opens.
 

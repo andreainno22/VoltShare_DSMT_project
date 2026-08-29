@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 25 agosto 2026 — M1-B, M2-B e **M3-B** chiuse. Tre coordinatori con elezione bully, quorum e ricostruzione: failover provato in Docker uccidendo due leader di fila. 132 test, 0 fallimenti.
+**Ultimo aggiornamento:** 28 agosto 2026 — M1-B, M2-B, M3-B e **M4-B** chiuse. Penalità verificate end-to-end, comprese le sospensioni che sopravvivono a un failover. Partizione di rete vera dimostrata su un host solo. 133 test, 0 fallimenti.
 
 ---
 
@@ -13,9 +13,9 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 |---|---|---|
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
 | **M1** percorso base | ✅ **chiusa e verificata in Docker il 27/08**: 7 container, token emesso da Tomcat e verificato dalla stazione, `reserve` fino al coordinatore vero e ritorno, dedup provata dentro `vs_coord_srv`, lease che libera da solo, riconnessione dopo `stop station1`. Resta fuori solo la resa visiva in un browser vero (estensione non disponibile): la logica del rendering è provata con un DOM minimale, non i pixel | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
-| **M2** sessione e potenza | ⬜ canale colonnina, potenza, INSERT sessione, `session.jsp` | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
+| **M2** sessione e potenza | ✅ **chiusa il 28/08**: canale colonnina, riparto della potenza, INSERT su `sessions`, `session.jsp`, emulatore | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
 | **M3** tolleranza ai guasti | ⬜ rinnovo contro il nuovo leader, revoca, riconnessione client | ✅ **elezione, quorum, ricostruzione** — failover provato in Docker (§7m) |
-| **M4** regole di dominio | ⬜ | ⬜ |
+| **M4** regole di dominio | ⬜ overstay, lista d'attesa, segnalazione no_show | ✅ **penalità, notifiche, profilo** — provate contro il cluster (§7z) |
 | **M5** consegna | ⬜ | ⬜ |
 
 ### Cosa è stato realmente eseguito
@@ -775,6 +775,246 @@ percorso dell'erogazione.
 - `vs_coord_membership_tests` (9) — un nodo solo è sempre in maggioranza, 1 di 3 no, l'avvio è
   ottimista di proposito (altrimenti a un riavvio simultaneo tutti e tre si eleggono), e
   **un estraneo non fa quorum**.
+
+---
+
+## 7za. Le sospensioni non sopravvivevano a un riavvio — 28 agosto
+
+Nella sua nota A accennava a *"una review della PR #5: la più importante riguarda le sospensioni
+dopo un riavvio"*. Quella review non è mai arrivata — su GitHub c'è solo quella automatica di
+Copilot, su un altro punto. Ma **l'indizio era giusto**, e cercandolo sono usciti due buchi veri.
+
+### Il buco
+
+`pushAllSuspensions()` veniva chiamato solo quando il **nome** del leader cambiava:
+
+```java
+boolean changed = !a.atomValue().equals(leaderNode);
+if (changed) { PenaltyService.getInstance().pushAllSuspensions(); }
+```
+
+Due modi per non farlo scattare:
+
+1. **un coordinatore che si riavvia e rivince** torna con la mappa delle sospensioni **vuota**,
+   annuncia lo stesso nome di prima, e per il back office "non è cambiato niente". Serve a tempo
+   indeterminato lasciando prenotare utenti sospesi;
+2. **il back office che si riavvia** parte con `leaderNode` = primo elemento di `COORD_NODES`. Se
+   il leader è proprio quello, il primo annuncio non è un cambiamento. E peggio: `{leader, _}`
+   veniva inviato **una volta sola**, alla vittoria dell'elezione — quindi un back office
+   partito dopo non ne sentiva nessuno, e su un cluster sano l'elezione successiva non arriva mai.
+
+Il secondo è il caso più realistico ed è esattamente quello che A chiamava "dopo un riavvio".
+
+### Correzione, su entrambi i lati
+
+- **Java**: si spinge a **ogni** annuncio, non solo quando il nome cambia. L'annuncio non
+  significa "è cambiato il leader", significa *"ho appena cominciato a servire e la mia tabella è
+  quel che sono riuscito a ricostruire"* — cioè precisamente il momento in cui le sospensioni
+  vanno ripetute. È idempotente e costa una manciata di messaggi.
+- **Erlang**: il republish periodico manda anche `{leader, node()}`. Un back office partito tardi
+  converge da solo entro 30 secondi, invece di aspettare un'elezione che non verrà.
+
+### Verifica
+
+```
+docker compose restart backoffice          # nessuna elezione nei coordinatori
+backoffice | Coordinator leader is now vs@coord3
+backoffice | Re-sent 1 suspension(s) to the new leader
+
+utente sospeso, dopo il restart : {error, <<"r-c">>, suspended}
+```
+
+Il back office ha ripreso da solo, senza che nessuno rieleggesse nulla. Prima sarebbe rimasto in
+silenzio.
+
+### Perché è il tipo di difetto che sfugge
+
+La condizione `changed` sembrava un'ottimizzazione ovvia — evitare un push inutile. Ma stava
+confondendo **due domande diverse**: "chi è il leader?" e "il leader sa quel che deve sapere?".
+Un processo riavviato ha lo stesso nome e una memoria vuota, e il nome è ciò che stavamo
+guardando. Vale la pena raccontarlo all'orale insieme al rebuild: sono lo stesso problema —
+uno stato che il cluster non possiede — risolto una volta chiedendo e una volta ripetendo.
+
+---
+
+## 7z. M4-B: penalità, notifiche, profilo — 28 agosto
+
+Fatta e verificata end-to-end contro il cluster vero.
+
+| File | Ruolo |
+|---|---|
+| `service/PenaltyService.java` | N=2 no-show consecutivi → K=1 giorno di sospensione |
+| `dao/NotificationDao.java`, `model/Notification.java` | la tabella `notifications`, di sola B |
+| `UserDao` (+5 metodi) | contatore e sospensione, con la riga bloccata |
+| `web/NotificationsServlet`, `web/ProfileServlet` + le due JSP | le pagine, e la voce nel menu |
+| `vs_coord_srv`, `vs_coord_bo` | inoltro di `no_show` / `show_up` / `notify` verso Java |
+
+### La prova
+
+```
+1º no_show  → no_show_count = 1, notifica "reservation_expired"
+2º no_show  → suspended_until = domani, contatore azzerato,
+              notifica "suspended"
+
+prenotazione per l'utente sospeso  : {error, <<"r-susp">>, suspended}
+prenotazione per un utente normale : {ok, <<"r-ok">>, <<"c-5615...">>, ...}
+```
+
+La seconda riga è quella che conta: la sospensione è **mirata**, non un rifiuto generalizzato. E
+la pagina profilo dice al conducente fino a quando, e che **può comunque caricare a un connettore
+libero** — perché è la prenotazione a essergli tolta, non la ricarica.
+
+### L'interazione con M3, progettata apposta
+
+I claim sopravvivono a un failover perché il nuovo leader può **chiederli alle stazioni**, che li
+possiedono. Le sospensioni no: nessuno nel cluster le ha, vivono solo in MySQL. Un nuovo leader
+partirebbe quindi senza saperne nulla, e l'utente sospeso potrebbe riprenotare dopo ogni elezione.
+
+Risolto con un **push**, non con una domanda: il ponte, quando scopre un leader nuovo, gli rimanda
+tutte le sospensioni attive. Provato uccidendo il leader:
+
+```
+backoffice | Coordinator leader is now vs@coord2
+backoffice | Re-sent 1 suspension(s) to the new leader
+
+utente sospeso sul NUOVO leader: {error, <<"r-fo">>, suspended}
+```
+
+È lo stesso problema del rebuild ma con la sorgente **dall'altra parte del confine**, e per questo
+si risolve nella direzione opposta. Vale la pena raccontarlo così all'orale: la regola non è "il
+nuovo leader chiede", è "chi possiede lo stato lo ripropone", e le stazioni e il back office lo
+possiedono in due modi diversi.
+
+### Due scelte da difendere
+
+**Il contatore è scritto solo dal back office.** La stazione osserva e segnala; non conta e non
+sospende. "Due *consecutivi*" richiede storia, e la storia in una stazione si perde al riavvio —
+mentre il senso della regola è che si accumuli.
+
+**L'inoltro di `no_show` è gated su `serving`**, a differenza di `session_closed`. Due
+coordinatori che relayano lo stesso evento lo farebbero contare due volte, e il contatore non ha
+modo di distinguere i duplicati — mentre una sessione fatturata due volte è impossibile per via
+della UPDATE condizionata. Stessa forma, garanzie diverse, quindi trattamento diverso.
+
+E una concorrenza che **non** abbiamo introdotto: la sospensione è decisa in un posto solo e il
+coordinatore ne è la cache, così non diventa un secondo oggetto conteso accanto al connettore
+(`DESIGN-NOTES` §4b). L'unica corsa possibile è due `no_show` per lo stesso utente nello stesso
+istante, ed è gestita dove va gestita — `recordNoShow` incrementa e rilegge con la riga bloccata.
+
+---
+
+## 7y. La partizione si fa su un host solo — A aveva ragione, 27 agosto
+
+Provato il suggerimento di `nota-per-B-pendenze.md` §3, ed è **il risultato migliore della
+milestone M3**:
+
+```
+docker network disconnect voltshare_voltshare coord3     # non lo uccide: lo isola
+
+coord3 (vivo, isolato)     "QUORUM LOST (1 of 3) — this coordinator will refuse to serve"
+                           "election: out of quorum, abdicating"
+coord1 + coord2 (2 su 3)   coord2 eletto → rebuild: 2 stazioni interrogate → serving
+
+docker network connect voltshare_voltshare coord3
+coord3                     "quorum back, electing" → riprende la corona (rango più alto)
+                           → rebuild → serving
+```
+
+Interrogato dall'interno del container isolato:
+
+```
+coord3 è vivo         : true
+mode                  : suspended
+in_quorum             : false
+prenotazione tentata  : {not_serving, undefined}
+```
+
+**Il nodo è in esecuzione, si crede vivo, e si è tolto dal servizio da solo.** È esattamente lo
+scenario per cui esiste il quorum e che `docker kill` non può mostrare: quello è un *crash*, cioè
+un nodo che sparisce. Il caso difficile è un nodo che resta acceso e non vede più gli altri, e che
+deve avere il buon senso di smettere di concedere.
+
+Quindi cade anche l'ultimo motivo per il deploy multi-host (§7n): non serviva un'altra macchina per
+produrre una partizione vera, bastava staccare l'interfaccia. **Da mettere nella demo al posto di
+`docker kill`** — o meglio, accanto, perché sono due guasti diversi e il sistema li tratta in modo
+diverso.
+
+Un dettaglio onesto: alla riconnessione coord3 ha ricostruito con *"asked 0 station node(s)"*,
+perché le connessioni Erlang verso le stazioni non si erano ancora ristabilite. Ha atteso l'intera
+finestra — è il caso che avevamo corretto apposta il 25 (§7m) — e poi ha servito con tabella vuota;
+i claim sarebbero rientrati dai rinnovi entro dieci secondi. Non c'erano prenotazioni in corso, ma
+la finestra esiste e va detta.
+
+---
+
+## 7x. M1 di A è chiusa, e undici nostri test non venivano eseguiti — 27 agosto
+
+`nota-per-B-pendenze.md`. **Il client browser è arrivato**: `station.jsp`, `js/ws.js`,
+`js/station.js` su `main`, e con essi il JWT ha attraversato per la prima volta il confine fra le
+due metà — firmato da `JwtUtil`, letto dalla pagina renderizzata, verificato da `vs_jwt`.
+
+### ① Undici test di M3 saltati in silenzio
+
+Verificato, ed è esattamente come dice A:
+
+```
+rebar3 eunit --app=vs_coord   →  25 test
+rebar3 eunit                  → 133 test  (di cui 36 di vs_coord)
+```
+
+rebar3 accoppia un modulo di test a un sorgente con lo stesso stem. `vs_coord_failover.erl` **non
+esiste** — il modulo si chiama `vs_coord_election` — quindi `vs_coord_failover_tests` veniva
+**scartato senza un avviso**. Erano gli undici test di elezione, quorum e ricostruzione: la parte
+che vale l'esame.
+
+Il difetto era già visibile il 25: avevo notato *"solo 16, il nuovo modulo non è stato raccolto"*,
+avevo aggirato l'ostacolo con `--module=` e **non avevo cercato la causa**. Il numero in `PROGRESS`
+era giusto perché misurato con `rebar3 eunit` senza flag, quindi nulla segnalava il problema. È il
+motivo per cui vale la pena trattare una stranezza come un difetto invece che come un attrito.
+
+Correzione — rinominati i moduli perché si aggancino a un sorgente vero:
+
+- i 5 test di adozione → `vs_coord_rebuild_tests` (accoppiato a `vs_coord_rebuild.erl`);
+- i 6 test sui modi (standby, suspended, rebuilding) → dentro `vs_coord_srv_tests`, che è il server
+  a cui appartengono;
+- `vs_coord_failover_tests.erl` eliminato.
+
+Ora `--app=vs_coord` ne conta **36** invece di 25, e la suite intera resta 133.
+
+### ② A ritira la segnalazione sul `monitor_nodes`, e ha ragione a ritirarla
+
+Aveva scritto che `{nodedown, Node}` non arrivava mai perché nessuno si iscriveva. Falso: il suo
+grep cercava `monitor_nodes` al plurale, mentre `vs_coord_srv` usa `erlang:monitor_node/2`, che è
+l'API per **un nodo specifico** — la scelta giusta, perché sorveglia le stazioni annunciate invece
+di farsi svegliare da ogni nodo del cluster. `claim.md` riga 154 lo diceva già a parole.
+
+Ha rifatto la prova sui container: `docker compose stop station1` → due secondi dopo, claim a zero
+e stazioni a uno. Nessuna correzione da fare da parte nostra.
+
+Vale la pena notare la simmetria: in due giorni A ha trovato due difetti veri nel nostro codice e
+una volta si è corretto da solo. Il valore delle PR incrociate sta anche in questo — non solo nel
+trovare, ma nel poter smentire un sospetto guardando il codice invece di ricordarselo.
+
+### ③ La partizione si può fare su un host solo
+
+Nell'annotare il ridimensionamento del multi-host avevamo scritto che l'unico motivo residuo per
+volerlo era la **partizione vera**, impossibile su una macchina. A fa notare che l'argomento non
+regge:
+
+```bash
+docker network disconnect voltshare coord3   # resta vivo, ma isolato
+docker network connect    voltshare coord3
+```
+
+`docker kill` è un **crash**; il quorum esiste per l'altro scenario, un nodo che *resta vivo* e non
+vede più gli altri. Disconnettere l'interfaccia lo riproduce esattamente, su un host solo. Se
+funziona, al multi-host non resta nemmeno quel motivo — **e la demo guadagna lo scenario più
+difficile da mostrare.** Da provare al prossimo avvio di Docker.
+
+### ④ e ⑤
+
+C'è un utente `cc-probe` nel MySQL condiviso, creato da A per firmare un token vero: comparirà
+nella lobby e nello storico, si cancella se dà fastidio in demo. E A aspetta la PR su `claim.md`.
 
 ---
 

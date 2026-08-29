@@ -17,7 +17,8 @@
 -module(vs_coord_bo).
 -behaviour(gen_server).
 
--export([start_link/0, publish/1, announce_leader/0, standing_by/0, session_closed/1]).
+-export([start_link/0, publish/1, announce_leader/0, standing_by/0,
+         session_closed/1, penalty_event/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(SERVER, ?MODULE).
@@ -78,6 +79,19 @@ standing_by() ->
 session_closed(Event) ->
     gen_server:cast(?SERVER, {session_closed, Event}).
 
+%% @doc Relay a `no_show' or `show_up' observed by a station (M4).
+%%
+%% Unlike the station list, this is **not** a snapshot: a lost `no_show' is a
+%% strike that never gets counted, and no later message repairs it. That is
+%% accepted rather than fixed, and it is the right trade here — the penalty
+%% exists to stop a habit, so missing one strike delays a suspension instead of
+%% corrupting anything. The alternative, making the cluster responsible for
+%% delivering it, would put durable state back into a process that any election
+%% can replace.
+-spec penalty_event(tuple()) -> ok.
+penalty_event(Event) ->
+    gen_server:cast(?SERVER, {penalty_event, Event}).
+
 %%%===================================================================
 %%% gen_server
 %%%===================================================================
@@ -127,6 +141,18 @@ handle_cast({session_closed, Event}, State) ->
     send(State, Event),
     {noreply, State};
 
+%% Gated on `serving', unlike session_closed: a station talks to the leader, so
+%% a penalty event reaching a follower means the routing is already confused,
+%% and relaying it from two coordinators at once would count one no-show twice.
+%% Java's counter has no way to tell the duplicates apart.
+handle_cast({penalty_event, Event}, State = #state{serving = true}) ->
+    send(State, Event),
+    {noreply, State};
+
+handle_cast({penalty_event, Event}, State) ->
+    logger:info("not serving: dropping penalty event ~p", [Event]),
+    {noreply, State};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -135,6 +161,16 @@ handle_cast(_Msg, State) ->
 %% table is empty and republishing it would blank the lobby.
 handle_info(republish, State = #state{serving = true}) ->
     erlang:send_after(?REPUBLISH_INTERVAL_MS, self(), republish),
+    %% The leader announcement rides along with the station list.
+    %%
+    %% Without it, `{leader, _}' is sent exactly once, on winning an election. A back office
+    %% that starts later never hears one and keeps addressing whichever node happens to be
+    %% first in COORD_NODES — which is also the moment it would have pushed the suspensions.
+    %% Both would then wait for the next election, which on a healthy cluster never comes.
+    %%
+    %% Repeating it every 30 s makes a restarted back office converge on its own, and costs
+    %% one extra message per interval.
+    send(State, {leader, node()}),
     {noreply, send_stations(State#state.last, State)};
 
 handle_info(republish, State) ->
