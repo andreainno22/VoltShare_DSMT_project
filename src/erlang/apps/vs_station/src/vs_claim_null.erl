@@ -14,14 +14,21 @@
 
 -export([acquire/4, renew/2, release/2]).
 
+%% Four elements since P14: `GrantedAt' is the second one, and here it is
+%% the local clock because there is no other — the whole point of this
+%% module is that no coordinator was asked. In `vs_claim_client' the same
+%% position carries the coordinator's own timestamp, which is what makes
+%% oldest-wins (claim.md §5.5) a comparison between one clock and itself.
 -spec acquire(pos_integer(), pos_integer(), pos_integer(), pos_integer()) ->
-          {ok, binary(), vs_time:epoch_ms()} | {error, vs_connector:refusal()}.
+          {ok, binary(), vs_time:epoch_ms(), vs_time:epoch_ms()} |
+          {error, vs_connector:refusal()}.
 acquire(VehicleId, UserId, StationId, ConnId) ->
     logger:warning("vs_claim_null: granting an UNCOORDINATED claim "
                    "(vehicle ~p, user ~p, station ~p, connector ~p)",
                    [VehicleId, UserId, StationId, ConnId]),
     ClaimId = list_to_binary("null-" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, ClaimId, vs_time:in_seconds(vs_env:get_int("LEASE_SECONDS", 900) + 60)}.
+    {ok, ClaimId, vs_time:now_ms(),
+     vs_time:in_seconds(vs_env:get_int("LEASE_SECONDS", 900) + 60)}.
 
 -spec renew(pos_integer(), [binary()]) -> {renewed, [binary()], [binary()]}.
 renew(_StationId, ClaimIds) ->

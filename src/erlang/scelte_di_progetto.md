@@ -1980,3 +1980,147 @@ Quel solo test tiene quindi un override esplicito a 500 ms. La regola completa �
 di una chiamata di test non deve poter scattare per scheduling; dove la chiamata è fatta apposta
 per non raggiungere nessuno, il timeout diventa un tetto deterministico su una latenza che non
 controlliamo, e va tenuto ben sotto i 5 s di eunit.*
+
+---
+
+## 20. Il claim non è un ricordo del client, è il riflesso di ciò che i connettori possiedono (P14 + P15)
+
+### 20.1 Le due metà non si vedevano morire
+
+Il claim vive in `vs_claim_client`, ma il **fatto** vive nel connettore: `#hold.claim_id` prima
+che il cavo entri, `#session.claim_id` dopo. Fino al 29 agosto nessuna delle due metà si
+accorgeva della morte dell'altra, e ognuna delle due direzioni era un difetto suo, misurato
+(`REPORT_M3A_VERIFICA` §6.1 e §6.2):
+
+- **muore il client** → riparte con `claims = #{}`, risponde a `who_do_you_hold` con niente, e
+  alla prima elezione il coordinatore nuovo ricostruisce da un client che non sa più nulla:
+  lo stesso veicolo si ritrova con due prenotazioni su due stazioni. È l'invariante di uso
+  esclusivo di `SCOPE` §4 — la ragione per cui il coordinatore esiste — rotta in 53 secondi
+  da un `exit/2`;
+- **muore un connettore** → il client conserva un claim che non ha più proprietario e lo
+  rinnova ogni 10 s. Siccome il coordinatore ricalcola `NewExpiry` a ogni giro, quel claim
+  **non scade mai**: un veicolo chiuso fuori da tutta la rete, per sempre.
+
+La radice è una sola, e la correzione è la stessa frase detta nelle due direzioni: **il claim
+non è un ricordo del client, è il riflesso di ciò che i connettori possiedono.** È la lezione
+del rebuild del coordinatore («il coordinatore è un indice, non il registro») applicata un
+livello più in basso.
+
+### 20.2 Il `monitor` invece del soft state, e perché
+
+La direzione pensata inizialmente era la ripresentazione periodica: ogni connettore ricasta il
+proprio claim ogni N secondi, il client tiene ciò che ha sentito di recente. È il modello con
+cui B ha chiuso le sospensioni, e funziona.
+
+Il `monitor` fa la stessa cosa meglio, e il confronto vale la pena di essere scritto perché la
+differenza non è di efficienza:
+
+| | monitor + domanda all'avvio | ripresentazione periodica |
+|---|---|---|
+| connettore morto | chiuso **nell'istante** del `DOWN` | chiuso dopo N periodi di silenzio |
+| client riavviato | chiuso al primo `handle_continue` | chiuso al primo periodo |
+| traffico a regime | **zero** | un giro di cast per periodo, per sempre |
+| rischio nuovo | nessuno: il `DOWN` è un fatto | un connettore vivo ma **lento** viene letto come morto, e il suo claim rilasciato per errore |
+
+L'ultima riga decide. Il soft state ha bisogno di un timeout, e un timeout su un processo
+locale è **una misura della macchina, non del fatto** — la stessa lezione di P11 (§19). Il
+`monitor` è la primitiva che Erlang offre proprio per non doverlo indovinare, e arriva anche
+su `exit(Pid, kill)`, che è precisamente il caso in cui `terminate/3` non viene eseguito, cioè
+il buco misurato in §6.2.
+
+La domanda all'avvio è l'altra metà, e ha un verso preciso: **la fa chi ha perso lo stato**,
+una volta sola, in `handle_continue`. Un cast `{claims_rebuild, self()}` a ogni connettore
+vivo; chi tiene un claim risponde con un cast che porta i sei campi. Nessuna chiamata sincrona
+in nessuna delle due direzioni, quindi la regola strutturale di §4.4 regge intatta: i pid dei
+connettori si leggono dall'ETS del manager con la stessa lettura sporca che il modulo già
+dichiara consentita.
+
+### 20.3 La conseguenza dichiarata: il claim è legato alla vita del processo connettore
+
+Questo è un cambio di semantica, non un dettaglio implementativo, e va scritto come tale.
+
+**Da oggi un claim muore quando muore il processo che lo ha chiesto.** Se un connettore crasha
+e riparte *durante una sessione di ricarica con prenotazione*, il claim viene rilasciato.
+
+È coerente con quello che il sistema già faceva: §17.5 dice che una sessione che torna dopo la
+morte del connettore **è un walk-in**, e che ricostruire la prenotazione è deliberatamente non
+tentato (§6 del contratto colonnina: «l'auto continua a caricare, la sessione è fatturata, la
+prenotazione è persa»). Il claim seguiva quella prenotazione: rilasciarlo mette il coordinatore
+d'accordo con la stazione invece di lasciarli divergere.
+
+Ed è corretto perché **non esiste un percorso che riadotti un `hold`**. Verificato per
+struttura, non per lettura: `#hold{}` viene costruito in **un solo punto**
+(`vs_connector.erl`, dentro `free({call, From}, {reserve, …})`, dopo un `acquire` riuscito),
+`held` si raggiunge da lì e da nessun altro posto, `init/1` parte `free` col campo a
+`undefined`, e le due adozioni da hardware riagganciato passano `undefined` come claim
+esplicitamente. Se un giorno qualcuno scrive una riadozione, **questa scelta va ripensata**, e
+la riga sopra è il posto in cui accorgersene.
+
+### 20.4 I sei campi non c'erano: `claim_mod:acquire/4` ne restituisce quattro
+
+Il piano dava per scontato che il connettore avesse già i sei campi del contratto da
+ripresentare. Non era vero, e la differenza non era di forma:
+
+- `#hold.granted_at` è `vs_time:now_ms()` **della stazione**, preso dopo l'`acquire`; il
+  `GrantedAt` del coordinatore non arrivava mai al connettore;
+- `#hold.expires_at` è la scadenza del **lease** (900 s), non quella del claim (960 s);
+- `#session` non aveva né l'uno né l'altro: due dei sei campi mancavano del tutto.
+
+Il `ClaimExpiresAt` tornava da `acquire/4` e veniva **solo loggato**. Il `GrantedAt` viveva
+solo dentro il client — e con il client moriva.
+
+Ripresentare i valori locali sarebbe stato inventarli, ed è esattamente ciò che il PR di
+contratto del 24 agosto aveva eliminato: `claim.md` §5.5 decide *oldest wins* su `GrantedAt`, e
+`vs_coord_srv:renew_one/4` usa il valore riportato dalla stazione **nei due rami di adozione**,
+cioè proprio nella finestra di failover. Un orologio di stazione al posto di quello del
+coordinatore avrebbe rimesso lo skew fra macchine dentro il confronto.
+
+Quindi `claim_mod:acquire/4` restituisce `{ok, ClaimId, GrantedAt, ExpiresAt}` e il connettore
+tiene i due valori **del coordinatore** accanto ai propri (`claim_granted_at`,
+`claim_expires_at`), copiandoli in `#session` al passaggio `held → charging`. **Il contratto
+sul filo non cambia**: `GrantedAt` era già sul filo, cambia solo la giuntura interna fra
+connettore e claim_mod — la stessa che rende `vs_claim_null` sostituibile.
+
+Quattro campi tempo in due coppie, ed è bene che i nomi lo dicano: `granted_at`/`expires_at`
+sono la **prenotazione della stazione** (questo orologio, il lease che il driver vede, il timer
+di `held`), `claim_granted_at`/`claim_expires_at` sono il **claim del coordinatore**, copiati e
+mai toccati.
+
+### 20.5 La rete di sicurezza, e il qualificatore che la rende vera
+
+Nel `renew_tick` i claim già scaduti non vengono rinnovati: escono dalla mappa e la loro uscita
+è un **`warning`**, perché in una stazione sana non deve succedere mai e una difesa che
+silenzia è peggio del difetto rumoroso.
+
+Ma «mai» è una parola che va guadagnata. Il connettore ripresenta la scadenza che aveva
+copiato **quando il claim è stato concesso**, e nel frattempo il coordinatore l'ha spostata in
+avanti ogni dieci secondi: le due divergono per costruzione. Una sessione di ricarica supera
+lease+grace (960 s) di routine, quindi senza qualificatore un client che riparte durante una
+qualsiasi sessione più vecchia di sedici minuti avrebbe ricostruito il claim e l'avrebbe
+buttato un tick dopo, gridando contro una stazione perfettamente sana — cioè rimettendo in
+piedi il difetto di §6.1 per lo stato `charging`, che è esattamente quello che questo lavoro
+doveva chiudere.
+
+Perciò il `#claim` porta un `confirmed`: vero per una concessione e per ogni claim che un giro
+di renew ha confermato, falso per uno che un connettore ha ripresentato. **Lo sweep guarda solo
+i confermati**, e con quel qualificatore diventa quello che `claim.md` §5.6 descrive: scatta
+quando una scadenza *che il coordinatore stesso ha dichiarato* è passata senza rinnovo, cioè
+quando il claim è morto anche per lui.
+
+Un claim non confermato **entra** quindi in un giro di batch anche se la sua copia locale è
+scaduta. Non è «rinnovare qualcosa di morto»: è chiedere all'unico che sa. Il coordinatore
+risponde adottandolo — e la scadenza vera torna in `Ok`, che lo marca confermato — oppure
+revocandolo. Un giro basta: misurato sul cluster vivo, un claim ricostruito con
+`expires_at = 1788024516065` è tornato `1788024774224` al primo renew.
+
+### 20.6 Il claim id non si avvicina al browser
+
+La strada più economica per P14 sarebbe stata lo snapshot del manager: il client è già
+sottoscritto a `{station_state, …}`. È stata scartata, e non per gusto: lo snapshot non
+contiene `claim_id`, e aggiungercelo lo esporrebbe a `vs_driver_proto`, cioè **a un passo dalla
+pagina**, protetto solo da un filtro che qualcuno deve ricordarsi di mantenere. Un canale
+dedicato costa due cast e non ha quel rischio.
+
+`build_snapshot/2` resta quindi senza i campi nuovi, ed è asserito sul sistema vivo, non
+promesso: durante la sessione di controprova la snapshot del connettore in `charging` non
+conteneva alcun `claim_id`, né al primo livello né dentro `session`.

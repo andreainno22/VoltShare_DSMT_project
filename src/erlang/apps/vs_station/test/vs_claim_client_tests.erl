@@ -95,6 +95,28 @@ history_has(Pred) ->
 acquire() ->
     vs_claim_client:acquire(?VEHICLE, ?USER, 1, ?CONN).
 
+%% P15 — who is monitoring this process. The manager monitors every
+%% connector too (its registry heals on the DOWN), so the assertions
+%% below are about membership, never about the whole list.
+monitored_by(Pid) ->
+    {monitored_by, Pids} = process_info(Pid, monitored_by),
+    Pids.
+
+monitors(Watcher, Pid) -> lists:member(Watcher, monitored_by(Pid)).
+
+%% P14 — the restart REPORT_M3A_VERIFICA §6.1 measured: `exit(kill)', so
+%% nothing gets to run a cleanup, and a brand new process that comes up
+%% with `claims = #{}'. The caller stops the replacement itself: the
+%% fixture's teardown holds the pid of the client it started, not of this
+%% one.
+restart_client() ->
+    Old = whereis(vs_claim_client),
+    unlink(Old),
+    exit(Old, kill),
+    wait_gone([vs_claim_client]),
+    {ok, New} = vs_claim_client:start_link(client_opts()),
+    New.
+
 %% Ask the client what it holds, with the contract's own message (§3.4).
 holds() ->
     vs_claim_client ! {who_do_you_hold, self(), node()},
@@ -122,9 +144,15 @@ announces_itself_on_boot_test() ->
 
 acquire_happy_path_test() ->
     with_client(fun() ->
-        {ok, ClaimId, ExpiresAt} = acquire(),
+        {ok, ClaimId, GrantedAt, ExpiresAt} = acquire(),
         ?assert(is_binary(ClaimId)),
         ?assert(ExpiresAt > vs_time:now_ms()),
+        %% P14 — four elements, and the second is the coordinator's own
+        %% `GrantedAt'. It used to stop inside do_acquire/4; the connector
+        %% needs it because the connector is the half that survives a
+        %% restart of the client.
+        ?assert(GrantedAt =< vs_time:now_ms()),
+        ?assert(GrantedAt < ExpiresAt),
         %% the wire request carried exactly what the contract says
         ?assert(history_has(fun({claim, _ReqId, ?VEHICLE, ?USER, 1, ?CONN}) -> true;
                                (_) -> false end))
@@ -187,7 +215,7 @@ no_coordinator_at_all_refuses_with_no_claim_test() ->
 
 release_reaches_the_coordinator_and_empties_the_table_test() ->
     with_client(fun() ->
-        {ok, ClaimId, _} = acquire(),
+        {ok, ClaimId, _GrantedAt, _ExpiresAt} = acquire(),
         ok = vs_claim_client:release(ClaimId, cancelled),
         ok = wait_until(fun() ->
             history_has(fun(M) -> M =:= {release, ClaimId, cancelled} end)
@@ -197,7 +225,10 @@ release_reaches_the_coordinator_and_empties_the_table_test() ->
 
 who_do_you_hold_answers_from_memory_test() ->
     with_client(fun() ->
-        {ok, ClaimId, ExpiresAt} = acquire(),
+        %% Binding GrantedAt here and matching it again below is the
+        %% assertion, not decoration: what `acquire' hands back to the
+        %% connector must be the very number this table stores and echoes.
+        {ok, ClaimId, GrantedAt, ExpiresAt} = acquire(),
         {1, [{?VEHICLE, ?USER, ?CONN, ClaimId, GrantedAt, ExpiresAt}]} = holds(),
         ?assert(GrantedAt =< vs_time:now_ms()),
         ?assert(GrantedAt < ExpiresAt),
@@ -212,7 +243,7 @@ who_do_you_hold_answers_from_memory_test() ->
 
 renew_batches_the_claims_every_tick_test() ->
     with_client(fun() ->
-        {ok, ClaimId, _} = acquire(),
+        {ok, ClaimId, _GrantedAt, _ExpiresAt} = acquire(),
         %% within a couple of (shortened) ticks the batch shows up, in
         %% the five-field form of the 24/08 contract PR — echoing the
         %% coordinator-issued GrantedAt, never a local timestamp
@@ -295,11 +326,24 @@ revocation_travels_from_coordinator_to_connector_test() ->
 %% Deterministic by construction: the connector supervisor is held with
 %% `sys:suspend' so that it cannot restart the child, which is exactly how
 %% the E2E of REPORT_CP_TOUCHUPS §6 forces the same window on a real socket.
+%%
+%% P15 moved this window, and the test has to move with it. A claim asked
+%% for BY the connector now dies with the connector, so a revocation that
+%% lands after the kill would find nothing to revoke: the test would stay
+%% green while exercising none of the branch it was written for.
+%%
+%% The window is still real in production — the client's mailbox can hold
+%% a `renew_result' ahead of the `DOWN', and then `revoke/2' runs with the
+%% claim present and the connector already gone — and this is the
+%% deterministic way to produce it: the claim's owner is the test process,
+%% which outlives the connector on purpose. What is under test is
+%% `revoke/2' reading the registry, which is where the P10 crash was, and
+%% not who happens to own the claim.
 a_revocation_while_the_connector_restarts_does_not_kill_the_client_test() ->
     with_station(fun() ->
         Client = whereis(vs_claim_client),
         {ok, Pid} = vs_station_mgr:connector_pid(?CONN),
-        {ok, _ExpiresAt} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        {ok, _ClaimId, _GrantedAt, _ExpiresAt} = acquire(),
         ok = sys:suspend(vs_connector_sup),
         try
             exit(Pid, kill),
@@ -347,7 +391,7 @@ coordinator_reachable_follows_the_renew_outcome_test() ->
     try
         ?assert(vs_claim_client:coordinator_reachable()),
         %% a claim, so that the renew tick has something to renew
-        {ok, _ClaimId, _} = acquire(),
+        {ok, _ClaimId, _GrantedAt, _ExpiresAt} = acquire(),
         stop([Mock]),
         wait_gone([vs_coord_srv]),
         ok = wait_until(fun() -> not vs_claim_client:coordinator_reachable() end),
@@ -385,4 +429,253 @@ the_reachability_table_survives_a_client_restart_test() ->
         wait_gone([vs_claim_client]),
         flush()
     end.
+
+%%%===================================================================
+%%% P15 — the claim dies with the connector that held it
+%%%===================================================================
+
+%% The premise the whole design rests on, asserted instead of read.
+%% `handle_call({granted, …})' monitors its caller, and the caller must be
+%% the connector's own gen_statem process: if either of the two call
+%% sites in `do_acquire/4' ran in a throwaway process, the monitor would
+%% land on that process and the claim would die a microsecond after it
+%% was granted.
+%%
+%% It has to go through `with_station'. The `acquire/0' helper above
+%% calls the client from the TEST process — a legitimate owner, and
+%% exactly the wrong one to assert on.
+the_claim_is_monitored_on_the_connector_that_asked_for_it_test() ->
+    with_station(fun() ->
+        Client = whereis(vs_claim_client),
+        {ok, ConnPid} = vs_station_mgr:connector_pid(?CONN),
+        %% synchronous all the way down: `reserve' returns only after the
+        %% client has answered `{granted, …}', so there is nothing to wait
+        %% for here
+        {ok, _ExpiresAt} = vs_connector:reserve(ConnPid, ?USER, ?VEHICLE),
+        ?assert(monitors(Client, ConnPid))
+    end).
+
+%% §6.2, closed. A connector killed while `held' never runs `terminate/3',
+%% so no release went out and the client kept renewing a claim nobody
+%% owned — for ever, because the coordinator recomputes the expiry on
+%% every round. The `DOWN' is the one notification `kill' cannot suppress.
+a_killed_connector_releases_its_claim_test() ->
+    with_station(fun() ->
+        {ok, ConnPid} = vs_station_mgr:connector_pid(?CONN),
+        {ok, _ExpiresAt} = vs_connector:reserve(ConnPid, ?USER, ?VEHICLE),
+        {1, [{?VEHICLE, ?USER, ?CONN, ClaimId, _, _}]} = holds(),
+        exit(ConnPid, kill),
+        %% the table empties itself ...
+        ok = wait_until(fun() -> {1, []} =:= holds() end),
+        %% ... and the coordinator is told, with one of the four words
+        %% claim.md §3.3 allows — no new atom on the wire
+        ok = wait_until(fun() ->
+            history_has(fun(M) -> M =:= {release, ClaimId, cancelled} end)
+        end)
+    end).
+
+%% Every exit from the table drops the monitor with it. A monitor left on
+%% a claim that is gone would deliver a `DOWN' matching nothing —
+%% harmless today, and precisely the kind of leak that becomes a puzzle
+%% six months later.
+a_released_claim_leaves_no_monitor_behind_test() ->
+    with_station(fun() ->
+        Client = whereis(vs_claim_client),
+        {ok, ConnPid} = vs_station_mgr:connector_pid(?CONN),
+        {ok, _ExpiresAt} = vs_connector:reserve(ConnPid, ?USER, ?VEHICLE),
+        ?assert(monitors(Client, ConnPid)),
+        %% the driver cancels: connector → release → the claim goes. The
+        %% release is a call made from inside `cancel', so by the time
+        %% `cancel' has returned the client has already done the removal.
+        ok = vs_connector:cancel(ConnPid, ?USER),
+        ?assertEqual({1, []}, holds()),
+        ?assertNot(monitors(Client, ConnPid))
+    end).
+
+a_revoked_claim_leaves_no_monitor_behind_test() ->
+    with_station(fun() ->
+        Client = whereis(vs_claim_client),
+        {ok, ConnPid} = vs_station_mgr:connector_pid(?CONN),
+        {ok, _ExpiresAt} = vs_connector:reserve(ConnPid, ?USER, ?VEHICLE),
+        ?assert(monitors(Client, ConnPid)),
+        %% the coordinator revokes on the next renew (claim.md §5.4)
+        ok = vs_mock_coord:set_renew(revoke_all),
+        ok = wait_until(fun() -> {1, []} =:= holds() end),
+        %% the connector obeyed and is still alive — so a monitor left on
+        %% it would still be there to find
+        ok = wait_until(fun() ->
+            free =:= maps:get(state, vs_connector:snapshot(ConnPid))
+        end),
+        ?assertNot(monitors(Client, ConnPid))
+    end).
+
+%%%===================================================================
+%%% P14 — the client asks the connectors for what it forgot
+%%%===================================================================
+
+%% §6.1, closed, with the sequence that was measured: a live reservation,
+%% `exit(whereis(vs_claim_client), kill)', and the replacement answering
+%% `who_do_you_hold' with nothing — which is what let the first election
+%% hand the same vehicle a second reservation on another station.
+%%
+%% `GrantedAt' is matched, not ignored: it is the coordinator's own
+%% timestamp, it is what claim.md §5.5 settles conflicts on, and the only
+%% reason the connector carries it is so that it can come back here.
+%% `ExpiresAt' is not matched — the renew loop moves it every tick, by
+%% design.
+a_restarted_client_rebuilds_its_claims_from_the_connectors_test() ->
+    with_station(fun() ->
+        {ok, ConnPid} = vs_station_mgr:connector_pid(?CONN),
+        {ok, _ExpiresAt} = vs_connector:reserve(ConnPid, ?USER, ?VEHICLE),
+        {1, [{?VEHICLE, ?USER, ?CONN, ClaimId, GrantedAt, _}]} = holds(),
+        New = restart_client(),
+        try
+            ok = wait_until(fun() ->
+                case holds() of
+                    {1, [{?VEHICLE, ?USER, ?CONN, ClaimId, GrantedAt, E}]} ->
+                        is_integer(E);
+                    _Empty ->
+                        false
+                end
+            end),
+            %% and it is a claim like any other: monitored on its owner,
+            %% so the rebuilt table is not a second-class copy
+            ?assert(monitors(New, ConnPid))
+        after
+            stop([New]),
+            wait_gone([vs_claim_client])
+        end
+    end).
+
+%% The half that `held' alone would leave open. `held → charging' hands
+%% the reservation in and discards the `#hold' (D-8), so after the cable
+%% goes in the claim lives in `#session' — and a client that restarts
+%% mid-session has to get it back from there, with the coordinator's two
+%% timestamps intact. That is the whole reason `#session' carries them.
+a_charging_connector_presents_its_claim_too_test() ->
+    with_station(fun() ->
+        {ok, ConnPid} = vs_station_mgr:connector_pid(?CONN),
+        {ok, _ExpiresAt} = vs_connector:reserve(ConnPid, ?USER, ?VEHICLE),
+        ok = vs_connector:plugged(ConnPid, #{user_id => ?USER, vehicle_id => ?VEHICLE,
+                                             soc_pct => 22, battery_kwh => 58.0,
+                                             max_kw => 150}),
+        ?assertEqual(charging, maps:get(state, vs_connector:snapshot(ConnPid))),
+        {1, [{?VEHICLE, ?USER, ?CONN, ClaimId, GrantedAt, _}]} = holds(),
+        New = restart_client(),
+        try
+            ok = wait_until(fun() ->
+                case holds() of
+                    {1, [{?VEHICLE, ?USER, ?CONN, ClaimId, GrantedAt, E}]} ->
+                        is_integer(E);
+                    _Empty ->
+                        false
+                end
+            end)
+        after
+            stop([New]),
+            wait_gone([vs_claim_client])
+        end
+    end).
+
+%% Race (b) of the plan, which its own table listed as NOT VERIFIED: a
+%% connector that is already dead when its answer is handled.
+%% `erlang:monitor/2' on a dead pid delivers a `DOWN' with `noproc' at
+%% once, so the claim is inserted and taken straight back out — no
+%% special case anywhere in the code, and this is the proof.
+%%
+%% Deterministic without a clock: the cast and the `who_do_you_hold' both
+%% travel from this process, so the claim IS in the table when the first
+%% answer comes back, and the `DOWN' queued behind it takes it out.
+a_claim_presented_by_a_dead_connector_is_dropped_at_once_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        Dead = spawn(fun() -> ok end),
+        ok = wait_until(fun() -> not is_process_alive(Dead) end),
+        ClaimId = <<"c-orphan">>,
+        gen_server:cast(vs_claim_client,
+                        {claim_present, Dead, ClaimId, ?VEHICLE, ?USER, ?CONN,
+                         vs_time:now_ms(), vs_time:in_seconds(960)}),
+        ?assertMatch({1, [{?VEHICLE, ?USER, ?CONN, ClaimId, _, _}]}, holds()),
+        ok = wait_until(fun() -> {1, []} =:= holds() end),
+        %% and the coordinator hears that the vehicle is free again
+        ok = wait_until(fun() ->
+            history_has(fun(M) -> M =:= {release, ClaimId, cancelled} end)
+        end)
+    end).
+
+%%%===================================================================
+%%% the safety net (piano §1.4)
+%%%===================================================================
+
+%% It closes neither defect on its own — the claim of §6.2 was never
+%% expired, it was being rejuvenated ten seconds at a time — and it is
+%% here for the failure nobody has thought of yet. What it must not be is
+%% silent, so the drop is logged at `warning'.
+%%
+%% The claim goes in through the rebuild cast — the only door that lets a
+%% test choose the expiry, and it costs the mock coordinator no new knob —
+%% and is then CONFIRMED by hand-delivering the renew reply the client
+%% already handles, with an expiry that has passed. That is the real
+%% shape of "a coordinator told us this claim dies at T, and T is behind
+%% us". The tick is driven by hand too, so nothing here waits on a timer.
+an_expired_claim_is_dropped_instead_of_renewed_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        ClaimId = <<"c-already-dead">>,
+        Now = vs_time:now_ms(),
+        gen_server:cast(vs_claim_client,
+                        {claim_present, self(), ClaimId, ?VEHICLE, ?USER, ?CONN,
+                         Now - 2000, vs_time:in_seconds(960)}),
+        %% same sender, same mailbox: the cast is processed before this
+        ?assertMatch({1, [{?VEHICLE, ?USER, ?CONN, ClaimId, _, _}]}, holds()),
+        %% the coordinator's own word, and it says the claim is already over
+        vs_claim_client ! {renew_result, {ok, node(), {renewed, [ClaimId], [], Now - 1000}}},
+        vs_claim_client ! renew_tick,
+        ?assertEqual({1, []}, holds()),
+        %% and it was never offered to the coordinator afterwards
+        ?assertNot(history_has(fun({renew, 1, Batch}) ->
+                                      lists:keymember(ClaimId, 1, Batch);
+                                 (_) ->
+                                      false
+                              end))
+    end).
+
+%% The other side of the same qualifier, and the reason it exists.
+%%
+%% A connector presents the expiry it copied when the claim was granted;
+%% the coordinator has been pushing the real one forward ever since. The
+%% two diverge by design, and a charging session outlives lease+grace
+%% routinely — so a client restarting during one rebuilds a claim whose
+%% local expiry is already behind. Sweeping it would undo the rebuild one
+%% tick later and shout about a station that is perfectly healthy.
+%%
+%% What must happen instead: the claim stays, and it goes into the batch,
+%% because the coordinator is the only party that knows. It answers by
+%% adopting it or by revoking it (claim.md §5.4), and one round settles
+%% it — measured on the live cluster, where a rebuilt claim's expiry was
+%% corrected at the very first renew.
+a_rebuilt_claim_with_a_stale_expiry_is_asked_about_not_dropped_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        ClaimId = <<"c-stale-copy">>,
+        Now = vs_time:now_ms(),
+        gen_server:cast(vs_claim_client,
+                        {claim_present, self(), ClaimId, ?VEHICLE, ?USER, ?CONN,
+                         Now - 990000, Now - 1000}),
+        ?assertMatch({1, [{?VEHICLE, ?USER, ?CONN, ClaimId, _, _}]}, holds()),
+        vs_claim_client ! renew_tick,
+        %% not dropped ...
+        ?assertMatch({1, [{?VEHICLE, ?USER, ?CONN, ClaimId, _, _}]}, holds()),
+        %% ... and put to the only party that can settle it
+        ok = wait_until(fun() ->
+            history_has(fun({renew, 1, Batch}) -> lists:keymember(ClaimId, 1, Batch);
+                           (_) -> false
+                        end)
+        end),
+        %% the mock renews it, so the expiry it comes back with is a real
+        %% one and the claim is now confirmed
+        ok = wait_until(fun() ->
+            case holds() of
+                {1, [{?VEHICLE, ?USER, ?CONN, ClaimId, _, E}]} -> E > vs_time:now_ms();
+                _Gone -> false
+            end
+        end)
+    end).
 

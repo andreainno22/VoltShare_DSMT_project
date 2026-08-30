@@ -190,7 +190,7 @@ flush() -> receive _ -> flush() after 0 -> ok end.
 redirect_is_followed_once({{_, NodeA}, {_, NodeB}}) ->
     with_client([NodeA, NodeB], #{}, fun() ->
         set_reply(NodeA, {not_serving, NodeB}),
-        {ok, ClaimId, ExpiresAt} = acquire(),
+        {ok, ClaimId, _GrantedAt, ExpiresAt} = acquire(),
         ?assert(is_binary(ClaimId)),
         ?assert(ExpiresAt > vs_time:now_ms()),
         ?assertMatch([{claim, _, ?VEHICLE, ?USER, ?STATION, ?CONN}],
@@ -236,7 +236,7 @@ circular_redirect_does_not_loop({{_, NodeA}, {_, NodeB}}) ->
 %% fresh one back before the next test runs.
 renew_against_a_new_leader_keeps_granted_at({{_, NodeA}, {_, NodeB}}) ->
     with_client([NodeA, NodeB], #{renew_interval_ms => 100}, fun() ->
-        {ok, ClaimId, _ExpiresAt} = acquire(),
+        {ok, ClaimId, GrantedAt, _ExpiresAt} = acquire(),
         ?assertEqual(NodeA, leader()),
         {?STATION, [{?VEHICLE, ?USER, ?CONN, ClaimId, GrantedAt, _}]} =
             holds_from(NodeA),
@@ -274,7 +274,7 @@ renew_against_a_new_leader_keeps_granted_at({{_, NodeA}, {_, NodeB}}) ->
 %% than a label the test made up.
 who_do_you_hold_from_a_non_leader({{_, NodeA}, {_, NodeB}}) ->
     with_client([NodeA, NodeB], #{}, fun() ->
-        {ok, ClaimId, ExpiresAt} = acquire(),
+        {ok, ClaimId, _GrantedAt, ExpiresAt} = acquire(),
         ?assertEqual(NodeA, leader()),
         Self = self(),
         _ = erpc:call(NodeB, erlang, send,

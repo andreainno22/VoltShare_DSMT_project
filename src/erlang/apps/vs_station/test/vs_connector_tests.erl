@@ -1087,3 +1087,107 @@ a_reserved_replug_after_a_fault_bills_each_kwh_once_test() ->
         ?assertEqual([6.0, 4.0], [maps:get(energy_kwh, R) || R <- vs_db_stub:rows()]),
         ?assertEqual(10.0, billed())
     end).
+
+%%%===================================================================
+%%% P14 — presenting the claim to a client that has forgotten it
+%%%===================================================================
+
+%% The claim client is a gen_server, so the connector answers with a
+%% cast; arriving at a bare test process that is the raw `{'$gen_cast',
+%% Msg}' wrapper, and unwrapping it here is cheaper than standing up a
+%% whole client to receive one message.
+%%
+%% Both helpers put a `snapshot' call between the question and the
+%% verdict, and that is what makes them deterministic rather than timed:
+%% the cast and the call travel from this process to the same one, so the
+%% connector has finished handling the rebuild before the snapshot reply
+%% comes back — whatever it sent is already in this mailbox, and `after 0'
+%% is enough. P11's rule: no assertion that a scheduler can trip.
+claim_presented(Pid) ->
+    _ = vs_connector:snapshot(Pid),
+    receive
+        {'$gen_cast', {claim_present, _, _, _, _, _, _, _} = Msg} -> Msg
+    after 0 ->
+        erlang:error(no_claim_presented)
+    end.
+
+no_claim_presented(Pid) ->
+    _ = vs_connector:snapshot(Pid),
+    receive
+        {'$gen_cast', {claim_present, _, _, _, _, _, _, _} = Msg} ->
+            erlang:error({presented_a_claim_it_does_not_have, Msg})
+    after 0 ->
+        ok
+    end.
+
+%% `held' is where the claim lives before the cable goes in, and the
+%% expiry presented is the COORDINATOR's, not the station's lease. The
+%% two are different numbers on purpose (claim.md §3.1 grants the claim
+%% longer so it cannot die under a live reservation), and the snapshot
+%% shows the lease — so comparing them is what proves the connector kept
+%% the right one rather than re-reporting what it already had.
+a_held_connector_presents_its_claim_on_rebuild_test() ->
+    with_connector(fun(Pid) ->
+        {ok, LeaseExpiresAt} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = vs_claim_stub:last_claim_id(),
+        vs_connector:claims_rebuild(Pid, self()),
+        {claim_present, Owner, Cid, Vehicle, User, ConnId, GrantedAt, ExpiresAt} =
+            claim_presented(Pid),
+        ?assertEqual(Pid, Owner),
+        ?assertEqual(ClaimId, Cid),
+        ?assertEqual(?VEHICLE, Vehicle),
+        ?assertEqual(?USER, User),
+        ?assertEqual(3, ConnId),
+        ?assert(GrantedAt =< vs_time:now_ms()),
+        ?assert(ExpiresAt > LeaseExpiresAt)
+    end).
+
+%% The other half: after `held → charging' the `#hold' is gone (D-8) and
+%% the claim lives in `#session'. Without this clause a client that
+%% restarted mid-session would never get the claim back, and §6.1 would
+%% stay open for every connector that happens to be charging.
+a_charging_connector_presents_its_claim_on_rebuild_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = vs_claim_stub:last_claim_id(),
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(charging, state_of(Pid)),
+        vs_connector:claims_rebuild(Pid, self()),
+        {claim_present, Owner, Cid, Vehicle, User, ConnId, GrantedAt, ExpiresAt} =
+            claim_presented(Pid),
+        ?assertEqual(Pid, Owner),
+        %% the same claim, and the same two coordinator timestamps, carried
+        %% across the transition that throws the reservation away
+        ?assertEqual(ClaimId, Cid),
+        ?assertEqual(?VEHICLE, Vehicle),
+        ?assertEqual(?USER, User),
+        ?assertEqual(3, ConnId),
+        ?assert(is_integer(GrantedAt)),
+        ?assert(ExpiresAt > vs_time:now_ms())
+    end).
+
+%% "Negli altri stati, silenzio" — and `free' is the state every
+%% connector boots into, so this is what the very first rebuild of a
+%% station's life gets back.
+a_free_connector_says_nothing_on_a_claims_rebuild_test() ->
+    with_connector(fun(Pid) ->
+        ?assertEqual(free, state_of(Pid)),
+        vs_connector:claims_rebuild(Pid, self()),
+        ok = no_claim_presented(Pid)
+    end).
+
+%% Not a formality: a walk-in reaches `charging' through the same door as
+%% a reserved session, and it has no claim at all (SCOPE §3.3 — no
+%% reservation is needed to plug in at a free outlet). A clause that
+%% matched `#session{}' without looking at the claim id would cast
+%% `undefined' as a claim, and the client would put into its table — and
+%% from there into the coordinator's, on the next renew — a claim nobody
+%% ever granted.
+a_walk_in_has_no_claim_to_present_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(charging, state_of(Pid)),
+        ?assertEqual([], [C || C = {acquire, _, _, _, _} <- vs_claim_stub:calls()]),
+        vs_connector:claims_rebuild(Pid, self()),
+        ok = no_claim_presented(Pid)
+    end).

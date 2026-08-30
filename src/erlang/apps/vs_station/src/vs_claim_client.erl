@@ -36,6 +36,37 @@
 %%% kept and retried at the next tick — discovery failures must never
 %%% stop what is already running (claim.md §4); the local lease and the
 %%% claim's own expiry are the backstop (§5.6).
+%%%
+%%% ## The table is a reflection, not a memory (P14, P15)
+%%%
+%%% The claim lives here, but the *fact* lives in the connector — in
+%%% `#hold.claim_id', and in `#session.claim_id' once the cable is in.
+%%% Until 29/08 the two halves could not see each other die, and each
+%%% direction was its own defect, both measured (REPORT_M3A_VERIFICA
+%%% §6.1, §6.2):
+%%%
+%%%   * this process died → it came back with `claims = #{}', answered
+%%%     `who_do_you_hold' with nothing, and the first election let the
+%%%     same vehicle hold two reservations (P14);
+%%%   * a connector died → this process kept renewing a claim nobody
+%%%     owned, and since the coordinator recomputes the expiry on every
+%%%     round that claim **never expired**: one vehicle locked out of
+%%%     the whole network, for ever (P15).
+%%%
+%%% So a claim is now tied to the life of the process that asked for it.
+%%% `{granted, …}' monitors its caller — which is the connector's own
+%%% process, and that is the premise the whole design rests on — and a
+%%% `DOWN' releases the claim at the instant the owner dies. A monitor
+%%% is the exact notification of what happened, it needs no timeout,
+%%% and it arrives on `kill' too, which is precisely the case where
+%%% `terminate/3' does not run.
+%%%
+%%% In the other direction, a client that has just booted asks: one
+%%% `{claims_rebuild, self()}' cast per live connector, out of
+%%% `handle_continue', and whoever holds a claim casts it back. A
+%%% question asked once by the side that lost its state, not a
+%%% heartbeat — and no synchronous call in either direction, so rule 2
+%%% above still holds.
 %%%-------------------------------------------------------------------
 -module(vs_claim_client).
 -behaviour(gen_server).
@@ -57,11 +88,25 @@
 -define(SRV, vs_coord_srv).          %% remote name, fixed by the contract
 -define(REACH, vs_claim_reach).      %% one row: {coordinator_reachable, boolean()}
 
+%% P15 — `owner' and `mon' are what makes the table a reflection: the
+%% connector process that asked for this claim, and the monitor on it.
+%% `owner' is carried for the logs only; `mon' is the key the `DOWN'
+%% arrives with, and every path that takes a claim out of the map must
+%% drop it (see drop_claim/2).
 -record(claim, {vehicle_id :: pos_integer(),
                 user_id    :: pos_integer(),
                 conn_id    :: pos_integer(),
                 granted_at :: vs_time:epoch_ms(),
-                expires_at :: vs_time:epoch_ms()}).
+                expires_at :: vs_time:epoch_ms(),
+                owner      :: pid(),
+                mon        :: reference(),
+                %% Has a coordinator spoken about THIS claim since this
+                %% process learned of it? `true' for a grant and for every
+                %% claim a renew round confirmed; `false' for one a
+                %% connector presented at rebuild, whose expiry is a copy
+                %% taken at grant time and is therefore a lower bound, not
+                %% a fact. Only the sweep reads it — see drop_expired/1.
+                confirmed = false :: boolean()}).
 
 -record(state, {station_id  :: pos_integer(),
                 nodes       :: [node()],
@@ -82,8 +127,21 @@
 %% @doc Ask the coordinator before committing anything local. Runs in
 %% the connector's process; blocking it is correct (reserve is
 %% synchronous by design) and keeps this round-trip out of the client.
+%%
+%% It runs in the connector's process for a second reason since P15: the
+%% claim is monitored on whoever makes this call, so the caller IS the
+%% owner. Calling it from a throwaway process would attach the monitor
+%% to that process and kill the claim a microsecond later.
+%%
+%% Four elements, not three (P14): `GrantedAt' is the coordinator's own
+%% timestamp and it used to stop here, inside `do_acquire/4'. The
+%% connector needs it because the connector is the only half that
+%% survives a restart of this one, and claim.md §5.5 decides oldest-wins
+%% on that number — a station that reported its own clock instead would
+%% put the skew back that the contract PR of 24/08 removed.
 -spec acquire(pos_integer(), pos_integer(), pos_integer(), pos_integer()) ->
-          {ok, binary(), vs_time:epoch_ms()} | {error, vs_connector:refusal()}.
+          {ok, binary(), vs_time:epoch_ms(), vs_time:epoch_ms()} |
+          {error, vs_connector:refusal()}.
 acquire(VehicleId, UserId, StationId, ConnId) ->
     try
         do_acquire(VehicleId, UserId, StationId, ConnId)
@@ -188,6 +246,23 @@ handle_continue(announce, State) ->
     %% manager answers a cast-subscription by sending the current state
     %% at once, which seeds the first station_stats.
     gen_server:cast(vs_station_mgr, {subscribe, self()}),
+    %% P14 — ask the connectors what they hold. Last of the three, and
+    %% the order is a decision rather than an accident:
+    %%
+    %%   * **after `do_announce'**, because a claim presented to a
+    %%     coordinator that has never heard of this station comes back
+    %%     `unknown_station' on the first renew; announcing first costs
+    %%     one cast and removes that round trip;
+    %%   * **after the subscription**, because the reply to a subscribe
+    %%     is a `{station_state, …}' push and this one is not: keeping
+    %%     the subscription ahead means the first push describes the
+    %%     station as it is, not as it was one rebuild ago.
+    %%
+    %% At the very first boot this finds either nothing (`connector_specs'
+    %% answers `[]' while the manager's table does not exist) or a set of
+    %% connectors that are all `free', and every one of them answers with
+    %% silence. It costs one cast per connector, once per client life.
+    ask_connectors_for_claims(),
     erlang:send_after(State#state.announce_ms, self(), announce_tick),
     erlang:send_after(State#state.renew_ms, self(), renew_tick),
     {noreply, State}.
@@ -200,26 +275,36 @@ handle_call(get_route, _From, State) ->
 handle_call(station_up_msg, _From, State) ->
     {reply, station_up_msg(State), State};
 
+%% P15 — `From' was `_From' until 29/08, and that underscore was the
+%% defect. A gen_server:call carries the caller's pid, this call is made
+%% from the connector's own process (§1.2 of REPORT_CLAIM_RIFLESSO, and
+%% the assertion that proves it), so the owner of the claim is right
+%% here, for free, in the message that creates it.
 handle_call({granted, Node, ClaimId, VehicleId, UserId, ConnId, GrantedAt, ExpiresAt},
-            _From, State = #state{claims = Claims}) ->
+            {Owner, _Tag}, State = #state{claims = Claims}) ->
     %% GrantedAt comes from the coordinator (contract PR of 24/08): the
     %% station never invents a timestamp, it stores this one and repeats
     %% it in renew and who_do_you_hold. Oldest-wins (§5.5) is thereby
     %% decided by ONE clock even across a failover — no cross-station
     %% clock skew in the comparison.
-    Claim = #claim{vehicle_id = VehicleId,
-                   user_id    = UserId,
-                   conn_id    = ConnId,
-                   granted_at = GrantedAt,
-                   expires_at = ExpiresAt},
     {reply, ok, State#state{leader = Node,
-                            claims = Claims#{ClaimId => Claim}}};
+                            claims = put_claim(ClaimId,
+                                               #claim{vehicle_id = VehicleId,
+                                                      user_id    = UserId,
+                                                      conn_id    = ConnId,
+                                                      granted_at = GrantedAt,
+                                                      expires_at = ExpiresAt,
+                                                      owner      = Owner,
+                                                      %% the coordinator has
+                                                      %% just spoken: this
+                                                      %% expiry is a fact
+                                                      confirmed  = true},
+                                               Claims)}};
 
 handle_call({release, ClaimId, Reason}, _From,
             State = #state{leader = Leader, claims = Claims}) ->
-    Msg = {release, ClaimId, Reason},
-    _ = spawn(fun() -> gen_server:cast({?SRV, Leader}, Msg) end),
-    {reply, ok, State#state{claims = maps:remove(ClaimId, Claims)}};
+    cast_leader(Leader, {release, ClaimId, Reason}),
+    {reply, ok, State#state{claims = drop_claim(ClaimId, Claims)}};
 
 handle_call(_Other, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -227,9 +312,8 @@ handle_call(_Other, _From, State) ->
 handle_cast({leader_hint, Node}, State) ->
     {noreply, State#state{leader = Node}};
 
-%% Same shape as `station_stats' below: the cast to the leader goes out
-%% from a throwaway process, so a coordinator that is slow, or a node that
-%% is not there, can never hold up the one process that renews claims.
+%% Out through `cast_leader/2' like every other message to a
+%% coordinator, for the reason written there.
 %%
 %% The message is `{session_closed, Event}' — the two-element wrapper
 %% `vs_coord_srv:handle_cast/2' matches, with the nine-field tuple of
@@ -237,16 +321,68 @@ handle_cast({leader_hint, Node}, State) ->
 %% into the coordinator's catch-all instead, which is a warning in a log
 %% nobody is reading and a receipt that never arrives.
 handle_cast({session_closed, Event}, State = #state{leader = Leader}) ->
-    _ = spawn(fun() -> gen_server:cast({?SRV, Leader}, {session_closed, Event}) end),
+    cast_leader(Leader, {session_closed, Event}),
     {noreply, State};
+
+%% P14 — a connector answering the `{claims_rebuild, …}' this process
+%% sent from `handle_continue'. Same six fields as a `granted', and the
+%% same treatment: insert and monitor the sender, because the connector
+%% that still holds the claim is still its owner.
+%%
+%% **Race (a), and why the map cannot be left dirty.** A connector may
+%% answer this and then release the claim an instant later — its lease
+%% ran out while we were rebuilding. Both messages travel from the SAME
+%% process to THIS one (the cast here, then the `{release, …}' call of
+%% `vs_connector:release/2'), so Erlang's pairwise ordering puts them in
+%% that order in our mailbox and the release finds the claim to remove.
+%% It holds *only* because both hops are direct connector→client: route
+%% the release through a third party and the guarantee is gone. This is
+%% a property the code rests on, so it is written next to it.
+%%
+%% **Race (b), and why there is no special case.** If the connector is
+%% already dead when we get here, `erlang:monitor/2' delivers a `DOWN'
+%% with `noproc' at once (verified on OTP 29, and asserted in
+%% `a_claim_presented_by_a_dead_connector_is_dropped_at_once_test'), so
+%% the claim is inserted and taken straight back out by the clause below.
+handle_cast({claim_present, Owner, ClaimId, VehicleId, UserId, ConnId,
+             GrantedAt, ExpiresAt},
+            State = #state{claims = Claims}) ->
+    case maps:is_key(ClaimId, Claims) of
+        true ->
+            %% Already known — a `granted' beat the answer here, or a
+            %% connector answered twice. Re-monitoring would leak a
+            %% monitor for a claim that can only be dropped once.
+            {noreply, State};
+        false ->
+            logger:notice("claim client: connector ~p presented claim ~s "
+                          "(vehicle ~p, user ~p) — rebuilding it",
+                          [ConnId, ClaimId, VehicleId, UserId]),
+            Claim = #claim{vehicle_id = VehicleId,
+                           user_id    = UserId,
+                           conn_id    = ConnId,
+                           granted_at = GrantedAt,
+                           expires_at = ExpiresAt,
+                           owner      = Owner,
+                           %% secondhand, and said so: the connector copied
+                           %% this expiry when the claim was granted and
+                           %% nobody has moved it since. The next renew
+                           %% round settles it.
+                           confirmed  = false},
+            {noreply, State#state{claims = put_claim(ClaimId, Claim, Claims)}}
+    end;
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% -- the renew loop --------------------------------------------------
 
-handle_info(renew_tick, State = #state{claims = Claims}) ->
-    erlang:send_after(State#state.renew_ms, self(), renew_tick),
+handle_info(renew_tick, State0 = #state{claims = Claims0}) ->
+    erlang:send_after(State0#state.renew_ms, self(), renew_tick),
+    %% The safety net (piano §1.4), applied before the batch is built so
+    %% that nothing dead can be in it. See drop_expired/1 for why it is
+    %% here at all and why it shouts.
+    Claims = drop_expired(Claims0),
+    State = State0#state{claims = Claims},
     case map_size(Claims) of
         0 -> ok;
         _ ->
@@ -286,7 +422,8 @@ handle_info({renew_result, {ok, Node, {renewed, Ok, Revoked, NewExpiresAt}}},
                 fun(ClaimId, Acc) ->
                         case Acc of
                             #{ClaimId := C} ->
-                                Acc#{ClaimId := C#claim{expires_at = NewExpiresAt}};
+                                Acc#{ClaimId := C#claim{expires_at = NewExpiresAt,
+                                                        confirmed  = true}};
                             _ ->
                                 Acc     %% released while the renew was in flight
                         end
@@ -313,9 +450,8 @@ handle_info({station_state, StateMap}, State = #state{last_stats = Last}) ->
         Last ->
             {noreply, State};
         {Free, Held, Charging} = Stats ->
-            Msg = {station_stats, State#state.station_id, Free, Held, Charging},
-            Leader = State#state.leader,
-            _ = spawn(fun() -> gen_server:cast({?SRV, Leader}, Msg) end),
+            cast_leader(State#state.leader,
+                        {station_stats, State#state.station_id, Free, Held, Charging}),
             {noreply, State#state{last_stats = Stats}}
     end;
 
@@ -330,6 +466,42 @@ handle_info({who_do_you_hold, From, CoordNode},
              || {ClaimId, C} <- maps:to_list(Claims)],
     From ! {holds, StationId, Holds},
     {noreply, State#state{leader = CoordNode}};
+
+%% -- the owner died (P15) --------------------------------------------
+
+%% The connector that asked for this claim is gone. It is not "maybe
+%% gone", and no timeout had to guess it: a `DOWN' is the fact itself,
+%% and it arrives on `exit(Pid, kill)' too — the case where the
+%% connector's own `terminate/3' never runs, which is exactly the hole
+%% measured in §6.2.
+%%
+%% A connector that comes back comes back `free' and claimless (verified
+%% by structure: `#hold{}' is built in one place, on a grant), so there
+%% is nothing to re-adopt and releasing is the whole of the right answer.
+%%
+%% `cancelled' is the reason: claim.md §3.3 fixes four words —
+%% `cancelled | expired | completed | revoked' — and this is the station
+%% giving the claim back, not a lease running out. No contract changes.
+%%
+%% No `demonitor' here: delivering the `DOWN' has already consumed the
+%% monitor, so `maps:remove' rather than `drop_claim/2'.
+handle_info({'DOWN', Ref, process, Pid, Reason}, State = #state{claims = Claims,
+                                                               leader = Leader}) ->
+    case claim_by_mon(Ref, Claims) of
+        {ClaimId, C} ->
+            logger:notice("claim client: the connector holding claim ~s died "
+                          "(connector ~p, pid ~p, reason ~p) — releasing it",
+                          [ClaimId, C#claim.conn_id, Pid, Reason]),
+            cast_leader(Leader, {release, ClaimId, cancelled}),
+            {noreply, State#state{claims = maps:remove(ClaimId, Claims)}};
+        error ->
+            %% A monitor this process no longer has a claim for. Harmless
+            %% by construction — every removal demonitors with `flush' —
+            %% and worth a line rather than a crash if it ever shows up.
+            logger:debug("claim client: DOWN from ~p (~p) matching no claim",
+                         [Pid, Reason]),
+            {noreply, State}
+    end;
 
 handle_info(announce_tick, State) ->
     do_announce(State),
@@ -352,7 +524,7 @@ do_acquire(VehicleId, UserId, StationId, ConnId) ->
         {ok, Node, {ok, ReqId, ClaimId, GrantedAt, ExpiresAt}} ->
             ok = gen_server:call(?MODULE, {granted, Node, ClaimId, VehicleId,
                                            UserId, ConnId, GrantedAt, ExpiresAt}),
-            {ok, ClaimId, ExpiresAt};
+            {ok, ClaimId, GrantedAt, ExpiresAt};
         {ok, Node, {error, ReqId, unknown_station}} ->
             %% §3.1: re-announce, retry once. Cast then call from THIS
             %% process to THE SAME node: pairwise FIFO guarantees the
@@ -363,7 +535,7 @@ do_acquire(VehicleId, UserId, StationId, ConnId) ->
                 {ok, ReqId, ClaimId, GrantedAt, ExpiresAt} ->
                     ok = gen_server:call(?MODULE, {granted, Node, ClaimId, VehicleId,
                                                    UserId, ConnId, GrantedAt, ExpiresAt}),
-                    {ok, ClaimId, ExpiresAt};
+                    {ok, ClaimId, GrantedAt, ExpiresAt};
                 {error, ReqId, Reason} ->
                     {error, map_refusal(Reason)};
                 _ ->
@@ -452,17 +624,123 @@ revoke(ClaimId, Claims) ->
                     %% revocation lands during a connector restart.
                     ok   %% connector down: its restart comes back claimless anyway
             end,
-            maps:remove(ClaimId, Claims);
+            drop_claim(ClaimId, Claims);
         _ ->
             Claims   %% released in the meantime — nothing left to revoke
     end.
 
-do_announce(State = #state{leader = Leader}) ->
-    Msg = station_up_msg(State),
-    %% Spawned: even the auto-connect attempt towards a dead node must
-    %% not stall this process.
+%%%===================================================================
+%%% the claim table — every way in and out of it
+%%%===================================================================
+
+%% The one door in. It monitors the owner and, if that claim id was
+%% somehow already there, drops the old monitor first: a second
+%% `erlang:monitor' on the same pid returns a NEW reference, so
+%% overwriting the record without this would leave a monitor that
+%% nothing can ever demonitor.
+put_claim(ClaimId, Claim = #claim{owner = Owner}, Claims) ->
+    Claims1 = drop_claim(ClaimId, Claims),
+    Claims1#{ClaimId => Claim#claim{mon = erlang:monitor(process, Owner)}}.
+
+%% The one door out, used by release, revoke and the expiry sweep.
+%%
+%% `[flush]', never a bare demonitor: without it a `DOWN' that is already
+%% in the mailbox is delivered after the claim is gone. Today that is
+%% harmless — the clause above finds no claim for the reference and logs
+%% a debug line — but a monitor left hanging on something that no longer
+%% exists is exactly the kind of thing that is innocuous until it is not.
+drop_claim(ClaimId, Claims) ->
+    case maps:take(ClaimId, Claims) of
+        {#claim{mon = Ref}, Rest} when is_reference(Ref) ->
+            _ = erlang:demonitor(Ref, [flush]),
+            Rest;
+        {_NoMonitor, Rest} ->
+            Rest;
+        error ->
+            Claims
+    end.
+
+claim_by_mon(Ref, Claims) ->
+    case [{Id, C} || {Id, C = #claim{mon = R}} <- maps:to_list(Claims), R =:= Ref] of
+        [Found | _] -> Found;
+        []          -> error
+    end.
+
+%% The safety net of piano §1.4. It closes neither defect on its own —
+%% the claim of §6.2 was never expired, it was being rejuvenated ten
+%% seconds at a time — and it is here for the failure nobody has thought
+%% of yet: if a monitor ever fails to fire, this turns "renew something
+%% dead for ever" into "at most one tick late".
+%%
+%% Loud on purpose. In a healthy station this cannot happen: the owner's
+%% `DOWN', the release and the revocation all get here first, and every
+%% successful renew pushes the expiry forward. A defence that quietly
+%% removes the evidence of the defect it defends against is worse than
+%% the defect, so a claim dropped here is a `warning' with the reason
+%% written out.
+%%
+%% **Only `confirmed' claims, and that qualifier is what keeps the
+%% sentence above true.** A claim a connector presented at rebuild
+%% carries the expiry the connector copied when it was granted, and
+%% nobody has moved it since — while the coordinator has been pushing the
+%% real one forward every ten seconds. The two diverge by design, and a
+%% charging session outlives lease+grace routinely, so without this
+%% qualifier a client restarting during any session older than sixteen
+%% minutes would rebuild its claim and drop it one tick later, shouting
+%% about a healthy station. (Measured on the live cluster: a rebuilt
+%% claim's 1788024516065 became 1788024774224 at the first renew.)
+%%
+%% So an unconfirmed claim IS offered in one renew batch. That is not
+%% renewing something dead: it is asking the only party that knows, and
+%% the coordinator answers by adopting it — `Ok', with a real expiry,
+%% which marks it confirmed — or by revoking it. Either way one round
+%% settles it. If no coordinator answers at all it stays, and that is
+%% §5.4: a failed renew is not a revocation.
+drop_expired(Claims) ->
+    Expired = [Id || {Id, C} <- maps:to_list(Claims),
+                     C#claim.confirmed,
+                     vs_time:expired(C#claim.expires_at)],
+    lists:foldl(
+      fun(ClaimId, Acc) ->
+              #{ClaimId := C} = Acc,
+              logger:warning("claim client: claim ~s (connector ~p, owner ~p) expired "
+                             "at ~p and was still in the table — dropped instead of "
+                             "renewed", [ClaimId, C#claim.conn_id, C#claim.owner,
+                                         C#claim.expires_at]),
+              drop_claim(ClaimId, Acc)
+      end, Claims, Expired).
+
+%% P14 — the question, asked once, by the side that lost its state.
+%%
+%% Both reads are the dirty ETS ones the module doc allows (rule 2): a
+%% `gen_server:call' into the manager would close the cycle of three that
+%% can deadlock, and the answer is worth exactly what a dirty read is
+%% worth — a connector that dies between the lookup and the cast simply
+%% never answers, and a connector that was not registered yet has no
+%% claim to present.
+%%
+%% `{error, no_pid | no_manager | unknown_connector}' (P10) are all the
+%% same thing here: nobody to ask.
+ask_connectors_for_claims() ->
+    Self = self(),
+    lists:foreach(
+      fun({ConnId, _RatedKw}) ->
+              case vs_station_mgr:lookup_pid(ConnId) of
+                  {ok, Pid}  -> vs_connector:claims_rebuild(Pid, Self);
+                  {error, _} -> ok
+              end
+      end, vs_station_mgr:connector_specs()).
+
+%% Every message this process sends to a coordinator goes out from a
+%% throwaway process (scelte §4.4): a slow coordinator, or the
+%% auto-connect attempt towards a node that is not there, must never be
+%% able to stall the one process that renews the station's claims.
+cast_leader(Leader, Msg) ->
     _ = spawn(fun() -> gen_server:cast({?SRV, Leader}, Msg) end),
     ok.
+
+do_announce(State = #state{leader = Leader}) ->
+    cast_leader(Leader, station_up_msg(State)).
 
 station_up_msg(#state{station_id = StationId, info = Info}) ->
     {station_up, StationId, node(),

@@ -57,7 +57,7 @@
 
 %% API
 -export([start_link/1, reserve/3, cancel/2, plugged/2, unplugged/2,
-         meter/2, stop_session/2, revoke/2, snapshot/1,
+         meter/2, stop_session/2, revoke/2, claims_rebuild/2, snapshot/1,
          attach_cp/2, set_limit/2, cp_status/2]).
 %% gen_statem
 -export([init/1, callback_mode/0, terminate/3]).
@@ -99,15 +99,36 @@
 
 -export_type([refusal/0]).
 
+%% P14 — four timestamps in two pairs, and the pairs are not the same
+%% thing. `granted_at'/`expires_at' are the STATION's reservation: this
+%% clock, and the lease of §3.1, which is what the driver is shown and
+%% what `held(enter, …)' arms its timer on. `claim_granted_at' and
+%% `claim_expires_at' are the COORDINATOR's, copied verbatim out of
+%% `claim_mod:acquire/4' and never touched.
+%%
+%% They are here because this process is the half that survives a restart
+%% of the claim client, so it is the only place those two numbers can
+%% wait. The station's own pair could not stand in for them: claim.md
+%% §5.5 settles conflicts on `GrantedAt', and reporting a local clock
+%% would put back the cross-station skew the contract PR of 24/08 removed.
 -record(hold, {user_id     :: user_id(),
                vehicle_id  :: vehicle_id(),
                claim_id    :: binary(),
                granted_at  :: vs_time:epoch_ms(),
-               expires_at  :: vs_time:epoch_ms()}).
+               expires_at  :: vs_time:epoch_ms(),
+               claim_granted_at :: vs_time:epoch_ms(),
+               claim_expires_at :: vs_time:epoch_ms()}).
 
 -record(session, {user_id     :: user_id(),
                   vehicle_id  :: vehicle_id(),
                   claim_id    :: binary() | undefined,
+                  %% The coordinator's two, carried across held → charging
+                  %% with the claim id. `undefined' for a walk-in and for
+                  %% the §6 adoption from reconnected hardware, which have
+                  %% no claim at all — and a session with no claim id has
+                  %% nothing to present.
+                  claim_granted_at :: vs_time:epoch_ms() | undefined,
+                  claim_expires_at :: vs_time:epoch_ms() | undefined,
                   started_at  :: vs_time:epoch_ms(),
                   energy_kwh  = 0.0 :: float(),
                   %% D-1. The charge point counts from *its* start and
@@ -199,6 +220,18 @@ stop_session(Pid, UserId) ->
 revoke(Pid, ClaimId) ->
     gen_statem:cast(Pid, {revoke, ClaimId}).
 
+%% @doc The claim client has restarted with an empty table and is asking
+%% what this connector holds (P14).
+%%
+%% A cast, and the client's pid travels inside it: a cast carries no
+%% sender, and the client monitors whoever owns the claim. Answered in
+%% `held' and in `charging', where a claim id exists; everywhere else the
+%% state functions absorb it and say nothing, which is the right answer —
+%% there is nothing to present.
+-spec claims_rebuild(pid(), pid()) -> ok.
+claims_rebuild(Pid, ClientPid) ->
+    gen_statem:cast(Pid, {claims_rebuild, ClientPid}).
+
 %% @doc Current view of the connector, for the `state' push.
 -spec snapshot(pid()) -> map().
 snapshot(Pid) ->
@@ -286,16 +319,23 @@ free({call, From}, {reserve, UserId, VehicleId}, Data) ->
     %% coordinator answers, this connector is still `free' until it says ok.
     case (Data#data.claim_mod):acquire(VehicleId, UserId,
                                        Data#data.station_id, Data#data.conn_id) of
-        {ok, ClaimId, ClaimExpiresAt} ->
+        {ok, ClaimId, ClaimGrantedAt, ClaimExpiresAt} ->
             %% The reservation deadline is the station's lease, not the
             %% claim's: the claim is granted longer on purpose (claim.md
             %% §3.1) so it never dies under a live reservation.
             ExpiresAt = vs_time:in_ms(Data#data.lease_ms),
+            %% P14 — the coordinator's two timestamps are kept beside the
+            %% station's. `ClaimExpiresAt' was already coming back here
+            %% and was only being logged; `ClaimGrantedAt' is the field
+            %% `acquire/4' grew. Neither is used by this state machine:
+            %% they are held for the claim client to ask back.
             Hold = #hold{user_id    = UserId,
                          vehicle_id = VehicleId,
                          claim_id   = ClaimId,
                          granted_at = vs_time:now_ms(),
-                         expires_at = ExpiresAt},
+                         expires_at = ExpiresAt,
+                         claim_granted_at = ClaimGrantedAt,
+                         claim_expires_at = ClaimExpiresAt},
             logger:notice("connector ~p reserved by user ~p (claim ~s, claim expiry ~p)",
                           [Data#data.conn_id, UserId, ClaimId, ClaimExpiresAt]),
             notify(Data, {reserved, UserId, ExpiresAt}),
@@ -391,7 +431,7 @@ held({call, From}, {plugged, Info}, Data = #data{hold = Hold}) ->
             %% and has no voice on the account: the person billed is the
             %% one the claim was granted to.
             Session = adopt(Info#{user_id => Hold#hold.user_id},
-                            Hold#hold.claim_id, Data),
+                            claim_of(Hold), Data),
             notify(Data, {session_started, Hold#hold.user_id}),
             %% D-8: the reservation has done its work and is discarded
             %% here. Left in place it went on being reported by
@@ -419,6 +459,13 @@ held(cast, {revoke, ClaimId}, Data = #data{hold = #hold{claim_id = ClaimId, user
     notify(Data, {claim_revoked, U}),
     %% No release message: the coordinator revoked it, it already knows.
     {next_state, free, Data};
+
+%% P14 — the claim client restarted and is asking. This is where the
+%% claim lives before the cable goes in.
+held(cast, {claims_rebuild, Client}, Data = #data{hold = Hold}) ->
+    present_claim(Client, claim_of(Hold),
+                  Hold#hold.vehicle_id, Hold#hold.user_id, Data),
+    keep_state_and_data;
 
 held(cast, {meter, Reading}, Data) ->
     logger:warning("connector ~p: meter for a connector with no session "
@@ -523,6 +570,17 @@ charging(cast, {revoke, ClaimId}, Data = #data{session = #session{claim_id = Cla
     notify(Data, {claim_revoked, U}),
     send_cp(Data, stop_cmd(claim_revoked)),
     {next_state, closing, Data};
+
+%% P14, the other half. `held → charging' hands the reservation in and
+%% throws the `#hold' away (D-8), so after the cable goes in the claim
+%% lives here — and a client that restarts mid-session has to be able to
+%% get it back, or §6.1 stays open for every connector that is charging.
+%% A walk-in falls into the same clause and presents nothing: its
+%% `claim_id' is `undefined' and `present_claim/5' says so.
+charging(cast, {claims_rebuild, Client}, Data = #data{session = S}) ->
+    present_claim(Client, claim_of(S),
+                  S#session.vehicle_id, S#session.user_id, Data),
+    keep_state_and_data;
 
 charging({call, From}, {reserve, _U, _V}, _Data) ->
     {keep_state_and_data, [{reply, From, {error, already_held}}]};
@@ -828,11 +886,44 @@ reported_state(State, _Session) ->
 %% offset is applied and cleared in one place rather than three. Splitting
 %% them keeps the clearing visible at the call site: an adoption *consumes*
 %% what a previous session left behind, whichever door it came through.
-adopt(Info, ClaimId, #data{energy_billed = Billed}) ->
-    session_from(Info, ClaimId, Billed).
+%% The second argument is the whole claim now — `{ClaimId, GrantedAt,
+%% ExpiresAt}' — or `undefined' for a session that never had one. The two
+%% callers that passed `undefined' before still pass it and still mean the
+%% same thing: the walk-in of `free/3' and the §6 re-adoption of
+%% `out_of_service/3' have no claim, not merely no claim id.
+adopt(Info, Claim, #data{energy_billed = Billed}) ->
+    session_from(Info, Claim, Billed).
 
 consumed(Data) ->
     Data#data{energy_billed = 0.0}.
+
+%% The claim a `#hold' or a `#session' carries, in the shape `adopt/3' and
+%% `present_claim/5' both want. One function over two records because it
+%% is one fact: the claim outlives the transition between them.
+claim_of(#hold{claim_id = Id, claim_granted_at = G, claim_expires_at = E}) ->
+    {Id, G, E};
+claim_of(#session{claim_id = Id, claim_granted_at = G, claim_expires_at = E}) ->
+    {Id, G, E}.
+
+%% P14 — the answer to a `{claims_rebuild, …}'.
+%%
+%% The six fields of claim.md, in the order the client stores them, with
+%% `self()' in front: a cast carries no sender and the client monitors
+%% whoever owns the claim, so the pid has to be in the message.
+%%
+%% A session with no claim says nothing. That clause is not a formality:
+%% a walk-in reaches `charging' through the same door, and casting
+%% `undefined' as a claim id would put into the client's table — and from
+%% there into the coordinator's, on the next renew — a claim nobody ever
+%% granted.
+present_claim(_Client, {undefined, _GrantedAt, _ExpiresAt}, _VehicleId, _UserId, _Data) ->
+    ok;
+present_claim(Client, {ClaimId, GrantedAt, ExpiresAt}, VehicleId, UserId,
+              #data{conn_id = ConnId}) ->
+    logger:notice("connector ~p: presenting claim ~s (vehicle ~p, user ~p) to a "
+                  "claim client that asked", [ConnId, ClaimId, VehicleId, UserId]),
+    gen_server:cast(Client, {claim_present, self(), ClaimId, VehicleId, UserId,
+                             ConnId, GrantedAt, ExpiresAt}).
 
 %% §4.3 — every figure the charge point sends is cumulative since *its*
 %% start. `energy_offset' is how much of that has already been written to
@@ -871,7 +962,8 @@ final_energy(Reported, S) ->
 %% never saw — and an offset from a delivery that is over means nothing:
 %% it is dropped and the payload is taken at face value. Deciding it once,
 %% here, is what keeps a later `unplugged' from having to guess.
-session_from(Info, ClaimId, Offset) ->
+session_from(Info, Claim, Offset) ->
+    {ClaimId, ClaimGrantedAt, ClaimExpiresAt} = claim_fields(Claim),
     Reported = float(maps:get(energy_kwh, Info, 0.0)),
     {Offset1, Energy} =
         case Offset > 0.0 andalso Reported >= Offset of
@@ -881,12 +973,21 @@ session_from(Info, ClaimId, Offset) ->
     #session{user_id     = maps:get(user_id, Info),
              vehicle_id  = maps:get(vehicle_id, Info),
              claim_id    = ClaimId,
+             claim_granted_at = ClaimGrantedAt,
+             claim_expires_at = ClaimExpiresAt,
              started_at  = started_at_from(Info),
              energy_kwh  = Energy,
              energy_offset = Offset1,
              soc_pct     = maps:get(soc_pct, Info, 0),
              battery_kwh = maps:get(battery_kwh, Info, 0.0),
              max_kw      = maps:get(max_kw, Info, 0)}.
+
+%% The three `undefined' of a session with no claim, said once so that
+%% `session_from/3' has a single shape to fill in either case.
+claim_fields(undefined) ->
+    {undefined, undefined, undefined};
+claim_fields({ClaimId, GrantedAt, ExpiresAt}) ->
+    {ClaimId, GrantedAt, ExpiresAt}.
 
 %% §6 — when the session began, and the one date the reconciliation is
 %% allowed to move. It used to be the adoption instant unconditionally, on

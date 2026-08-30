@@ -2328,6 +2328,99 @@ primo cavo) → `EXIT=0`, riga 6 in `sessions`: 13:30:08 → 13:33:19, 5.957 kWh
 Controprova del permanente: emulatore su un connettore non configurato (9) → `4404`, morte
 immediata, `EXIT=2`. Report completo in `REPORT_P10.md`.
 
+## 7zd. P14 e P15: il claim smette di essere un ricordo del client — 29 agosto
+
+I due difetti misurati nel pair 1 (`REPORT_M3A_VERIFICA` §6.1 e §6.2), chiusi. Una radice sola:
+il claim vive in `vs_claim_client`, il **fatto** vive nel connettore (`#hold.claim_id`, poi
+`#session.claim_id`), e quando una delle due metà moriva l'altra non se ne accorgeva.
+
+### Le due verifiche bloccanti, prima di scrivere qualsiasi cosa
+
+**Esiste un percorso che fa riadottare un `hold` a un connettore riavviato?** No, e cercato per
+struttura: `#hold{}` è costruito in **un solo punto** (dopo un `acquire` riuscito), `held` si
+raggiunge solo da lì, `init/1` parte `free` col campo a `undefined`, `free(enter)` e
+`out_of_service(enter)` azzerano `hold` e `session`, e le due adozioni da hardware riagganciato
+passano `undefined` come claim esplicitamente. Se fosse esistito, rilasciare sul `DOWN` sarebbe
+stato sbagliato e tutto il disegno andava ripensato.
+
+**Entrambi i chiamanti di `{granted, …}` chiamano dal processo del connettore?** Sì — sono i due
+rami di `do_acquire/4`, unico chiamante `acquire/4`, invocata solo come
+`(Data#data.claim_mod):acquire(...)` dentro `free({call, From}, {reserve, …})`, che è una
+callback di `gen_statem`. Se anche uno solo avesse chiamato da un processo effimero il monitor si
+sarebbe attaccato a quello e il claim sarebbe morto subito. **Provato, non solo letto**: un test
+asserisce che il pid monitorato è quello del connettore.
+
+### Il piano si sbagliava su un punto, e non di forma
+
+Dava per scontato che il connettore avesse già i sei campi del contratto da ripresentare. Non li
+aveva: `#hold.granted_at` è l'orologio **della stazione**, `#hold.expires_at` è il **lease**
+(900 s) e non la scadenza del claim (960 s), e `#session` non aveva né l'uno né l'altro — due dei
+sei campi mancanti del tutto. Il `ClaimExpiresAt` tornava da `acquire/4` ed era **solo loggato**;
+il `GrantedAt` del coordinatore viveva solo dentro il client, e con il client moriva.
+
+Ripresentare i valori locali sarebbe stato inventarli, e avrebbe rimesso lo skew fra orologi
+dentro il confronto *oldest wins* che il PR di contratto del 24 agosto aveva eliminato. Scelta
+presa consapevolmente (opzione A): `claim_mod:acquire/4` restituisce
+`{ok, ClaimId, GrantedAt, ExpiresAt}` e il connettore tiene i due valori **del coordinatore**
+accanto ai propri. **Il contratto sul filo non cambia** — `GrantedAt` era già sul filo — cambia
+solo la giuntura interna fra connettore e claim_mod. Dettagli in `scelte_di_progetto.md` §20.4.
+
+### Cosa fa adesso
+
+**P15.** `handle_call({granted, …})` usa il `From` che ignorava: `erlang:monitor` sul chiamante,
+`reference()` nel `#claim`. Un `DOWN` rilascia il claim verso il leader (`cancelled`, una delle
+quattro parole di `claim.md` §3.3 — nessun atomo nuovo sul filo), lo toglie dalla mappa e lo
+**logga a `notice`**. Ogni altra uscita dalla mappa demonitora con `[flush]`.
+
+**P14.** `handle_continue(announce, …)` chiede: un cast `{claims_rebuild, self()}` a ogni
+connettore vivo, letto dall'ETS del manager con la lettura sporca già consentita. Chi tiene un
+claim risponde con un cast, in `held` **e in `charging`**. Nessuna chiamata sincrona in nessuna
+delle due direzioni.
+
+**La rete di sicurezza**, con il qualificatore che la rende vera: i claim scaduti non vengono
+rinnovati e escono con un `warning`, ma **solo i confermati**. Un claim ripresentato porta la
+scadenza copiata al momento della concessione, che diverge da quella vera per costruzione: senza
+il qualificatore un client che riparte durante una sessione più vecchia di sedici minuti avrebbe
+buttato il claim un tick dopo averlo ricostruito, gridando contro una stazione sana — cioè
+rimettendo in piedi §6.1 per lo stato `charging`. Il warning non è mai scattato in tutta la
+sessione E2E, che è come deve essere.
+
+**Suite: 328 test** (315 + 13), tre giri consecutivi verdi con `EXPECTED_TESTS` aggiornato nello
+stesso momento. E la prova che mordono, perché passare non basta: rotte le due correzioni
+(`DOWN` reso un no-op, domanda del rebuild tolta), il modulo dà `19 tests, 0 failures,
+3 cancelled` — la firma di §7zb, cioè il giro che `rebar3 eunit` da solo avrebbe fatto passare
+per innocuo.
+
+Un test che c'era si era **svuotato**:
+`a_revocation_while_the_connector_restarts_does_not_kill_the_client_test` (§7zc) apriva la sua
+finestra con `exit(ConnPid, kill)`, e da oggi quel kill fa sparire il claim prima che la revoca
+conti qualcosa — verde, e senza toccare più il ramo per cui era stato scritto. Riscritto perché
+il claim sopravviva al connettore, così che `revoke/2` incontri davvero il `{error, no_pid}`.
+
+### Le stesse misure del pair 1, ripetute
+
+Immagini ricostruite e container ricreati; `beam_lib:md5` host↔container identico su
+`vs_claim_client`, `vs_connector`, `vs_claim_null` e `vs_coord_srv` (quest'ultimo invariato,
+`c5393f49…`, lo stesso valore registrato dal pair 1).
+
+| | prima (pair 1) | dopo |
+|---|---|---|
+| **P15** — connettore ucciso mentre `held` | claim rinnovato ogni 10 s **per sempre**, veicolo chiuso fuori dalla rete | claim fuori dalla mappa in **10 ms**, `notice` nei log, coordinatore aggiornato |
+| il veicolo prova un altro connettore | `NO_CLAIM — your vehicle already holds a reservation elsewhere` | **`{ok, …}`** — prenota, 312 ms dopo |
+| **P14** — `exit(whereis(vs_claim_client), kill)` con un `held` vivo | `who_do_you_hold` → `{holds, 1, []}` | riavvio in **2 ms**, e la **prima** `who_do_you_hold` risponde già col claim, `granted_at` originale incluso |
+| poi `docker stop` del leader | coord2 ricostruisce con **ZERO claim**, e station2 **ottiene** lo stesso veicolo | coord2: «2 station(s) answered with **1 claim(s)**», «serving with **1 adopted claim(s)**», e station2 → **`vehicle_committed`**, connettore 5 resta `free` |
+
+**Controprova sul percorso sano**, con gli emulatori veri sui due canali WebSocket: boot della
+colonnina, prenotazione, cavo alle 17:24:59, carica a 150 kW, unplug a SoC 25. Riga **7** in
+`sessions` (12 / 1 / 3, 17:24:58 → 17:25:43, **1.876 kWh**), esattamente il
+`final energy_kwh = 1.876` stampato da `cp.js`; claim rilasciato, connettore `free`, coordinatore
+a zero claim. E il canale driver intatto: 8 driver in contesa su un connettore, 1 accettato,
+7 `ALREADY_HELD`, invariante chiusa, risposta massima 4 ms.
+
+Durante la sessione la snapshot del connettore in `charging` **non conteneva alcun `claim_id`**,
+né al primo livello né dentro `session`: il divieto di avvicinare il claim id al browser è
+asserito sul sistema vivo, non promesso. Report completo in `REPORT_CLAIM_RIFLESSO.md`.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
