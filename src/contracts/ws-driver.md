@@ -94,7 +94,7 @@ Refusals — the mapping from the coordinator's answer to what the driver sees:
 | — (connector not `free` locally) | `ALREADY_HELD` | someone else got this connector first |
 | `{error, _, already_held}` | `NO_CLAIM` | your vehicle already holds a reservation |
 | `{error, _, suspended}` | `SUSPENDED` | the account is serving a no-show penalty; walk-in charging still works |
-| `{error, _, rebuilding}` | `RETRY_LATER` | a new leader is rebuilding; try again in a few seconds |
+| `{error, _, rebuilding}` | `RETRY_LATER` | a new coordinator is rebuilding; try again shortly |
 | unreachable, timeout, no leader | `NO_CLAIM` | reservations are unavailable right now |
 
 The last row is the deliberate one: with no coordinator the station refuses **new reservations** and keeps everything already running (claim.md §4). Availability is sacrificed exactly where safety demands it and nowhere else.
