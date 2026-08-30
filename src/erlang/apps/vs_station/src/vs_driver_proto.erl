@@ -306,6 +306,24 @@ with_connector(ReqId, Payload, Session, Fun) ->
                 {error, no_manager} ->
                     reply(error_frame(ReqId, <<"RETRY_LATER">>,
                                       <<"the station is restarting">>),
+                          Session);
+                %% P13. The row exists and carries `undefined': this
+                %% connector IS of this station, its process died and the
+                %% supervisor is a few milliseconds behind. It used to
+                %% fall into the clause above it and be answered
+                %% UNKNOWN_CONNECTOR — a permanent code for something
+                %% that lasts an instant, the same mistake as the 4404 of
+                %% P4 and the one of P10.
+                %%
+                %% Same code as `no_manager' and a sentence of its own:
+                %% §6 gives the code what the client must DO — try again
+                %% in a moment, identical in both — and leaves the
+                %% message to say what happened, which is the only part
+                %% that differs and the only part a person reads.
+                {error, no_pid} ->
+                    reply(error_frame(ReqId, <<"RETRY_LATER">>,
+                                      <<"the connector is restarting; "
+                                        "try again in a moment">>),
                           Session)
             end;
         _Missing ->
@@ -384,8 +402,17 @@ refusal(already_held, ConnId) ->
 %% code is the same NO_CLAIM, but the sentence is what changes the
 %% driver's next move — cancel the other reservation, instead of walking
 %% down the row of connectors trying each one.
+%%
+%% P12: it used to end in "elsewhere", and the first case a driver
+%% actually meets is the second reservation on the SAME station — two
+%% connectors along the row, where the adverb is simply false. It was
+%% false only because it was too precise; without it the sentence is true
+%% wherever the other reservation is, and still does the job above.
+%% Changed here and in the §4.1 table together: a sentence the contract
+%% quotes and the code no longer says is a contract that has stopped
+%% describing the code.
 refusal(vehicle_committed, _ConnId) ->
-    {<<"NO_CLAIM">>, <<"your vehicle already holds a reservation elsewhere">>};
+    {<<"NO_CLAIM">>, <<"your vehicle already holds a reservation">>};
 refusal(no_claim, _ConnId) ->
     {<<"NO_CLAIM">>, <<"reservations are unavailable right now">>};
 refusal(suspended, _ConnId) ->

@@ -2124,3 +2124,84 @@ dedicato costa due cast e non ha quel rischio.
 `build_snapshot/2` resta quindi senza i campi nuovi, ed è asserito sul sistema vivo, non
 promesso: durante la sessione di controprova la snapshot del connettore in `charging` non
 conteneva alcun `claim_id`, né al primo livello né dentro `session`.
+
+---
+
+## 21. La firma di ritorno decide quali distinzioni sono ancora possibili a valle (P4, P10, P13)
+
+Tre correzioni in tre punti diversi del sistema, a tre giorni di distanza, e una radice sola.
+Vale una voce unica perché **la lezione non è nessuno dei tre fix**.
+
+| | dove | il permanente detto a un temporaneo | chiuso con |
+|---|---|---|---|
+| **P4** | resa del riaggancio, canale colonnina | `4404` — «questo connettore non è di questa stazione» (§1: permanente, e `cp.js` ci muore sopra, correttamente) | `1012` Service Restart (§18.2) |
+| **P10** | handshake della colonnina | lo stesso `4404`, stavolta all'apertura del socket | i due temporanei **ammessi**, risposta data dal `boot` con `accepted:false` (§18.3) |
+| **P13** | canale driver | `UNKNOWN_CONNECTOR` — «connector does not belong to this station» | `RETRY_LATER`, allargato ai suoi tre casi reali |
+
+### La radice: `{error, atom()}` con un atomo solo per tre fatti diversi
+
+`vs_station_mgr` tiene una riga per ogni connettore configurato, e la riga **non sparisce mai**:
+`init/1` le inserisce tutte con pid `undefined`, e il `DOWN` di un connettore rimette
+`undefined` invece di cancellare. Quindi la tabella distingue tre situazioni per costruzione —
+riga con pid vivo, riga con `undefined`, riga assente — e ne aggiunge una quarta chi la legge
+sporco: tabella non ancora creata.
+
+Entrambe le funzioni di lettura ne restituivano **una sola**:
+
+```erlang
+_ -> {error, unknown_connector}     %% lookup_pid/1 fino a P10, connector_pid/1 fino a P13
+```
+
+Il difetto non è il ramo `_`. È che con quella firma **nessun chiamante può più distinguere**:
+l'informazione è stata buttata dentro la funzione, e a valle non c'è codice che possa
+recuperarla. Ogni chiamante è allora costretto a scegliere *una* condotta per tutti e tre i
+casi, e sceglie la peggiore che sia corretta per almeno uno — cioè quella permanente. Il
+risultato lo paga il chiamante **più lontano**, che è sempre lo stesso: l'apparecchiatura o il
+browser, gli unici che non possono discutere. La colonnina moriva con `EXIT=2`; il driver
+leggeva «questo connettore non è di questa stazione» di un connettore che, un secondo dopo,
+era lì.
+
+Da cui la regola generale, che è il motivo per cui questa voce esiste: **il tipo di ritorno di
+una funzione non descrive ciò che essa sa, decide ciò che i suoi chiamanti potranno sapere.**
+Collassare più esiti in un atomo solo è una perdita di informazione che avviene una volta, in
+un posto, in silenzio, e diventa irreversibile per tutto ciò che sta a valle.
+
+### E la regola di contratto, che è stata la stessa tre volte
+
+In nessuno dei tre casi è stato inventato un codice nuovo. Il codice sul filo dice al client
+**cosa fare**, non classifica la causa a beneficio nostro: se la condotta è identica — riprova
+fra poco — il codice deve essere identico, e la causa va nel `message`, che è il campo fatto
+per quello. La controprova è che in tutti e tre i giri **il client non è stato toccato**:
+`cp.js` cade da solo nel suo ramo di backoff su un `1012` e su un `accepted:false`, e `js/ws.js`
+mostra il `message` verbatim senza sapere niente di connettori e supervisori. Un codice davanti
+al quale un client che non sa nulla fa comunque la cosa giusta è la prova che quel codice dice
+ciò che intende dire.
+
+`ws-driver.md` §6 elenca ora i tre casi di `RETRY_LATER` con il messaggio che li separa — leader
+in ricostruzione, stazione in riavvio, connettore in riavvio. I primi due il codice li produceva
+**già**: il contratto ne dichiarava uno solo, ed era in ritardo di un caso senza che ce ne
+fossimo accorti. Allargarlo non è stato solo aggiungere P13, è stato allineare il documento a
+ciò che il codice faceva da prima.
+
+### Il quarto esito che qui non serve, e perché non è una svista
+
+`lookup_pid/1` ha quattro ritorni, `connector_pid/1` tre. Non è un'asimmetria da sanare: la
+prima è una **dirty read** dell'ETS e cattura il proprio `badarg` quando la tabella non esiste
+(`no_manager`); la seconda è una `gen_server:call`, e un manager assente non è un `badarg` qui
+ma un `exit({noproc, …})` sollevato **nel chiamante** — che `vs_driver_proto` cattura già e
+traduce in `no_manager` da sé. Il caso c'è in entrambe; cambia soltanto chi lo produce.
+Verificato, non dedotto: una call a un nome non registrato solleva
+`{noproc, {gen_server, call, [vs_station_mgr, …]}}`, che è esattamente la forma che lo stub dei
+test riproduce.
+
+### P12, accorpato qui perché è la stessa riga
+
+Il messaggio di `vehicle_committed` diceva «your vehicle already holds a reservation
+**elsewhere**». Falso nel primo caso in cui un driver ci si imbatte davvero — la seconda
+prenotazione sulla **stessa** stazione, due connettori più in là — e falso *solo perché era
+troppo preciso*. Tolto l'avverbio la frase è vera ovunque sia l'altra prenotazione e continua a
+fare l'unico lavoro che ha: mandare il driver ad annullare quella, invece che a provare i
+connettori uno per uno. La stessa frase stava nella colonna «Meaning shown» di `ws-driver.md`
+§4.1 ed è stata cambiata **nello stesso commit**: un test la confronta alla lettera, e un testo
+che il contratto cita e il codice non pronuncia è un contratto che ha smesso di descrivere il
+codice.

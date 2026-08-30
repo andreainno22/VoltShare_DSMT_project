@@ -92,7 +92,7 @@ Refusals — the mapping from the coordinator's answer to what the driver sees:
 | Coordinator replied | Driver receives | Meaning shown |
 |---|---|---|
 | — (connector not `free` locally) | `ALREADY_HELD` | someone else got this connector first |
-| `{error, _, already_held}` | `NO_CLAIM` | your vehicle already holds a reservation elsewhere |
+| `{error, _, already_held}` | `NO_CLAIM` | your vehicle already holds a reservation |
 | `{error, _, suspended}` | `SUSPENDED` | the account is serving a no-show penalty; walk-in charging still works |
 | `{error, _, rebuilding}` | `RETRY_LATER` | a new leader is rebuilding; try again in a few seconds |
 | unreachable, timeout, no leader | `NO_CLAIM` | reservations are unavailable right now |
@@ -249,10 +249,20 @@ This frame is the **live** copy, delivered to a driver who happens to be connect
 | `ALREADY_HELD` | the connector is held or charging for someone else |
 | `NO_CLAIM` | the network refused: vehicle committed elsewhere, or no coordinator |
 | `SUSPENDED` | account under a no-show penalty; reserving only, charging still allowed |
-| `RETRY_LATER` | a new leader is rebuilding its claim table |
+| `RETRY_LATER` | the request cannot be served this instant and can be a moment later — three cases, below |
 | `NOT_YOUR_TURN` | the connector is under a waiting-list offer to another driver |
 | `NOT_YOURS` | the reservation or session belongs to another account |
 | `INVALID_STATE` | the action does not apply in the connector's current state |
+
+`RETRY_LATER` covers three different facts, and the `message` says which:
+
+| `message` | What happened |
+|---|---|
+| `a new coordinator is rebuilding; try again shortly` | the coordinator answered `rebuilding`: a new leader has not finished rebuilding its claim table |
+| `the station is restarting` | the station's own registry is not answering — it is booting, or has just been restarted |
+| `the connector is restarting; try again in a moment` | the connector process died and its supervisor has not put it back yet. The connector **is** one of this station's: `UNKNOWN_CONNECTOR` would be a permanent answer to something that lasts an instant |
+
+One code and not three, because a code exists to tell the client **what to do**, and in all three cases that is the same thing: wait a moment and ask again. Three codes would put a piece of the station's internals into every client that reconnects, to no purpose. The cause stays in `message`, which is the field made for it and the half the page shows verbatim.
 
 An `error` is always correlated to a `request_id`: there is no such thing as a floating error. Conditions that arise on their own — a lease expiring, a claim revoked — are `notification` frames, because they are news, not answers.
 

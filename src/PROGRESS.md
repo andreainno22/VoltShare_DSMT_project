@@ -207,12 +207,12 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
 rebar3 compile                         # quattro applicazioni, nessun warning
-rebar3 eunit                           # 311 test, 0 fallimenti (29/08, dopo P10)
+rebar3 eunit                           # 333 test, 0 fallimenti (30/08, dopo P13)
 #
 # Dal 29/08 il controllo vero prima di un push è lo script, non il comando nudo.
 # Si posiziona da sé, quindi gira da qualunque directory (qui dalla radice):
 #
-#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "311 tests, 0 failures"
+#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "333 tests, 0 failures"
 #
 # `rebar3 eunit' da solo non basta: un giro può stampare "0 failures" e avere
 # ventidue test cancellati, o perderne otto dal conteggio (§7zb).
@@ -2420,6 +2420,77 @@ a zero claim. E il canale driver intatto: 8 driver in contesa su un connettore, 
 Durante la sessione la snapshot del connettore in `charging` **non conteneva alcun `claim_id`**,
 né al primo livello né dentro `session`: il divieto di avvicinare il claim id al browser è
 asserito sul sistema vivo, non promesso. Report completo in `REPORT_CLAIM_RIFLESSO.md`.
+
+## 7ze. P13 e P12: il canale driver smette di dire «non è tuo» a un connettore che sta riavviando — 30 agosto
+
+Il terzo e ultimo posto della famiglia di §7x/§7zc, chiuso. `vs_station_mgr:connector_pid/1`
+collassava in un unico `{error, unknown_connector}` due situazioni — riga col pid a `undefined`
+(connettore fra la morte e il riavvio del supervisore) e riga assente (id non di questa
+stazione) — di cui **solo la seconda è permanente**. Il canale driver rispondeva a entrambe
+`UNKNOWN_CONNECTOR`, «connector does not belong to this station», di un connettore che è di
+questa stazione e che un secondo dopo risponde.
+
+`connector_pid/1` ne restituisce ora **tre**, e il ramo `{error, no_pid}` di `with_connector/4`
+risponde `RETRY_LATER` con un messaggio proprio. Tre e non quattro come `lookup_pid/1`, ed è
+verificato e non dedotto: `connector_pid/1` è una `call`, quindi un manager assente non è un
+`badarg` da catturare nel manager ma un `exit({noproc, …})` sollevato nel **chiamante**, che
+`vs_driver_proto` traduce già in `no_manager`.
+
+**Il contratto era in ritardo di un caso prima ancora di questo lavoro.** `ws-driver.md` §6
+definiva `RETRY_LATER` come «a new leader is rebuilding its claim table», cioè un fatto del
+coordinatore; il codice lo usava **già** anche per «the station is restarting», che è un fatto
+della stazione. §6 elenca ora i tre casi con il messaggio che li separa: nessun codice nuovo,
+perché la condotta che il client deve tenere è identica in tutti e tre — e infatti nessun
+client è stato toccato.
+
+**P12**, accorpato perché è una riga dello stesso file: il messaggio di `vehicle_committed`
+perde `elsewhere`, in `vs_driver_proto` **e** nella riga corrispondente di §4.1 — un test la
+confronta alla lettera.
+
+### Le tre verifiche prima di toccare il codice
+
+1. **Bloccante — esiste un test che asserisce `UNKNOWN_CONNECTOR` per un connettore *della
+   stazione ma senza pid*?** No. Cercati per struttura tutti i match sull'atomo e sul codice:
+   `vs_driver_proto_tests:246` usa il connettore 99 contro `[1,2,3,4]`, `vs_station_mgr_tests:96`
+   il 99 contro `[{1,150},{2,50}]` — entrambi **non configurati**, quindi restano corretti — e
+   `crashed_connector_is_restarted_and_readopted_test` aspetta con un `_ -> false` senza
+   asserire nulla. Nessun test difendeva il difetto: niente da rinominare.
+2. **Qualcuno confronta la stringa `"elsewhere"`?** Sì, uno: `vs_driver_proto_tests:319`, che la
+   cita «verbatim dalla colonna Meaning shown di §4.1». Aggiornato **per progetto**, non in
+   silenzio. Le altre occorrenze fuori perimetro (`js/station.js`, `emulator/driver.js`) sono
+   commenti in prosa, non confronti.
+3. **`vs_driver_proto` è l'unico chiamante di produzione di `connector_pid`?** Sì, confermato
+   per struttura: tutti gli altri ~25 call site sono test, tutti sul percorso `{ok, Pid}`. La
+   tabella del piano era completa.
+
+**Suite: 333 test** (328 + 5), tre giri consecutivi verdi con `EXPECTED_TESTS` aggiornato nello
+stesso momento. I cinque test sono stati scritti prima del codice e visti fallire: tre
+`case_clause {error, no_pid}` dentro `with_connector/4`, due sulla stringa vecchia, uno con
+`{error, unknown_connector}` dove ci voleva `no_pid`.
+
+### E2E sul compose, prima e dopo, sulla stessa scena
+
+Compose già su (sette container). Finestra aperta come nel giro di §7zc — `sys:suspend` sul
+supervisore dei connettori e connettore ucciso — così che duri quanto la misura invece di
+millisecondi; prenotazione tentata dal canale driver vero su `ws://localhost:9101/ws/driver`.
+
+| | `connector_pid(4)` | il driver riceve |
+|---|---|---|
+| **prima** (immagine in esecuzione, `vs_station_mgr` md5 `8340a381…`) | `{error, unknown_connector}` | `UNKNOWN_CONNECTOR` — *"connector does not belong to this station"* |
+| **dopo** (immagine ricostruita, md5 `258a53aa…`) | `{error, no_pid}` | **`RETRY_LATER`** — *"the connector is restarting; try again in a moment"* |
+
+Il nodo gira davvero il codice nuovo, verificato sul posto: `beam_lib:md5` host↔container
+identico su `vs_station_mgr` (`258a53aa…`) e `vs_driver_proto` (`3fba1b84…`), ed entrambi
+diversi dai valori di prima. Con la finestra aperta le **tre** azioni del canale — `reserve`,
+`cancel_reservation`, `stop_session` — hanno risposto tutte `RETRY_LATER` con lo stesso
+messaggio: il ramo sta in `with_connector/4`, che è il motivo per cui quella funzione era stata
+fattorizzata.
+
+**Controprova del permanente:** stesso socket, connettore **99** (non configurato) →
+`UNKNOWN_CONNECTOR`, invariato. **Controprova di P12:** stesso veicolo su due connettori della
+**stessa** stazione — il caso segnalato da B — → `NO_CLAIM`, *"your vehicle already holds a
+reservation"*, senza l'avverbio. Stazione lasciata come trovata: quattro connettori `free`,
+supervisore ripreso, quattro figli.
 
 ## 9. Prossimo passo
 

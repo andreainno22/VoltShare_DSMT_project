@@ -93,7 +93,27 @@ start_link(Opts) ->
 station_state() ->
     gen_server:call(?MODULE, station_state).
 
--spec connector_pid(pos_integer()) -> {ok, pid()} | {error, unknown_connector}.
+%% @doc The connector's process, for the driver channel. Three answers,
+%% because the two errors are not the same kind of fact:
+%%
+%%   `no_pid'             row there, process not — TEMPORARY: the gap
+%%                        between a connector's death and its restart.
+%%   `unknown_connector'  row absent — PERMANENT: this id is not a
+%%                        connector of this station.
+%%
+%% P13, and the same distinction `lookup_pid/1' was given in P10, on the
+%% same table and for the same reason. What differs is who paid for the
+%% two being merged: there the charge point was closed with the permanent
+%% 4404 while its connector was restarting, here the driver was told
+%% UNKNOWN_CONNECTOR — "does not belong to this station" — about a
+%% connector that belonged to it and would answer a second later.
+%%
+%% There is no fourth answer for "the manager is not up", and that is not
+%% an omission. This is a `call': an absent manager is not a `badarg' to
+%% catch here but an `exit({noproc, …})' raised in the CALLER, and
+%% `vs_driver_proto' already turns that into `no_manager'.
+-spec connector_pid(pos_integer()) ->
+          {ok, pid()} | {error, no_pid | unknown_connector}.
 connector_pid(ConnId) ->
     gen_server:call(?MODULE, {connector_pid, ConnId}).
 
@@ -231,10 +251,13 @@ handle_continue(start_connectors, State0) ->
 handle_call(station_state, _From, State) ->
     {reply, build_state(State), State};
 
+%% The three of connector_pid/1 above, in the order the table can hold
+%% them. `[]' is the whole of the third case because ?TAB is a `set'.
 handle_call({connector_pid, ConnId}, _From, State) ->
     Reply = case ets:lookup(?TAB, ConnId) of
                 [{ConnId, _RatedKw, Pid}] when is_pid(Pid) -> {ok, Pid};
-                _ -> {error, unknown_connector}
+                [{ConnId, _RatedKw, _NoPid}]               -> {error, no_pid};
+                []                                         -> {error, unknown_connector}
             end,
     {reply, Reply, State};
 
