@@ -175,8 +175,17 @@ temporaneo.**
   avviando, connettore fra crash e restart). Ora quei casi sono **ammessi** e risponde il
   `boot` con `accepted: false` e un `reason`. Due frasi in `ws-chargepoint.md` §1 e §3.1 —
   contratto nostro, nessuna PR dovuta, ma te lo segnaliamo perché tocca cose che vedi.
-- **P13** — ancora aperto: la stessa confusione sul canale driver, dove un connettore in
-  riavvio produce `UNKNOWN_CONNECTOR` invece di `RETRY_LATER`.
+- **P13** — chiuso lo stesso giorno: la stessa confusione sul canale driver, dove un connettore
+  in riavvio produceva `UNKNOWN_CONNECTOR` («does not belong to this station») invece di
+  `RETRY_LATER`. `ws-driver.md` §6 ora allarga `RETRY_LATER` a **tre** casi con una tabella dei
+  messaggi — un codice dice al client *cosa fare*, e in tutti e tre è la stessa cosa: aspettare
+  un istante e richiedere. Tre codici avrebbero messo un pezzo dei nostri interni in ogni
+  client.
+
+Nella stessa passata è sparito il tuo `"elsewhere"` (P12) — e grazie, perché ci ha fatto
+scoprire che **la nostra scheda su quel difetto sbagliava**: dava per scontato che
+`ws-driver.md` non fissasse i testi dei messaggi, mentre §4.1 li riporta e un test li confronta
+alla lettera. Codice e contratto andavano cambiati insieme.
 
 Sta bene accanto al tuo «due domande diverse» sul `leaderNode`: lì un nome che non cambia
 scambiato per uno stato che non è cambiato; qui una condizione che passa scambiata per una che
