@@ -202,11 +202,36 @@ Poi due difetti **nostri**, misurati, che però hanno per vittima il tuo coordin
    `do_renew` ricalcola `NewExpiry` a ogni giro — giustamente — quel claim **non scade mai**: il
    veicolo resta escluso da tutta la rete, in modo permanente e silenzioso.
 
-Nessuna azione per te: la radice è lato nostro (il claim vive in un processo diverso da quello
-che possiede la prenotazione) e il rimedio lo progettiamo domani, nella direzione che hai già
-usato per le sospensioni — **chi possiede lo stato lo ripropone**. Te li segnaliamo perché il
-secondo, se ci capita in demo, si vede come un rifiuto inspiegabile del coordinatore, e ora
-sappiamo che non sarebbe colpa sua.
+**Corretti entrambi in giornata** — te li raccontiamo lo stesso, perché la lezione è comune e
+perché il secondo, se fosse capitato in demo, si sarebbe visto come un rifiuto inspiegabile del
+*tuo* coordinatore: ora sai che non sarebbe stata colpa sua.
+
+Il rimedio è nella direzione che avevi usato tu per le sospensioni — **chi possiede lo stato lo
+ripropone** — in una forma che il vostro `monitor` rende esatta invece che periodica:
+
+- il client **monitora il connettore** che ha chiesto il claim. Il pid era già lì, dentro il
+  `From` della `gen_server:call` che registra il claim (l'`acquire` gira nel processo del
+  connettore), e per tre milestone l'abbiamo scritto `_From`. Quell'underscore *era* il difetto.
+  Ora il `DOWN` rilascia il claim: fuori dalla mappa in **10 ms**, e funziona anche su `kill`,
+  cioè proprio dove `terminate/3` non viene eseguito.
+- al riavvio il client **chiede** ai connettori cosa tengono, con un cast, e loro ripresentano
+  il claim. La prima risposta alla tua `who_do_you_hold` porta già il claim col `granted_at`
+  originale, e dopo uno stop del leader la seconda stazione riceve `vehicle_committed` invece
+  del veicolo.
+
+Una cosa che potrebbe interessarti perché tocca il tuo `do_renew`: un claim **ripresentato**
+porta la scadenza che il connettore aveva copiato alla concessione, mentre tu la sposti avanti
+a ogni rinnovo — le due divergono per progetto, e una ricarica supera tranquillamente
+lease+grace. Abbiamo dovuto marcare quei claim come "non ancora confermati" e offrirli comunque
+in un batch di renew: sei tu l'unico che sa se sono ancora buoni, e ci rispondi adottandoli o
+revocandoli. Un giro basta.
+
+E scrivendolo ci siamo accorti che è la **terza** volta che il progetto impara la stessa cosa:
+il coordinatore che è un indice e non il registro (e chiede alle stazioni), il back office che
+ripropone le sospensioni al leader nuovo, e ora il claim client che riflette invece di
+ricordare. Tre livelli diversi, una regola sola: **chi possiede lo stato lo ridice a chi lo
+aggrega, e chi aggrega non prova a ricordarselo da solo.** Per la relazione è un paragrafo che
+si scrive da sé.
 
 ## 12. Demo e database non condivisi — d'accordo su tutto
 
