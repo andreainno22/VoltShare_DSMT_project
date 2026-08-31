@@ -54,6 +54,8 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | ③ Novanta secondi di inattività senza scollegarsi | ✅ **chiusa il 27/08** — **101 secondi** senza inviare nulla: socket sempre aperto, `["connecting","online"]` e nessuna riconnessione, 23 push di stato ricevuti. Il `pong` automatico tiene davvero fermo l'`idle_timeout` (60 s) di cowboy. Misurato con un client Node, che risponde ai ping esattamente come un browser |
 | ④ JWT in transito (B firma con `JwtUtil`, A verifica con `vs_jwt`) | ✅ **chiusa il 27/08** — registrato un utente vero da Tomcat, letto il `TOKEN` dalla pagina renderizzata (`sub:"1"`, `vehicle_id:1`, `iss:voltshare-backoffice`, 60 min) e usato per il `join`: accettato. È l'ultimo pezzo del confine fra le due metà, ed era l'unico mai provato |
 
+| **Suite completa dopo il merge di `a/m2-cp-touchups` (P11)** | ✅ **307 test** — misurati il 29/08 su `a/p11-suite-flake`: **stesso totale su 26 giri della suite completa**, e 0 fallimenti su 25 di quei 26 (l'unico rosso è il terzo difetto di §7zb, prima della sua correzione; dopo la correzione, 13 giri su 13 verdi). Da oggi il numero non è più una nota: `src/scripts/eunit_check.sh` lo confronta e fallisce se cambia (§7zb). **311 dal 29/08 con i quattro test di P10** (§7zc) |
+
 **Prerequisiti ancora da installare:** solo Docker Desktop. Erlang/OTP 29 (erts 17.0.5) + rebar3 3.27, JDK 17 e Maven 3.9.9 ci sono e funzionano.
 
 **PATH:** risolto il 24/08. `erl`, `erlc`, `escript` e `rebar3` si invocano direttamente sia da bash sia da PowerShell — non serve più il prefisso `export PATH="/c/Program Files/Erlang OTP/bin:$PATH"` che compariva nelle istruzioni precedenti.
@@ -205,7 +207,15 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
 rebar3 compile                         # quattro applicazioni, nessun warning
-rebar3 eunit                           # 109 test (96 stazione+common lato A, 13 coordinatore)
+rebar3 eunit                           # 333 test, 0 fallimenti (30/08, dopo P13)
+#
+# Dal 29/08 il controllo vero prima di un push è lo script, non il comando nudo.
+# Si posiziona da sé, quindi gira da qualunque directory (qui dalla radice):
+#
+#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "333 tests, 0 failures"
+#
+# `rebar3 eunit' da solo non basta: un giro può stampare "0 failures" e avere
+# ventidue test cancellati, o perderne otto dal conteggio (§7zb).
 #
 # Nota di misura (24/08, macchina A): `rebar3 eunit --app vs_coord` conta **13**
 # test, non i 22 riportati sopra per M1-B — il file ha due generatori con 13
@@ -2106,6 +2116,382 @@ Il resto delle prove non ha prodotto difetti: zero crash, zero report di supervi
   sono documentate in `src/emulator/README.md` invece di essere aggiunte a un contratto che non
   è nostro.
 
+## 7x. Due ritocchi a `ws-chargepoint.md`: `charging_seconds` e il codice della resa — 29 agosto
+
+Branch `a/m2-cp-touchups`, da `a/m2-load` (`cccf8f1`, passo 5 committato davvero — verificato con
+`git log` prima di ramificare). Questa volta **il contratto si modifica**: `ws-chargepoint.md` è
+di A da entrambi i lati, quindi niente PR, ma testo e implementazioni cambiano nello stesso
+commit. Nessun meccanismo nuovo: un campo facoltativo in più, un numero corretto.
+
+### Le tre verifiche bloccanti
+
+| Verifica | Misura | Esito |
+|---|---|---|
+| Baseline 298 test | `rebar3 eunit` (mai `--app`) su `cccf8f1` | **298 test, 0 fallimenti**. Confermata |
+| Dove sta davvero il `4404` della resa | `grep` su tutto il repo, poi lettura del commit | **c'è, ma non dove il piano lo cercava.** Il numero è in `vs_cp_proto:retry/2`, e il commento che motiva la scelta sbagliata è lì e nel doc di modulo, **non** in `vs_cp_ws` — che ha solo la citazione del 4404 di handshake, che resta giusta. Corretto dove sta |
+| Nessun test difende il comportamento sbagliato | `grep 4404` e `grep started_at` nei test | **due test lo difendevano** (sotto). Sul `started_at` di una sessione adottata: **nessuno**, e l'unica asserzione vicina (`ended_at >= started_at`, `vs_connector_tests`) regge la retrodatazione |
+
+### I due test che difendevano il difetto
+
+`vs_cp_proto_tests:five_attempts_with_no_connector_close_4404/0` e `ws_give_up_closes_the_socket/0`
+asserivano `4404` sul percorso della resa — uno sul protocollo, uno sul trasporto. Segnalati e non
+aggiustati in silenzio: il numero **è** il contenuto di quel ramo, perché è l'unica cosa che
+l'apparecchiatura dall'altra parte può leggere, quindi un test che lo asserisce non è un dettaglio
+d'implementazione ma la codifica della scelta. Rinominati in `..._1012`, con il commento che dice
+cosa asserivano prima e perché era sbagliato — che è il solo modo perché la prossima persona non
+lo rimetta a posto «com'era».
+
+### Catena dei chiamanti, cercata prima di toccare il codice
+
+| Funzione | Chiamanti | Conseguenza |
+|---|---|---|
+| `vs_connector:session_from/3` | `adopt/3`, chiamata dai **tre** ingressi in `charging`: `free`, `held`, `out_of_service` | Cambia il **dato**, non il percorso: nessuno dei tre è stato toccato, e solo un `plugged` di riconciliazione porta una durata |
+| `vs_cp_proto:authorise/5` | `with_account/4` ← `plugged/2` ← l'evento `plugged` **e** `reconcile/2` | Il replay del riaggancio passa dalla stessa funzione, ed è il motivo per cui la durata stantia va tolta lì (sotto) |
+| `vs_cp_proto:retry/2` | `handle_info(cp_reattach, ...)`, due clausole | Cambia un numero e il commento che lo motivava |
+| `#session.started_at` (letto) | `settle/1` (la riga), `build_snapshot/2` → `vs_driver_proto` (§5.2) e `vs_power:victim/1` | Tre conseguenze, tutte volute — sotto |
+| `cp.js` | — | **nessuna modifica**, che è l'argomento del ritocco 2 |
+
+**Il punto che il piano dava per scontato e che non lo era.** «Solo l'adozione deve cambiare» è
+vero come *comportamento*, non come *struttura*: la scena che conta — riavvio della stazione —
+**non** passa da `out_of_service` ma da `free`, perché una stazione che riparte lo fa con processi
+connettore nuovi, che nascono liberi. Confermato dal log della prova: `connector 3 walk-in session
+for user 12`. Legare la correzione strutturalmente a `out_of_service` avrebbe prodotto codice che
+passa i test unitari e non corregge niente sul compose.
+
+**Le tre conseguenze della retrodatazione, cercate e non subite.**
+
+1. `vs_power:victim/1` sospende **l'ultimo arrivato**, ordinando per `started_at`. Una sessione
+   adottata ora è anziana invece che appena arrivata: sotto scarsità viene sospesa **per ultima**
+   invece che per prima. È il verso giusto — un'auto che carica da un'ora *è* arrivata prima di
+   una attaccata un minuto fa — e la stabilità regge, perché `started_at` continua a essere
+   scritto una volta sola e a non cambiare più.
+2. La pagina del driver (`ws-driver.md` §5.2, campo `started_at`) mostra da quando si carica: dopo
+   un riavvio diceva «da 23 secondi» a chi caricava da un'ora, adesso dice la verità. Il contratto
+   del driver non cambia, cambia il valore che ci passa.
+3. La riga su `sessions` — il difetto che si stava chiudendo.
+
+### Verificato — girato davvero
+
+**Suite.** `rebar3 eunit` senza `--app`: **307 test, 0 fallimenti** (298 + 9 nuovi — quattro sul
+campo al confine del filo, uno sul replay che lo lascia cadere, quattro sul `started_at` delle tre
+porte).
+
+**Le due durate, sulla stessa scena.** Emulatore su conn 3, carica, `docker restart station1`,
+sessione riadottata, stacco a SoC raggiunto. Immagine ricostruita fra le due corse, stessi
+parametri, energia finale a un millesimo di distanza:
+
+| | `started_at` → `ended_at` | durata | energia | kW impliciti |
+|---|---|---|---|---|
+| **prima** (riga 1) | 13:56:54 → 13:57:59 | **65 s** | 5.956 kWh | **329.9** su una presa da 150 |
+| **dopo** (riga 3) | 08:18:20 → 08:20:48 | **148 s** | 5.957 kWh | **144.9** |
+
+Il `started_at` di dopo è **l'istante in cui il cavo è entrato** (log dell'emulatore:
+`08:18:20.465 plugged … cable in`), al secondo. I 144.9 invece di 150 sono le due rampe da cinque
+secondi (partenza e ripartenza) più i tre secondi di socket giù: fisicamente coerenti. La
+riconnessione ha portato `charging for 88s`, e il cavo era entrato 88 s prima.
+
+**La controprova.** Sessione ordinaria, nessun riavvio, stessi parametri prima e dopo:
+
+| | durata | energia | kW impliciti |
+|---|---|---|---|
+| **prima** (riga 2) | 43 s | 1.791 kWh | 149.9 |
+| **dopo** (riga 4) | 43 s | 1.791 kWh | 149.9 |
+
+Identica in ogni campo che non sia l'orologio a muro. E non è identica perché il campo non
+arriva: l'emulatore lo manda anche al primo `plugged` (`charging for 0s`), e la stazione lo legge
+come «niente da dichiarare» — quindi la controprova prova la cosa giusta, cioè che il percorso
+ordinario è inerte **con** il campo sul filo.
+
+**Il ritocco 2, prima e dopo, su un socket vero.** `CP_REATTACH_TRIES` a 1 via `os:putenv` sul
+nodo, `sys:suspend` sul supervisore dei connettori, connettore ucciso. È **la prima volta che quel
+ramo gira su un socket vero**: il passo 5 lo aveva solo nei test unitari, e lo dichiarava.
+
+* **prima** — stazione: `… did not come back in 1 attempts … - closing 4404`; emulatore: `the
+  station refused connector 3 (4404): it does not belong to station 1` → **uscita con codice 2**.
+  La sessione non viene mai riconciliata né fatturata.
+* **dopo** — stazione: `… - closing 1012`; emulatore: `disconnected (code 1012); retrying in
+  1000 ms` → si riconnette, riannuncia il cavo con `charging for 21s`, la stazione riadotta e la
+  riga viene scritta (`session 5 written: connector 3, user 12, 2.417 kWh`, uscita 0). `cp.js` non
+  è stato toccato: è la prova che il codice scelto dice quello che intende dire.
+
+### Un difetto nuovo, trovato provando questo — e non corretto
+
+Tenendo il supervisore sospeso **a tempo indefinito** (deterministico, ma non il caso vero),
+l'emulatore riceve il `1012`, si riconnette come previsto, e sull'**handshake** trova il registro
+ancora senza quel connettore: `4404`, e muore lo stesso. È lo stesso errore di P4 un gradino più
+in là: `vs_station_mgr:lookup_pid/1` collassa in un unico `{error, unknown_connector}` tre
+situazioni di cui **due sono temporanee** (manager non avviato; connettore senza pid in questo
+istante) e una sola è permanente. Segnalato in `PROBLEMI_TROVATI.md` **P10** e in
+`scelte_di_progetto.md` §18.2: tocca `vs_station_mgr`, che è fuori perimetro, ed è una terza
+decisione di contratto. Col supervisore che riparte davvero — il caso vero — non si presenta, ed è
+il motivo per cui la prova sopra è stata rifatta lasciandolo ripartire.
+
+### Ragionato, non provato — e perché
+
+- **I due residui del campo facoltativo** (`scelte_di_progetto.md` §18.1) sono *decisi* e coperti
+  da test unitari, non osservati sul compose. (a) La copia del riaggancio non riporta la durata,
+  perché è l'unico campo che invecchia: quel percorso torna al comportamento di prima. Nella prova
+  E2E non si è visto perché lì è stata la **colonnina** a rimandare il `plugged`, con un numero
+  fresco — che è il progetto, non un caso fortunato. (b) Guasti incatenati sullo stesso cavo: la
+  seconda riga porta l'energia della fetta nuova e una durata che copre tutto il cavo, quindi le
+  due righe si sovrappongono nel tempo. È il prezzo di tenere durata ed energia indipendenti, ed è
+  stato pagato consapevolmente.
+- **Una colonnina che non manda il campo** è coperta da tre test (assenza, zero, valore
+  impossibile) e da tutta la suite preesistente, ma non da una prova E2E con un emulatore
+  modificato apposta: l'unica colonnina che abbiamo ora lo manda sempre.
+- **`history.jsp`** non è stata riaperta: la riga adesso è internamente coerente, ma vederla nella
+  pagina richiede il login di B.
+- **Il fuso.** Le date sopra sono UTC in MySQL e ora locale nei log dell'emulatore; le due corse
+  cadono a cavallo della mezzanotte del 28/29 e i confronti sono fatti su durate, non su istanti.
+
+## 7zb. P11: un test che misurava la macchina, e un conteggio che può mentire — 29 agosto
+
+Segnalazione di B su cinque giri della suite (`src/contracts/risposta-per-A-m2a.md`): un giro con
+`acquire_happy_path_test` rosso per `{badmatch, {error, no_claim}}`, e un giro che contava **274
+test invece di 298**. Due difetti distinti. Report completo in `REPORT_P11.md`.
+
+**Il totale della suite è N = 307**, misurato su 26 giri della suite completa (3 di baseline, 10
+di riproduzione, 10 di chiusura più 3 di prova dello script), sempre identico.
+
+**P11-A — chiuso.** Il file di test del claim client fissava `timeout_ms => 500` per la
+`gen_server:call` verso il coordinatore. Il mock risponde in modo sincrono senza lavoro lento: se
+500 ms non bastano è perché gli scheduler sono saturi, e il test finisce per misurare la macchina
+invece del codice. Portato a 60000, con `wait_until` da 100 a 300 tentativi e l'`after` di
+`holds()` da 1 s a 5 s — stessa famiglia, costo zero sul verde.
+
+Una deviazione dal piano, misurata e ratificata: `rebar.config` dichiara `{dist_node, [{sname,
+vs}]}` e il nodo di test **è distribuito** (`node() = vs@BaLo`), quindi
+`no_coordinator_at_all_refuses_with_no_claim_test` non prende il `badarg` immediato che il piano
+gli attribuiva — paga una risoluzione DNS/epmd che fallisce come `nodedown` dopo ~2,5 s. Con
+60000 quel test sarebbe passato da 0,5 s a ~2,7 s contro i **5 s** del `?DEFAULT_TEST_TIMEOUT` di
+eunit, e un test ucciso da eunit finisce fra i *cancelled*: avremmo fabbricato noi il difetto B.
+Quel solo test tiene quindi un override esplicito a 500 ms, con il perché scritto accanto.
+
+**Un terzo difetto, trovato per strada e corretto.** Il giro 1 della baseline è fallito su
+`vs_connector_tests:an_adopted_session_is_dated_from_the_charging_seconds_test` (1 volta su 13).
+L'asserzione `?assert(StartedAt =< Before - 3600000)`, con `StartedAt` calcolato dal connettore
+come `now_ms() - 3600000`, equivale a chiedere che le due letture dell'orologio cadano nello
+**stesso millisecondo**. Tetto spostato su `vs_time:now_ms() - 3600000`, cioè letto dopo il
+fatto, come già facevano i due test gemelli dello stesso file. La proprietà asserita non cambia.
+
+**P11-B — non riprodotto, ma reso rumoroso.** Dieci giri consecutivi col report surefire attivo:
+307 ogni volta, e le liste dei singoli testcase identiche fra tutti e dieci. Non c'è quindi
+niente da attribuire a nessuno. Quello che invece è stato **misurato** è come un giro rotto
+riesce a sembrare verde, sabotando la suite apposta in tre modi diversi:
+
+| rottura | totale | `failures` | coda |
+|---|---|---|---|
+| `setup/0` di una fixture solleva | **invariato** (307) | 0 | `, 22 cancelled` |
+| `exit` nel processo di un test | **299** | 0 | `, 6 cancelled` |
+| un `_test_()` solleva mentre eunit enumera | **286** | 0 | `, 5 cancelled` |
+
+Tre lezioni: `0 failures` non vuol dire verde; il totale non è una costante della suite ma quanto
+lontano eunit è arrivato a enumerarla; e il totale da solo non basta, perché il primo caso lo
+lascia intatto. Da qui `src/scripts/eunit_check.sh`, che è verde **solo** se rebar3 esce 0 **e** il
+sommario è esattamente `307 tests, 0 failures` — ancorato, così che qualunque coda `cancelled`
+lo faccia fallire. Aggiornare quel numero è parte dell'aggiungere un test.
+
+## 7zc. P10: l'handshake diceva «mai più» per un fatto che dura un secondo — 29 agosto
+
+Il difetto lasciato aperto da §7x, chiuso. `vs_station_mgr:lookup_pid/1` collassava in un unico
+`{error, unknown_connector}` tre situazioni — tabella ETS assente (manager non ancora su), riga
+presente col pid a `undefined` (connettore fra la morte e il riavvio), riga assente (id non di
+questa stazione) — di cui **solo la terza è permanente**. L'handshake della colonnina rispondeva
+a tutte e tre col `4404` che §1 del contratto dichiara permanente, e su cui `cp.js` muore,
+correttamente.
+
+Adesso `lookup_pid/1` ne restituisce quattro (`{ok, Pid}`, `no_pid`, `no_manager`,
+`unknown_connector`), l'handshake **ammette** i due temporanei e la risposta la dà il boot con
+l'`accepted: false` di §3.1, che esisteva già: `reason` `"connector not ready"` per il
+temporaneo, `"unknown connector"` per il permanente. `cp.js` non è stato toccato — di nuovo, è
+l'argomento della scelta e non una comodità. Contratto aggiornato (§1 e §3.1) nello stesso
+commit di codice e test.
+
+Il chiamante che sarebbe morto: `vs_claim_client:revoke/2` aveva due sole clausole, `{ok, Pid}` e
+`{error, unknown_connector}`. Una revoca arrivata durante il riavvio di un connettore avrebbe
+prodotto `{error, no_pid}` → `case_clause` dentro `handle_info` → **muore il processo che tiene
+tutti i claim della stazione**. Allargata a `{error, _}`, e riprodotta prima di correggerla:
+rimettendo la clausola vecchia la suite non dice «1 rosso», dice `17 tests, 0 failures,
+6 cancelled` — la firma di §7zb, cioè esattamente il giro che `rebar3 eunit` da solo avrebbe
+fatto passare per innocuo.
+
+**Suite: 311 test** (307 + 4), tre giri consecutivi verdi con `eunit_check.sh` aggiornato nello
+stesso momento.
+
+**E2E sul compose, la scena di §7x che era rimasta rossa.** Emulatore in carica su conn 3,
+supervisore dei connettori sospeso con `sys:suspend` a tempo indefinito, connettore ucciso:
+resa `1012` (2,5 s) → riconnessione → **handshake ammesso** (`no_pid`) → boot
+`accepted:false (connector not ready)` → l'emulatore ritenta ~1/s per 45 s → `sys:resume`, il
+supervisore rifà il connettore in **10 ms** → boot accettato, `plugged` con `charging for 76s` e
+1.166 kWh già contati → sessione **riconciliata, non ricominciata** (`started_at` è l'ora del
+primo cavo) → `EXIT=0`, riga 6 in `sessions`: 13:30:08 → 13:33:19, 5.957 kWh, 268 cent.
+Controprova del permanente: emulatore su un connettore non configurato (9) → `4404`, morte
+immediata, `EXIT=2`. Report completo in `REPORT_P10.md`.
+
+## 7zd. P14 e P15: il claim smette di essere un ricordo del client — 29 agosto
+
+I due difetti misurati nel pair 1 (`REPORT_M3A_VERIFICA` §6.1 e §6.2), chiusi. Una radice sola:
+il claim vive in `vs_claim_client`, il **fatto** vive nel connettore (`#hold.claim_id`, poi
+`#session.claim_id`), e quando una delle due metà moriva l'altra non se ne accorgeva.
+
+### Le due verifiche bloccanti, prima di scrivere qualsiasi cosa
+
+**Esiste un percorso che fa riadottare un `hold` a un connettore riavviato?** No, e cercato per
+struttura: `#hold{}` è costruito in **un solo punto** (dopo un `acquire` riuscito), `held` si
+raggiunge solo da lì, `init/1` parte `free` col campo a `undefined`, `free(enter)` e
+`out_of_service(enter)` azzerano `hold` e `session`, e le due adozioni da hardware riagganciato
+passano `undefined` come claim esplicitamente. Se fosse esistito, rilasciare sul `DOWN` sarebbe
+stato sbagliato e tutto il disegno andava ripensato.
+
+**Entrambi i chiamanti di `{granted, …}` chiamano dal processo del connettore?** Sì — sono i due
+rami di `do_acquire/4`, unico chiamante `acquire/4`, invocata solo come
+`(Data#data.claim_mod):acquire(...)` dentro `free({call, From}, {reserve, …})`, che è una
+callback di `gen_statem`. Se anche uno solo avesse chiamato da un processo effimero il monitor si
+sarebbe attaccato a quello e il claim sarebbe morto subito. **Provato, non solo letto**: un test
+asserisce che il pid monitorato è quello del connettore.
+
+### Il piano si sbagliava su un punto, e non di forma
+
+Dava per scontato che il connettore avesse già i sei campi del contratto da ripresentare. Non li
+aveva: `#hold.granted_at` è l'orologio **della stazione**, `#hold.expires_at` è il **lease**
+(900 s) e non la scadenza del claim (960 s), e `#session` non aveva né l'uno né l'altro — due dei
+sei campi mancanti del tutto. Il `ClaimExpiresAt` tornava da `acquire/4` ed era **solo loggato**;
+il `GrantedAt` del coordinatore viveva solo dentro il client, e con il client moriva.
+
+Ripresentare i valori locali sarebbe stato inventarli, e avrebbe rimesso lo skew fra orologi
+dentro il confronto *oldest wins* che il PR di contratto del 24 agosto aveva eliminato. Scelta
+presa consapevolmente (opzione A): `claim_mod:acquire/4` restituisce
+`{ok, ClaimId, GrantedAt, ExpiresAt}` e il connettore tiene i due valori **del coordinatore**
+accanto ai propri. **Il contratto sul filo non cambia** — `GrantedAt` era già sul filo — cambia
+solo la giuntura interna fra connettore e claim_mod. Dettagli in `scelte_di_progetto.md` §20.4.
+
+### Cosa fa adesso
+
+**P15.** `handle_call({granted, …})` usa il `From` che ignorava: `erlang:monitor` sul chiamante,
+`reference()` nel `#claim`. Un `DOWN` rilascia il claim verso il leader (`cancelled`, una delle
+quattro parole di `claim.md` §3.3 — nessun atomo nuovo sul filo), lo toglie dalla mappa e lo
+**logga a `notice`**. Ogni altra uscita dalla mappa demonitora con `[flush]`.
+
+**P14.** `handle_continue(announce, …)` chiede: un cast `{claims_rebuild, self()}` a ogni
+connettore vivo, letto dall'ETS del manager con la lettura sporca già consentita. Chi tiene un
+claim risponde con un cast, in `held` **e in `charging`**. Nessuna chiamata sincrona in nessuna
+delle due direzioni.
+
+**La rete di sicurezza**, con il qualificatore che la rende vera: i claim scaduti non vengono
+rinnovati e escono con un `warning`, ma **solo i confermati**. Un claim ripresentato porta la
+scadenza copiata al momento della concessione, che diverge da quella vera per costruzione: senza
+il qualificatore un client che riparte durante una sessione più vecchia di sedici minuti avrebbe
+buttato il claim un tick dopo averlo ricostruito, gridando contro una stazione sana — cioè
+rimettendo in piedi §6.1 per lo stato `charging`. Il warning non è mai scattato in tutta la
+sessione E2E, che è come deve essere.
+
+**Suite: 328 test** (315 + 13), tre giri consecutivi verdi con `EXPECTED_TESTS` aggiornato nello
+stesso momento. E la prova che mordono, perché passare non basta: rotte le due correzioni
+(`DOWN` reso un no-op, domanda del rebuild tolta), il modulo dà `19 tests, 0 failures,
+3 cancelled` — la firma di §7zb, cioè il giro che `rebar3 eunit` da solo avrebbe fatto passare
+per innocuo.
+
+Un test che c'era si era **svuotato**:
+`a_revocation_while_the_connector_restarts_does_not_kill_the_client_test` (§7zc) apriva la sua
+finestra con `exit(ConnPid, kill)`, e da oggi quel kill fa sparire il claim prima che la revoca
+conti qualcosa — verde, e senza toccare più il ramo per cui era stato scritto. Riscritto perché
+il claim sopravviva al connettore, così che `revoke/2` incontri davvero il `{error, no_pid}`.
+
+### Le stesse misure del pair 1, ripetute
+
+Immagini ricostruite e container ricreati; `beam_lib:md5` host↔container identico su
+`vs_claim_client`, `vs_connector`, `vs_claim_null` e `vs_coord_srv` (quest'ultimo invariato,
+`c5393f49…`, lo stesso valore registrato dal pair 1).
+
+| | prima (pair 1) | dopo |
+|---|---|---|
+| **P15** — connettore ucciso mentre `held` | claim rinnovato ogni 10 s **per sempre**, veicolo chiuso fuori dalla rete | claim fuori dalla mappa in **10 ms**, `notice` nei log, coordinatore aggiornato |
+| il veicolo prova un altro connettore | `NO_CLAIM — your vehicle already holds a reservation elsewhere` | **`{ok, …}`** — prenota, 312 ms dopo |
+| **P14** — `exit(whereis(vs_claim_client), kill)` con un `held` vivo | `who_do_you_hold` → `{holds, 1, []}` | riavvio in **2 ms**, e la **prima** `who_do_you_hold` risponde già col claim, `granted_at` originale incluso |
+| poi `docker stop` del leader | coord2 ricostruisce con **ZERO claim**, e station2 **ottiene** lo stesso veicolo | coord2: «2 station(s) answered with **1 claim(s)**», «serving with **1 adopted claim(s)**», e station2 → **`vehicle_committed`**, connettore 5 resta `free` |
+
+**Controprova sul percorso sano**, con gli emulatori veri sui due canali WebSocket: boot della
+colonnina, prenotazione, cavo alle 17:24:59, carica a 150 kW, unplug a SoC 25. Riga **7** in
+`sessions` (12 / 1 / 3, 17:24:58 → 17:25:43, **1.876 kWh**), esattamente il
+`final energy_kwh = 1.876` stampato da `cp.js`; claim rilasciato, connettore `free`, coordinatore
+a zero claim. E il canale driver intatto: 8 driver in contesa su un connettore, 1 accettato,
+7 `ALREADY_HELD`, invariante chiusa, risposta massima 4 ms.
+
+Durante la sessione la snapshot del connettore in `charging` **non conteneva alcun `claim_id`**,
+né al primo livello né dentro `session`: il divieto di avvicinare il claim id al browser è
+asserito sul sistema vivo, non promesso. Report completo in `REPORT_CLAIM_RIFLESSO.md`.
+
+## 7ze. P13 e P12: il canale driver smette di dire «non è tuo» a un connettore che sta riavviando — 30 agosto
+
+Il terzo e ultimo posto della famiglia di §7x/§7zc, chiuso. `vs_station_mgr:connector_pid/1`
+collassava in un unico `{error, unknown_connector}` due situazioni — riga col pid a `undefined`
+(connettore fra la morte e il riavvio del supervisore) e riga assente (id non di questa
+stazione) — di cui **solo la seconda è permanente**. Il canale driver rispondeva a entrambe
+`UNKNOWN_CONNECTOR`, «connector does not belong to this station», di un connettore che è di
+questa stazione e che un secondo dopo risponde.
+
+`connector_pid/1` ne restituisce ora **tre**, e il ramo `{error, no_pid}` di `with_connector/4`
+risponde `RETRY_LATER` con un messaggio proprio. Tre e non quattro come `lookup_pid/1`, ed è
+verificato e non dedotto: `connector_pid/1` è una `call`, quindi un manager assente non è un
+`badarg` da catturare nel manager ma un `exit({noproc, …})` sollevato nel **chiamante**, che
+`vs_driver_proto` traduce già in `no_manager`.
+
+**Il contratto era in ritardo di un caso prima ancora di questo lavoro.** `ws-driver.md` §6
+definiva `RETRY_LATER` come «a new leader is rebuilding its claim table», cioè un fatto del
+coordinatore; il codice lo usava **già** anche per «the station is restarting», che è un fatto
+della stazione. §6 elenca ora i tre casi con il messaggio che li separa: nessun codice nuovo,
+perché la condotta che il client deve tenere è identica in tutti e tre — e infatti nessun
+client è stato toccato.
+
+**P12**, accorpato perché è una riga dello stesso file: il messaggio di `vehicle_committed`
+perde `elsewhere`, in `vs_driver_proto` **e** nella riga corrispondente di §4.1 — un test la
+confronta alla lettera.
+
+### Le tre verifiche prima di toccare il codice
+
+1. **Bloccante — esiste un test che asserisce `UNKNOWN_CONNECTOR` per un connettore *della
+   stazione ma senza pid*?** No. Cercati per struttura tutti i match sull'atomo e sul codice:
+   `vs_driver_proto_tests:246` usa il connettore 99 contro `[1,2,3,4]`, `vs_station_mgr_tests:96`
+   il 99 contro `[{1,150},{2,50}]` — entrambi **non configurati**, quindi restano corretti — e
+   `crashed_connector_is_restarted_and_readopted_test` aspetta con un `_ -> false` senza
+   asserire nulla. Nessun test difendeva il difetto: niente da rinominare.
+2. **Qualcuno confronta la stringa `"elsewhere"`?** Sì, uno: `vs_driver_proto_tests:319`, che la
+   cita «verbatim dalla colonna Meaning shown di §4.1». Aggiornato **per progetto**, non in
+   silenzio. Le altre occorrenze fuori perimetro (`js/station.js`, `emulator/driver.js`) sono
+   commenti in prosa, non confronti.
+3. **`vs_driver_proto` è l'unico chiamante di produzione di `connector_pid`?** Sì, confermato
+   per struttura: tutti gli altri ~25 call site sono test, tutti sul percorso `{ok, Pid}`. La
+   tabella del piano era completa.
+
+**Suite: 333 test** (328 + 5), tre giri consecutivi verdi con `EXPECTED_TESTS` aggiornato nello
+stesso momento. I cinque test sono stati scritti prima del codice e visti fallire: tre
+`case_clause {error, no_pid}` dentro `with_connector/4`, due sulla stringa vecchia, uno con
+`{error, unknown_connector}` dove ci voleva `no_pid`.
+
+### E2E sul compose, prima e dopo, sulla stessa scena
+
+Compose già su (sette container). Finestra aperta come nel giro di §7zc — `sys:suspend` sul
+supervisore dei connettori e connettore ucciso — così che duri quanto la misura invece di
+millisecondi; prenotazione tentata dal canale driver vero su `ws://localhost:9101/ws/driver`.
+
+| | `connector_pid(4)` | il driver riceve |
+|---|---|---|
+| **prima** (immagine in esecuzione, `vs_station_mgr` md5 `8340a381…`) | `{error, unknown_connector}` | `UNKNOWN_CONNECTOR` — *"connector does not belong to this station"* |
+| **dopo** (immagine ricostruita, md5 `258a53aa…`) | `{error, no_pid}` | **`RETRY_LATER`** — *"the connector is restarting; try again in a moment"* |
+
+Il nodo gira davvero il codice nuovo, verificato sul posto: `beam_lib:md5` host↔container
+identico su `vs_station_mgr` (`258a53aa…`) e `vs_driver_proto` (`3fba1b84…`), ed entrambi
+diversi dai valori di prima. Con la finestra aperta le **tre** azioni del canale — `reserve`,
+`cancel_reservation`, `stop_session` — hanno risposto tutte `RETRY_LATER` con lo stesso
+messaggio: il ramo sta in `with_connector/4`, che è il motivo per cui quella funzione era stata
+fattorizzata.
+
+**Controprova del permanente:** stesso socket, connettore **99** (non configurato) →
+`UNKNOWN_CONNECTOR`, invariato. **Controprova di P12:** stesso veicolo su due connettori della
+**stessa** stazione — il caso segnalato da B — → `NO_CLAIM`, *"your vehicle already holds a
+reservation"*, senza l'avverbio. Stazione lasciata come trovata: quattro connettori `free`,
+supervisore ripreso, quattro figli.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
@@ -2136,8 +2522,8 @@ server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il s
 `vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
 
 **M2-A è completo**: canale colonnina (§7p), allocazione della potenza (§7q), INSERT su
-`sessions` (§7s), il frame `session` con la sua pagina (§7v) e il riaggancio del socket con
-l'emulatore dei driver (§7w). La fatturazione non gira più su righe inserite a mano: l'auto
+`sessions` (§7s), il frame `session` con la sua pagina (§7v), il riaggancio del socket con
+l'emulatore dei driver (§7w) e i due ritocchi al contratto della colonnina (§7x). La fatturazione non gira più su righe inserite a mano: l'auto
 carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
 fine della sessione. Quello che resta di M2-A è la verifica del fuso in `history.jsp`, che
 richiede un browser e una password che non ho.

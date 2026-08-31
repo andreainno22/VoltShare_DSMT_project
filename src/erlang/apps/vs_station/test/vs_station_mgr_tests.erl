@@ -96,6 +96,40 @@ registry_resolves_connectors_test() ->
         ?assertEqual({error, unknown_connector}, vs_station_mgr:connector_pid(99))
     end).
 
+%% P13 — the three cases `connector_pid/1' has to tell apart, and the
+%% reason they cannot stay one: the row that carries `undefined' is
+%% TEMPORARY (the connector is ours, its supervisor is milliseconds
+%% behind), the absent row is PERMANENT (this id is not ours). Its twin
+%% `lookup_pid/1' learned the distinction in P10; this is the call side
+%% of the same registry, and the driver channel is what was paying for
+%% the two being answered alike.
+%%
+%% Deterministic by construction, not by timing: the connector supervisor
+%% is held with `sys:suspend' so it cannot restart the child, which is how
+%% vs_claim_client_tests forces the same window. The wait is on the
+%% registry reaching the state under test — row there, pid not — and not
+%% on the kill, so a failure here is an answer that is wrong rather than
+%% one that was read too early.
+connector_pid_tells_the_three_cases_apart_test() ->
+    with_station(fun() ->
+        {ok, Pid} = vs_station_mgr:connector_pid(1),
+        ok = sys:suspend(vs_connector_sup),
+        try
+            exit(Pid, kill),
+            wait_until(fun() ->
+                               {error, no_pid} =:= vs_station_mgr:lookup_pid(1)
+                       end),
+            ?assertEqual({error, no_pid}, vs_station_mgr:connector_pid(1)),
+            %% the permanent one did not move with it
+            ?assertEqual({error, unknown_connector}, vs_station_mgr:connector_pid(99))
+        after
+            %% a suspended supervisor would queue the fixture's own
+            %% shutdown too, and stop_station would sit there until eunit
+            %% cancelled the group
+            ok = sys:resume(vs_connector_sup)
+        end
+    end).
+
 %%%===================================================================
 %%% aggregate state
 %%%===================================================================

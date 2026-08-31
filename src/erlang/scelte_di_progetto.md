@@ -1008,10 +1008,10 @@ L'unica cosa che il suo riavvio costa sono le righe ancora in coda dentro di lui
 di perdita di §13.1, e il `terminate/2` la scrive nel log riga per riga invece di lasciarla
 scoprire dopo.
 
-> **Un limite di questa riga, misurato dopo.** Per una sessione che attraversa un riavvio della
-> stazione l'energia è giusta e la **durata no**: `started_at` finisce per essere l'istante
-> dell'adozione, non quello del cavo. Il fatto, il perché e la direzione per chiuderlo stanno
-> in §16.8.
+> **Un limite di questa riga, misurato dopo e poi chiuso.** Per una sessione che attraversava un
+> riavvio della stazione l'energia era giusta e la **durata no**: `started_at` finiva per essere
+> l'istante dell'adozione, non quello del cavo. Il fatto e il perché stanno in §16.8, la
+> correzione — una durata che arriva dall'hardware, mai un istante — in §18.1.
 
 ---
 
@@ -1471,16 +1471,40 @@ overstay: nessuna delle due date entra nel calcolo, verificato leggendo il metod
 qualunque lettura di `ended_at - started_at` come «tempo di ricarica», che è una cosa che
 qualcuno prima o poi farà.
 
-**La direzione, concordata e non implementata.** Al `plugged` di riconciliazione la colonnina
-aggiunge **da quanti secondi sta erogando**, e la stazione ricostruisce `started_at` con il
-proprio orologio sottraendoli. La forma è scelta apposta: l'hardware fornisce una **durata**,
-che è un dato fisico misurato da lui, non un orario — quindi §7.4 («i timestamp che contano
-sono quelli della stazione, l'orologio della colonnina è una comodità») resta rispettata alla
-lettera, e due macchine con orologi diversi continuano a non doversi accordare.
+**Chiuso.** Al `plugged` di riconciliazione la colonnina aggiunge `charging_seconds`, **da
+quanti secondi sta erogando**, e la stazione ricostruisce `started_at` con il proprio orologio
+sottraendoli.
 
-`ws-chargepoint.md` è di A da entrambi i lati, quindi la modifica non richiede una PR. **Non si
-fa adesso:** prima il passo 5 (emulatore dei driver e prove di carico), poi un pair piccolo per
-chiuderla. Il passo 4 aggiunge un frame, non rimaneggia il contratto della colonnina.
+**Perché una durata è ammissibile dove un istante non lo sarebbe** — è il punto della
+correzione, non un dettaglio della sua forma. §7.4 non dice «la colonnina non mandi dati»: dice
+che i timestamp che contano sono quelli della stazione, perché un orario prodotto dalla
+colonnina obbligherebbe due orologi a essere d'accordo su *che ora è*, e non lo sono. Una
+durata non chiede niente del genere. È una grandezza che l'hardware ha **misurato**, della
+stessa specie di `energy_kwh` — che il contratto gli fa già mandare e sul quale gli crede senza
+esitazioni, perché è l'unico che l'abbia contata. La stazione legge il proprio orologio e
+sottrae: due macchine sfasate di dieci minuti scrivono la stessa riga. Un `started_at` assoluto
+mandato dall'hardware, esattamente sulla stessa informazione, ne scriverebbe due diverse. La
+distinzione fra durata e istante è ciò che tiene la modifica dentro §7.4 alla lettera, non un
+cavillo per farcela entrare.
+
+Ed è misurata dallo stesso istante da cui è contata l'energia — il cavo che entra — quindi i
+due numeri della riga coprono la stessa finestra: è questo che li rende coerenti fra loro, che
+era tutto il problema.
+
+Il campo è **facoltativo e resta tale**: assente o non positivo, `started_at` è l'istante
+dell'adozione e la stazione si comporta come prima che il campo esistesse. Una colonnina che
+non sa rispondere non è una colonnina rotta, ed è la ragione per cui il contratto dichiara di
+essere implementabile da hardware vero (§7 del SCOPE).
+
+**Scartate.** Far mandare all'hardware un `started_at` assoluto: è il caso di sopra, due
+orologi che devono accordarsi. Dedurre la durata dall'energia e dalla potenza nominale: darebbe
+un numero plausibile e **falso** — plausibile è peggio, perché un numero visibilmente sbagliato
+si trova, uno verosimile no.
+
+`ws-chargepoint.md` è di A da entrambi i lati, quindi la modifica non ha richiesto una PR. Cosa
+è cambiato e cosa sopravvive: §18.1. Misurato sulla stessa scena, prima e dopo:
+**65 s contro 148 s** per 5,956 e 5,957 kWh, cioè **329,9 kW impliciti contro 144,9** su una presa
+da 150.
 
 ---
 
@@ -1627,11 +1651,14 @@ una configurazione sbagliata, e riprovare all'infinito una configurazione sbagli
 ciclo. Ma vuol dire che l'ipotesi «lascia riconnettere la colonnina col suo backoff» **è falsa
 per il nostro emulatore su quel percorso**.
 
-Segnalato e non corretto: `cp.js` è fuori dal perimetro di questo passo, e la scelta fra
-«cambiare il codice della resa» e «insegnare a `cp.js` a distinguere il 4404 dell'handshake da
-quello a metà vita» è una decisione di contratto, che è di Caleb. Il percorso è comunque quasi
-irraggiungibile — richiede che il supervisore abbia rinunciato del tutto — e nelle prove non è
-mai stato imboccato.
+Segnalato e non corretto **allora**: `cp.js` era fuori dal perimetro di quel passo, e la scelta
+fra «cambiare il codice della resa» e «insegnare a `cp.js` a distinguere il 4404 dell'handshake
+da quello a metà vita» è una decisione di contratto, che è di Caleb.
+
+**Deciso poi, e nel primo dei due modi: §18.2.** La resa chiude `1012`, `cp.js` non è stato
+toccato. Il percorso, che qui era descritto come «quasi irraggiungibile» e non era mai stato
+imboccato nelle prove, è stato poi forzato apposta su un socket vero: l'emulatore moriva
+davvero, e l'errore era per intero dalla parte della stazione.
 
 ### 17.8 L'emulatore dei driver: perché firma i token da sé
 
@@ -1722,3 +1749,459 @@ docker logs --since 5m station1 | grep -B1 "ping vs@" | grep NOTICE
 Due timestamp consecutivi a più di sei secondi vogliono dire che la VM si è fermata, e quella
 corsa va rifatta invece che spiegata. Tutti i **tempi** riportati per il passo 5 sono stati
 presi con questo controllo eseguito **dopo** la corsa, e nessuno di essi attraversa una pausa.
+
+---
+
+## 18. Due ritocchi al contratto della colonnina (M2-A, dopo il passo 5)
+
+Due modifiche piccole a `ws-chargepoint.md`, e nessuna delle due introduce un meccanismo: una
+aggiunge un campo facoltativo, l'altra corregge un numero. Sono qui insieme perché condividono
+la stessa regola di lavorazione — il contratto è di A da entrambi i lati, quindi cambia senza
+PR, ma **testo e implementazioni cambiano nello stesso commit**. Un contratto che descrive un
+campo che il codice non manda è peggio di nessuno dei due: il primo si scopre provando, il
+secondo si scopre leggendo, e leggere è quello che fa chi arriva dopo.
+
+### 18.1 `charging_seconds`: dove entra, e le due cose che non tocca
+
+Il fatto, la misura e la ragione per cui una **durata** è ammissibile dove un **istante** non lo
+sarebbe stanno in §16.8, dove il difetto era stato annotato. Qui c'è cosa è cambiato.
+
+Il campo entra in un punto solo. `vs_cp_proto` lo legge dal payload del `plugged` e lo mette
+nella mappa `Info` **solo se è positivo e sottraendolo non si finisce prima dell'epoca**;
+altrimenti la chiave non c'è. `vs_connector:session_from/3` calcola `started_at` da quella
+chiave se c'è, dall'orologio se non c'è. Nessun'altra data cambia.
+
+**Perché la chiave si aggiunge invece di avere un default a zero.** È la differenza fra una
+promessa strutturale e una convenzione. Con un default, ogni payload costruirebbe una mappa che
+*contiene* il campo, e nulla impedirebbe a un percorso futuro di leggerlo credendolo sempre
+significativo; senza, un `plugged` ordinario costruisce **la stessa mappa, chiave per chiave**,
+che costruiva prima che il campo esistesse, e la facoltatività è una proprietà del codice invece
+che di una riga di documentazione. Il test lo asserisce come assenza della chiave, non come
+zero, apposta.
+
+**I tre ingressi in `charging`, e perché solo l'adozione cambia.** `free`, `held` e
+`out_of_service` passano tutti da `adopt/3` → `session_from/3`, e nessuno dei tre è stato
+toccato: cambia il **dato**, non il percorso. Solo un `plugged` di riconciliazione porta una
+durata, perché è l'unico che la colonnina abbia motivo di mandare. Il punto meritava una
+verifica e non un'assunzione: la scena che conta — riavvio della stazione — **non** passa da
+`out_of_service` ma da `free`, perché una stazione che riparte lo fa con processi connettore
+**nuovi**, che nascono liberi. Legare la correzione strutturalmente a `out_of_service` avrebbe
+prodotto codice che supera i test unitari e non corregge niente sul compose.
+
+**Non è accoppiato a `energy_offset` (§14.2), e non deve diventarlo.** L'offset risponde a
+«quanto di questo cumulativo appartiene a una riga che esiste già», la durata risponde a «quando
+è cominciata l'erogazione»: sono due domande diverse e nessuna delle due si deduce dall'altra.
+Stanno affiancate e non si leggono a vicenda.
+
+**Cosa sopravvive, e va detto.** Due residui, entrambi noti e nessuno dei due chiuso qui.
+
+1. **La copia del riaggancio non riporta la durata.** Quando muore il *connettore* sotto un
+   socket vivo (§17.4), il socket rigioca il `plugged` che aveva messo da parte. Ogni campo di
+   quella copia regge la traduzione tranne questo: l'energia si aggiorna dal `meter` arrivato
+   un attimo prima, una durata non si aggiorna da niente e nel frattempo è cresciuta di quanto
+   la copia è rimasta lì. Rigiocarla daterebbe la sessione troppo tardi di esattamente quel
+   tanto — un numero plausibile e falso, che è la cosa che §16.8 sceglie di evitare. Viene
+   tolta, e quel percorso torna al comportamento di prima (`started_at` = istante
+   dell'adozione). Chiuderlo vorrebbe dire che il socket si annota **quando** ha ricevuto il
+   frame: un pezzo di stato in più sul confine più delicato del milestone, per un percorso che
+   l'hardware non vede nemmeno. Non adesso.
+2. **Guasti incatenati sullo stesso cavo.** Se una sessione è già stata chiusa con il cavo
+   dentro (§14.2, D-1) e la successiva adotta con un offset, l'energia della seconda riga è la
+   fetta nuova mentre la durata che l'hardware dichiara copre **tutto** il cavo: le due righe si
+   sovrappongono nel tempo. È il prezzo di tenere le due grandezze indipendenti, ed è stato
+   pagato consapevolmente. Chiuderlo vorrebbe dire ricordare *fino a quando* si è fatturato, non
+   solo *quanto*: un secondo offset, e un meccanismo nuovo dove questo lotto chiude difetti.
+
+### 18.2 La resa del riaggancio chiude `1012`, e l'emulatore non si tocca
+
+Il difetto è in §17.7: la resa chiudeva `4404`, e `cp.js` su `4404` muore. La correzione è di
+una cifra, ma la ragione è la parte che conta.
+
+`4404` è **permanente**: §1 gliel'ha assegnato all'handshake, dove significa «questo connettore
+non è di questa stazione», e su una configurazione sbagliata riprovare all'infinito è un ciclo.
+Una colonnina che lo tratta come fatale sta obbedendo al contratto, non sbagliando. La resa del
+riaggancio è **temporanea**: un processo connettore è morto e il suo supervisore è indietro. Il
+piano del passo 5 aveva riusato il codice permanente per una condizione passeggera, e la frase
+con cui quel ramo si chiudeva — «the charge point will reconnect» — era falsa contro l'unica
+colonnina che abbiamo.
+
+`1012` (Service Restart) è il codice standard per «torna, sto ripartendo». La scelta però non è
+stata fatta soltanto perché il nome è quello giusto: **`cp.js` non è stato toccato**, e questo è
+l'argomento. Un `1012` cade da solo nel suo ramo generico di riconnessione con backoff, che
+esisteva già e non sa niente di connettori e supervisori. Un codice che obbliga il client a
+imparare un caso speciale della stazione è un codice scelto male; uno di fronte al quale un
+client che non sa niente fa la cosa giusta da sé è la prova che dice quello che intende dire.
+L'alternativa — insegnare a `cp.js` a distinguere il `4404` dell'handshake da quello a metà
+vita — è stata scartata proprio per questo: avrebbe messo nell'emulatore una conoscenza che
+l'hardware vero non ha nessun motivo di avere, e avrebbe lasciato il contratto a dire una cosa
+falsa.
+
+Il percorso, che §17.7 dava per «quasi irraggiungibile» e mai imboccato nelle prove, è stato
+forzato apposta su un socket vero prima e dopo la correzione (`CP_REATTACH_TRIES` a 1,
+supervisore sospeso con `sys:suspend`, connettore ucciso): prima l'emulatore usciva con codice
+2, dopo si riconnette col backoff, riannuncia il cavo e la sessione viene fatturata. È la prima
+volta che quel ramo gira su un socket vero — il passo 5 lo aveva solo nei test unitari.
+
+**Ha trovato un terzo posto dove lo stesso errore è ancora dentro**, e non è stato corretto qui.
+Tenendo il supervisore sospeso *a tempo indefinito* — che non è il caso vero, ma è quello che
+rende la prova deterministica — l'emulatore riceve il `1012`, si riconnette come previsto, e
+sull'**handshake** trova il registro ancora senza quel connettore: `4404`, e muore lo stesso.
+`vs_station_mgr:lookup_pid/1` collassa in un solo `{error, unknown_connector}` tre situazioni di
+cui due sono temporanee (manager non avviato, connettore senza pid in questo istante) e una sola
+è permanente (id che non è di questa stazione), e il socket manda il codice permanente a tutte e
+tre. È `PROBLEMI_TROVATI.md` P10: tocca `vs_station_mgr`, che è fuori perimetro, ed è una terza
+decisione di contratto — la risposta giusta probabilmente esiste già in §3.1 (`accepted: false`
+con un `reason`, «the charge point closes and retries with backoff») e non richiede un codice
+nuovo. Segnalata e lasciata a chi decide il contratto, come §17.7 aveva fatto con questa.
+
+**Decisa e chiusa lo stesso giorno: §18.3.**
+
+### 18.3 L'handshake ammette il temporaneo, e a rispondere è il boot (P10)
+
+Il terzo posto che §18.2 aveva trovato e lasciato aperto. `vs_station_mgr:lookup_pid/1`
+collassava tre situazioni in un `{error, unknown_connector}` solo, e l'handshake della colonnina
+mandava a tutte e tre il `4404` che §1 destina al permanente. Adesso ne dice quattro:
+
+| ETS | ritorno | natura |
+|---|---|---|
+| riga con pid vivo | `{ok, Pid}` | — |
+| riga con `undefined` | `{error, no_pid}` | temporanea: fra il DOWN e il restart |
+| tabella assente (`badarg`) | `{error, no_manager}` | temporanea: manager non ancora su |
+| riga assente | `{error, unknown_connector}` | **permanente**: non è di questa stazione |
+
+La distinzione è pulita e non ha finestre grigie perché `init/1` inserisce **tutti** i connettori
+configurati con pid `undefined` prima di qualunque altra cosa, e il `DOWN` rimette `undefined`
+invece di cancellare la riga: una riga che c'è vuol dire "questo connettore è mio" per tutta la
+vita di quel manager.
+
+**La correzione non inventa un meccanismo, ne toglie uno di troppo.** I due temporanei sono
+*ammessi* all'handshake e la risposta la dà il `boot`, cioè l'unico punto del contratto che sa
+già dire «non adesso» senza dire «mai più»: `accepted: false` con un `reason`, e «the charge
+point closes and retries with backoff». Il ramo esisteva dal passo 5 e ci si arrivava quasi mai;
+oggi è la strada normale del riavvio di un connettore. Il `reason` distingue i due casi —
+`"connector not ready"` contro `"unknown connector"` — ed è l'unica parte del rifiuto che
+l'apparecchiatura legge.
+
+Il `4404` torna a essere esattamente ciò che §1 dichiara e nient'altro, e il `logger:notice` che
+lo accompagna («not a connector of station N») smette di mentire in due casi su tre. Come per il
+`1012` di §18.2, **`cp.js` non è stato toccato**: un `accepted: false` cade da solo nel suo ramo
+di chiusura-e-backoff, che non sa niente di supervisori.
+
+**Il chiamante che la modifica avrebbe ucciso, e che il piano aveva ragione a cercare.**
+`vs_claim_client:revoke/2` faceva `case vs_station_mgr:lookup_pid(...)` con **due sole clausole**.
+Allargare il tipo di ritorno senza toccarlo avrebbe fatto sì che una revoca del coordinatore
+arrivata durante il riavvio di un connettore producesse un `case_clause` dentro `handle_info`, e
+morisse il processo che tiene *tutti* i claim della stazione. Vale la pena scriverlo perché è il
+tipo di danno che una modifica "innocua" fa: nessuna delle due funzioni è sbagliata da sola.
+Riprodotto prima di correggerlo, e la forma del rosso è quella di §19.1 — `17 tests, 0 failures,
+6 cancelled`, non «1 fallimento».
+
+**Il backoff piatto dell'emulatore nel giro del boot rifiutato — osservato, accettato, non
+corretto.** `cp.js` azzera `backoffMs` in `onOpen`, e nel giro "connetti → boot rifiutato →
+chiudi" la connessione **riesce** ogni volta: quindi il backoff non cresce mai e l'emulatore
+ritenta a ~1/s finché il connettore non torna (misurato: 45 riconnessioni in 45 s). Non è un
+difetto del contratto — §6.1 parla del backoff della *riconnessione*, e la riconnessione qui
+riesce davvero — ed è l'emulatore, non l'hardware: una colonnina vera fa §3.1 per conto suo.
+Correggerlo vorrebbe dire insegnare a `cp.js` a distinguere "aperto" da "aperto e servito", che
+è la stessa conoscenza speciale della stazione che §18.2 ha rifiutato di metterci dentro.
+Annotato e basta.
+
+## 19. La suite come asserzione (P11)
+
+Due decisioni prese il 29/08 dopo la segnalazione di B — un giro rosso su
+`acquire_happy_path_test` e un giro che contava 274 test invece di 298. Misure e
+sabotaggi in `REPORT_P11.md`.
+
+### 19.1 Il conteggio dei test è un'asserzione, non una nota
+
+`rebar3 eunit` non dice se il giro è andato bene. Provato rompendo la suite apposta in tre
+modi diversi, su questo albero:
+
+| rottura controllata | totale | `failures` | coda del sommario | exit |
+|---|---|---|---|---|
+| il `setup/0` di una fixture solleva | **invariato** (307) | 0 | `, 22 cancelled` | 1 |
+| un `exit` nel processo di un test | **299** | 0 | `, 6 cancelled` | 1 |
+| un `_test_()` solleva mentre eunit **enumera** | **286** | 0 | `, 5 cancelled` | 1 |
+
+Tre cose che non si sapevano e che cambiano il rito:
+
+1. **`0 failures` non vuol dire verde.** Lo stampa anche un giro che ha perso ventidue test.
+   La parola che conta è quella dopo, e non c'è quando tutto va bene.
+2. **Il totale non è una costante della suite**: è quanto lontano eunit è arrivato a
+   *enumerare* l'albero dei test. Un'eccezione dentro una funzione generatrice ferma
+   `eunit_data:iter_next/1` e fa sparire dal conteggio molti più test di quanti ne contenesse
+   quel generatore — 21 per un generatore da 6.
+3. **Il totale da solo non basta**: il primo caso lo lascia a 307.
+
+Da qui `src/scripts/eunit_check.sh`, che è verde **solo** se rebar3 esce 0 **e** il sommario è
+esattamente `307 tests, 0 failures`, ancorato a fine riga così che qualunque coda `cancelled`
+o `skipped` lo faccia fallire. Il numero sta scritto in testa allo script e aggiornarlo è
+parte dell'aggiungere un test.
+
+L'alternativa scartata era documentare il totale solo in `PROGRESS.md`. È dove stava già, ed è
+esattamente il motivo per cui B ha dovuto contare a occhio: un numero che nessuno confronta
+automaticamente non è un'asserzione, è una speranza.
+
+### 19.2 Il timeout di una chiamata di test non deve poter scattare
+
+`vs_claim_client_tests` teneva `timeout_ms => 500` per la `gen_server:call` verso il
+coordinatore. Il mock risponde in modo sincrono dal proprio `handle_call`, senza lavoro lento:
+se 500 ms non bastano non è il codice a essere lento, sono gli scheduler a essere saturi — e
+`call_one` traduce il timeout in `unreachable`, la lista dei nodi si esaurisce e il test riceve
+`{error, no_claim}`. Il test misurava la macchina. Portato a 60000: nessun percorso di quel
+file **aspetta** davvero, perché i rifiuti arrivano come risposte esplicite e i nodi morti come
+`noproc` — il valore serve solo a rendere impossibile che lo scheduling lo faccia scattare.
+
+Lo stesso ragionamento vale per i due altri orologi del file, che sono **retry limitati e non
+asserzioni sul tempo**: `wait_until` esce alla prima verità, quindi il suo tetto (da 100 a 300
+tentativi) non si paga sul verde, e l'`after` di `holds()` (da 1 s a 5 s) è raggiungibile solo
+in un giro già rosso. Alzarli non rallenta niente e toglie il prossimo flake della stessa
+famiglia.
+
+**C'è però un'eccezione, ed è il motivo per cui la regola va scritta con il suo limite.**
+`rebar.config` dichiara `{dist_node, [{setcookie, voltshare}, {sname, vs}]}`, e il provider
+`eunit` di rebar3 lo onora: il nodo di test **è distribuito** (`node() = vs@<host>`). Quindi
+`no_coordinator_at_all_refuses_with_no_claim_test`, che chiama `'nonexistent@nowhere'`, non
+prende il `badarg` immediato che il commento in `call_one` promette per i nodi non distribuiti:
+paga una risoluzione DNS/epmd che fallisce come `nodedown` dopo ~2,5 s. Misurato:
+
+| `timeout_ms` | esito | durata |
+|---|---|---|
+| 500 | `{timeout, …}` | 511 ms |
+| 5000 | `{nodedown, nonexistent@nowhere}` | 2278 ms |
+| 60000 | `{nodedown, nonexistent@nowhere}` | 2704 ms |
+
+L'esito del test è lo stesso nei tre casi — `call_one` fa `catch _:_ -> unreachable` — ma la
+durata no, e eunit uccide un singolo test dopo **5000 ms** (`?DEFAULT_TEST_TIMEOUT`,
+`eunit_internal.hrl:38`), mettendolo fra i *cancelled*, cioè togliendolo dal conteggio. Alzare
+il timeout **anche lì** avrebbe fabbricato il difetto B con le nostre mani.
+
+Quel solo test tiene quindi un override esplicito a 500 ms. La regola completa è: *il timeout
+di una chiamata di test non deve poter scattare per scheduling; dove la chiamata è fatta apposta
+per non raggiungere nessuno, il timeout diventa un tetto deterministico su una latenza che non
+controlliamo, e va tenuto ben sotto i 5 s di eunit.*
+
+---
+
+## 20. Il claim non è un ricordo del client, è il riflesso di ciò che i connettori possiedono (P14 + P15)
+
+### 20.1 Le due metà non si vedevano morire
+
+Il claim vive in `vs_claim_client`, ma il **fatto** vive nel connettore: `#hold.claim_id` prima
+che il cavo entri, `#session.claim_id` dopo. Fino al 29 agosto nessuna delle due metà si
+accorgeva della morte dell'altra, e ognuna delle due direzioni era un difetto suo, misurato
+(`REPORT_M3A_VERIFICA` §6.1 e §6.2):
+
+- **muore il client** → riparte con `claims = #{}`, risponde a `who_do_you_hold` con niente, e
+  alla prima elezione il coordinatore nuovo ricostruisce da un client che non sa più nulla:
+  lo stesso veicolo si ritrova con due prenotazioni su due stazioni. È l'invariante di uso
+  esclusivo di `SCOPE` §4 — la ragione per cui il coordinatore esiste — rotta in 53 secondi
+  da un `exit/2`;
+- **muore un connettore** → il client conserva un claim che non ha più proprietario e lo
+  rinnova ogni 10 s. Siccome il coordinatore ricalcola `NewExpiry` a ogni giro, quel claim
+  **non scade mai**: un veicolo chiuso fuori da tutta la rete, per sempre.
+
+La radice è una sola, e la correzione è la stessa frase detta nelle due direzioni: **il claim
+non è un ricordo del client, è il riflesso di ciò che i connettori possiedono.** È la lezione
+del rebuild del coordinatore («il coordinatore è un indice, non il registro») applicata un
+livello più in basso.
+
+### 20.2 Il `monitor` invece del soft state, e perché
+
+La direzione pensata inizialmente era la ripresentazione periodica: ogni connettore ricasta il
+proprio claim ogni N secondi, il client tiene ciò che ha sentito di recente. È il modello con
+cui B ha chiuso le sospensioni, e funziona.
+
+Il `monitor` fa la stessa cosa meglio, e il confronto vale la pena di essere scritto perché la
+differenza non è di efficienza:
+
+| | monitor + domanda all'avvio | ripresentazione periodica |
+|---|---|---|
+| connettore morto | chiuso **nell'istante** del `DOWN` | chiuso dopo N periodi di silenzio |
+| client riavviato | chiuso al primo `handle_continue` | chiuso al primo periodo |
+| traffico a regime | **zero** | un giro di cast per periodo, per sempre |
+| rischio nuovo | nessuno: il `DOWN` è un fatto | un connettore vivo ma **lento** viene letto come morto, e il suo claim rilasciato per errore |
+
+L'ultima riga decide. Il soft state ha bisogno di un timeout, e un timeout su un processo
+locale è **una misura della macchina, non del fatto** — la stessa lezione di P11 (§19). Il
+`monitor` è la primitiva che Erlang offre proprio per non doverlo indovinare, e arriva anche
+su `exit(Pid, kill)`, che è precisamente il caso in cui `terminate/3` non viene eseguito, cioè
+il buco misurato in §6.2.
+
+La domanda all'avvio è l'altra metà, e ha un verso preciso: **la fa chi ha perso lo stato**,
+una volta sola, in `handle_continue`. Un cast `{claims_rebuild, self()}` a ogni connettore
+vivo; chi tiene un claim risponde con un cast che porta i sei campi. Nessuna chiamata sincrona
+in nessuna delle due direzioni, quindi la regola strutturale di §4.4 regge intatta: i pid dei
+connettori si leggono dall'ETS del manager con la stessa lettura sporca che il modulo già
+dichiara consentita.
+
+### 20.3 La conseguenza dichiarata: il claim è legato alla vita del processo connettore
+
+Questo è un cambio di semantica, non un dettaglio implementativo, e va scritto come tale.
+
+**Da oggi un claim muore quando muore il processo che lo ha chiesto.** Se un connettore crasha
+e riparte *durante una sessione di ricarica con prenotazione*, il claim viene rilasciato.
+
+È coerente con quello che il sistema già faceva: §17.5 dice che una sessione che torna dopo la
+morte del connettore **è un walk-in**, e che ricostruire la prenotazione è deliberatamente non
+tentato (§6 del contratto colonnina: «l'auto continua a caricare, la sessione è fatturata, la
+prenotazione è persa»). Il claim seguiva quella prenotazione: rilasciarlo mette il coordinatore
+d'accordo con la stazione invece di lasciarli divergere.
+
+Ed è corretto perché **non esiste un percorso che riadotti un `hold`**. Verificato per
+struttura, non per lettura: `#hold{}` viene costruito in **un solo punto**
+(`vs_connector.erl`, dentro `free({call, From}, {reserve, …})`, dopo un `acquire` riuscito),
+`held` si raggiunge da lì e da nessun altro posto, `init/1` parte `free` col campo a
+`undefined`, e le due adozioni da hardware riagganciato passano `undefined` come claim
+esplicitamente. Se un giorno qualcuno scrive una riadozione, **questa scelta va ripensata**, e
+la riga sopra è il posto in cui accorgersene.
+
+### 20.4 I sei campi non c'erano: `claim_mod:acquire/4` ne restituisce quattro
+
+Il piano dava per scontato che il connettore avesse già i sei campi del contratto da
+ripresentare. Non era vero, e la differenza non era di forma:
+
+- `#hold.granted_at` è `vs_time:now_ms()` **della stazione**, preso dopo l'`acquire`; il
+  `GrantedAt` del coordinatore non arrivava mai al connettore;
+- `#hold.expires_at` è la scadenza del **lease** (900 s), non quella del claim (960 s);
+- `#session` non aveva né l'uno né l'altro: due dei sei campi mancavano del tutto.
+
+Il `ClaimExpiresAt` tornava da `acquire/4` e veniva **solo loggato**. Il `GrantedAt` viveva
+solo dentro il client — e con il client moriva.
+
+Ripresentare i valori locali sarebbe stato inventarli, ed è esattamente ciò che il PR di
+contratto del 24 agosto aveva eliminato: `claim.md` §5.5 decide *oldest wins* su `GrantedAt`, e
+`vs_coord_srv:renew_one/4` usa il valore riportato dalla stazione **nei due rami di adozione**,
+cioè proprio nella finestra di failover. Un orologio di stazione al posto di quello del
+coordinatore avrebbe rimesso lo skew fra macchine dentro il confronto.
+
+Quindi `claim_mod:acquire/4` restituisce `{ok, ClaimId, GrantedAt, ExpiresAt}` e il connettore
+tiene i due valori **del coordinatore** accanto ai propri (`claim_granted_at`,
+`claim_expires_at`), copiandoli in `#session` al passaggio `held → charging`. **Il contratto
+sul filo non cambia**: `GrantedAt` era già sul filo, cambia solo la giuntura interna fra
+connettore e claim_mod — la stessa che rende `vs_claim_null` sostituibile.
+
+Quattro campi tempo in due coppie, ed è bene che i nomi lo dicano: `granted_at`/`expires_at`
+sono la **prenotazione della stazione** (questo orologio, il lease che il driver vede, il timer
+di `held`), `claim_granted_at`/`claim_expires_at` sono il **claim del coordinatore**, copiati e
+mai toccati.
+
+### 20.5 La rete di sicurezza, e il qualificatore che la rende vera
+
+Nel `renew_tick` i claim già scaduti non vengono rinnovati: escono dalla mappa e la loro uscita
+è un **`warning`**, perché in una stazione sana non deve succedere mai e una difesa che
+silenzia è peggio del difetto rumoroso.
+
+Ma «mai» è una parola che va guadagnata. Il connettore ripresenta la scadenza che aveva
+copiato **quando il claim è stato concesso**, e nel frattempo il coordinatore l'ha spostata in
+avanti ogni dieci secondi: le due divergono per costruzione. Una sessione di ricarica supera
+lease+grace (960 s) di routine, quindi senza qualificatore un client che riparte durante una
+qualsiasi sessione più vecchia di sedici minuti avrebbe ricostruito il claim e l'avrebbe
+buttato un tick dopo, gridando contro una stazione perfettamente sana — cioè rimettendo in
+piedi il difetto di §6.1 per lo stato `charging`, che è esattamente quello che questo lavoro
+doveva chiudere.
+
+Perciò il `#claim` porta un `confirmed`: vero per una concessione e per ogni claim che un giro
+di renew ha confermato, falso per uno che un connettore ha ripresentato. **Lo sweep guarda solo
+i confermati**, e con quel qualificatore diventa quello che `claim.md` §5.6 descrive: scatta
+quando una scadenza *che il coordinatore stesso ha dichiarato* è passata senza rinnovo, cioè
+quando il claim è morto anche per lui.
+
+Un claim non confermato **entra** quindi in un giro di batch anche se la sua copia locale è
+scaduta. Non è «rinnovare qualcosa di morto»: è chiedere all'unico che sa. Il coordinatore
+risponde adottandolo — e la scadenza vera torna in `Ok`, che lo marca confermato — oppure
+revocandolo. Un giro basta: misurato sul cluster vivo, un claim ricostruito con
+`expires_at = 1788024516065` è tornato `1788024774224` al primo renew.
+
+### 20.6 Il claim id non si avvicina al browser
+
+La strada più economica per P14 sarebbe stata lo snapshot del manager: il client è già
+sottoscritto a `{station_state, …}`. È stata scartata, e non per gusto: lo snapshot non
+contiene `claim_id`, e aggiungercelo lo esporrebbe a `vs_driver_proto`, cioè **a un passo dalla
+pagina**, protetto solo da un filtro che qualcuno deve ricordarsi di mantenere. Un canale
+dedicato costa due cast e non ha quel rischio.
+
+`build_snapshot/2` resta quindi senza i campi nuovi, ed è asserito sul sistema vivo, non
+promesso: durante la sessione di controprova la snapshot del connettore in `charging` non
+conteneva alcun `claim_id`, né al primo livello né dentro `session`.
+
+---
+
+## 21. La firma di ritorno decide quali distinzioni sono ancora possibili a valle (P4, P10, P13)
+
+Tre correzioni in tre punti diversi del sistema, a tre giorni di distanza, e una radice sola.
+Vale una voce unica perché **la lezione non è nessuno dei tre fix**.
+
+| | dove | il permanente detto a un temporaneo | chiuso con |
+|---|---|---|---|
+| **P4** | resa del riaggancio, canale colonnina | `4404` — «questo connettore non è di questa stazione» (§1: permanente, e `cp.js` ci muore sopra, correttamente) | `1012` Service Restart (§18.2) |
+| **P10** | handshake della colonnina | lo stesso `4404`, stavolta all'apertura del socket | i due temporanei **ammessi**, risposta data dal `boot` con `accepted:false` (§18.3) |
+| **P13** | canale driver | `UNKNOWN_CONNECTOR` — «connector does not belong to this station» | `RETRY_LATER`, allargato ai suoi tre casi reali |
+
+### La radice: `{error, atom()}` con un atomo solo per tre fatti diversi
+
+`vs_station_mgr` tiene una riga per ogni connettore configurato, e la riga **non sparisce mai**:
+`init/1` le inserisce tutte con pid `undefined`, e il `DOWN` di un connettore rimette
+`undefined` invece di cancellare. Quindi la tabella distingue tre situazioni per costruzione —
+riga con pid vivo, riga con `undefined`, riga assente — e ne aggiunge una quarta chi la legge
+sporco: tabella non ancora creata.
+
+Entrambe le funzioni di lettura ne restituivano **una sola**:
+
+```erlang
+_ -> {error, unknown_connector}     %% lookup_pid/1 fino a P10, connector_pid/1 fino a P13
+```
+
+Il difetto non è il ramo `_`. È che con quella firma **nessun chiamante può più distinguere**:
+l'informazione è stata buttata dentro la funzione, e a valle non c'è codice che possa
+recuperarla. Ogni chiamante è allora costretto a scegliere *una* condotta per tutti e tre i
+casi, e sceglie la peggiore che sia corretta per almeno uno — cioè quella permanente. Il
+risultato lo paga il chiamante **più lontano**, che è sempre lo stesso: l'apparecchiatura o il
+browser, gli unici che non possono discutere. La colonnina moriva con `EXIT=2`; il driver
+leggeva «questo connettore non è di questa stazione» di un connettore che, un secondo dopo,
+era lì.
+
+Da cui la regola generale, che è il motivo per cui questa voce esiste: **il tipo di ritorno di
+una funzione non descrive ciò che essa sa, decide ciò che i suoi chiamanti potranno sapere.**
+Collassare più esiti in un atomo solo è una perdita di informazione che avviene una volta, in
+un posto, in silenzio, e diventa irreversibile per tutto ciò che sta a valle.
+
+### E la regola di contratto, che è stata la stessa tre volte
+
+In nessuno dei tre casi è stato inventato un codice nuovo. Il codice sul filo dice al client
+**cosa fare**, non classifica la causa a beneficio nostro: se la condotta è identica — riprova
+fra poco — il codice deve essere identico, e la causa va nel `message`, che è il campo fatto
+per quello. La controprova è che in tutti e tre i giri **il client non è stato toccato**:
+`cp.js` cade da solo nel suo ramo di backoff su un `1012` e su un `accepted:false`, e `js/ws.js`
+mostra il `message` verbatim senza sapere niente di connettori e supervisori. Un codice davanti
+al quale un client che non sa nulla fa comunque la cosa giusta è la prova che quel codice dice
+ciò che intende dire.
+
+`ws-driver.md` §6 elenca ora i tre casi di `RETRY_LATER` con il messaggio che li separa — leader
+in ricostruzione, stazione in riavvio, connettore in riavvio. I primi due il codice li produceva
+**già**: il contratto ne dichiarava uno solo, ed era in ritardo di un caso senza che ce ne
+fossimo accorti. Allargarlo non è stato solo aggiungere P13, è stato allineare il documento a
+ciò che il codice faceva da prima.
+
+### Il quarto esito che qui non serve, e perché non è una svista
+
+`lookup_pid/1` ha quattro ritorni, `connector_pid/1` tre. Non è un'asimmetria da sanare: la
+prima è una **dirty read** dell'ETS e cattura il proprio `badarg` quando la tabella non esiste
+(`no_manager`); la seconda è una `gen_server:call`, e un manager assente non è un `badarg` qui
+ma un `exit({noproc, …})` sollevato **nel chiamante** — che `vs_driver_proto` cattura già e
+traduce in `no_manager` da sé. Il caso c'è in entrambe; cambia soltanto chi lo produce.
+Verificato, non dedotto: una call a un nome non registrato solleva
+`{noproc, {gen_server, call, [vs_station_mgr, …]}}`, che è esattamente la forma che lo stub dei
+test riproduce.
+
+### P12, accorpato qui perché è la stessa riga
+
+Il messaggio di `vehicle_committed` diceva «your vehicle already holds a reservation
+**elsewhere**». Falso nel primo caso in cui un driver ci si imbatte davvero — la seconda
+prenotazione sulla **stessa** stazione, due connettori più in là — e falso *solo perché era
+troppo preciso*. Tolto l'avverbio la frase è vera ovunque sia l'altra prenotazione e continua a
+fare l'unico lavoro che ha: mandare il driver ad annullare quella, invece che a provare i
+connettori uno per uno. La stessa frase stava nella colonna «Meaning shown» di `ws-driver.md`
+§4.1 ed è stata cambiata **nello stesso commit**: un test la confronta alla lettera, e un testo
+che il contratto cita e il codice non pronuncia è un contratto che ha smesso di descrivere il
+codice.

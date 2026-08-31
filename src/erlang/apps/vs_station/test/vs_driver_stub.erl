@@ -16,7 +16,7 @@
 
 %% arranging
 -export([reset/0, set_reserve/1, set_cancel/1, set_stop/1,
-         set_connectors/1, set_state/1, set_reachable/1]).
+         set_connectors/1, set_pid/1, set_state/1, set_reachable/1]).
 %% inspecting
 -export([calls/0, count/1]).
 %% conn_mod
@@ -34,6 +34,7 @@ reset() ->
     persistent_term:put(?K(cancel), ok),
     persistent_term:put(?K(stop), ok),
     persistent_term:put(?K(connectors), [1, 2, 3, 4]),
+    persistent_term:put(?K(pid), self),
     persistent_term:put(?K(state), default_state()),
     persistent_term:put(?K(reachable), true).
 
@@ -42,6 +43,12 @@ set_reserve(Reply)     -> persistent_term:put(?K(reserve), Reply).
 set_cancel(Reply)      -> persistent_term:put(?K(cancel), Reply).
 set_stop(Reply)        -> persistent_term:put(?K(stop), Reply).
 set_connectors(Ids)    -> persistent_term:put(?K(connectors), Ids).
+%% Which pid the row carries (P13). `self' — the default, and what every
+%% test before this one wanted — is the calling process. `undefined' is
+%% the third thing a real row can hold: configured, but no process behind
+%% it right now, which is exactly what the manager writes into the row on
+%% the connector's `DOWN' and leaves there until the supervisor is done.
+set_pid(Pid)           -> persistent_term:put(?K(pid), Pid).
 set_state(Map)         -> persistent_term:put(?K(state), Map).
 set_reachable(Bool)    -> persistent_term:put(?K(reachable), Bool).
 
@@ -80,6 +87,18 @@ answer(Reply)   -> Reply.
 %%% mgr_mod
 %%%===================================================================
 
+%% P13 — the three answers of `vs_station_mgr:connector_pid/1', arranged
+%% with the two knobs the real registry has: which ids the table holds,
+%% and which pid the row carries.
+%%
+%%   set_connectors(manager_down)  ->  an exit, and the protocol's own
+%%                                     wrapper makes it `no_manager'
+%%   ConnId not in the list        ->  {error, unknown_connector}
+%%   set_pid(undefined)            ->  {error, no_pid}
+%%
+%% Three and not four, unlike vs_cp_stub: `connector_pid/1' is a *call*,
+%% so "the manager is not up" is not one of its replies — it is the exit
+%% below, which is what a call to an unregistered name really raises.
 connector_pid(ConnId) ->
     record({connector_pid, ConnId}),
     case persistent_term:get(?K(connectors), []) of
@@ -88,9 +107,18 @@ connector_pid(ConnId) ->
             exit({noproc, {gen_server, call, [vs_station_mgr, {connector_pid, ConnId}]}});
         Ids ->
             case lists:member(ConnId, Ids) of
-                true  -> {ok, self()};
+                true  -> case registered_pid() of
+                             undefined -> {error, no_pid};
+                             Pid       -> {ok, Pid}
+                         end;
                 false -> {error, unknown_connector}
             end
+    end.
+
+registered_pid() ->
+    case persistent_term:get(?K(pid), self) of
+        self -> self();
+        Pid  -> Pid
     end.
 
 station_state() ->

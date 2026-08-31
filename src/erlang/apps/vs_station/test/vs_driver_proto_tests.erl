@@ -70,6 +70,12 @@ cases() ->
       fun the_waiting_list_is_out_of_m1/0},
      {"an unknown connector is refused",
       fun unknown_connector_is_refused/0},
+     {"a connector without a pid answers retry_later",
+      fun a_connector_without_a_pid_answers_retry_later/0},
+     {"the no_pid branch covers all three actions",
+      fun the_no_pid_branch_covers_all_three_actions/0},
+     {"an unconfigured connector stays unknown while another restarts",
+      fun an_unconfigured_connector_stays_unknown_while_another_restarts/0},
      {"connector_id must be a positive integer",
       fun connector_id_must_be_a_positive_integer/0},
      {"reserve acks with the lease",
@@ -78,6 +84,8 @@ cases() ->
       fun refusals_map_to_the_wire_codes/0},
      {"the two refusals of 4.1 stay apart",
       fun the_two_refusals_of_section_4_1_stay_apart/0},
+     {"the committed refusal does not say where",
+      fun the_committed_refusal_does_not_say_where/0},
      {"an unmapped refusal becomes invalid_state",
       fun an_unmapped_refusal_becomes_invalid_state/0},
      {"a replayed request_id does not reserve twice",
@@ -249,6 +257,68 @@ unknown_connector_is_refused() ->
     ?assertEqual(<<"UNKNOWN_CONNECTOR">>, code_of(Frame)),
     ?assertEqual(0, vs_driver_stub:count(reserve)).
 
+%% P13 — the row is there and carries `undefined': this connector IS of
+%% this station, it is between its own crash and the supervisor's
+%% restart. `connector_pid/1' used to collapse that into
+%% `unknown_connector', so the driver was told "does not belong to this
+%% station" — permanent, and false a second later.
+%%
+%% The message is asserted, not only the code, and that is the point of
+%% the case: RETRY_LATER already answers the manager restarting. §6 gives
+%% the code the conduct to hold — try again in a moment — and leaves the
+%% message to say which of the three things happened. Two facts sharing a
+%% code must not share a sentence.
+a_connector_without_a_pid_answers_retry_later() ->
+    S = joined_session(),
+    vs_driver_stub:set_pid(undefined),
+    {[Frame], _} = handle(frame(<<"reserve">>, <<"r-1">>, #{connector_id => 1}), S),
+    ?assertEqual(<<"RETRY_LATER">>, code_of(Frame)),
+    ?assertEqual(<<"the connector is restarting; try again in a moment">>,
+                 message_of(Frame)),
+
+    %% the same code from one step further up — and a different sentence
+    vs_driver_stub:set_pid(self()),
+    vs_driver_stub:set_connectors(manager_down),
+    {[FromMgr], _} = handle(frame(<<"reserve">>, <<"r-2">>, #{connector_id => 1}), S),
+    ?assertEqual(<<"RETRY_LATER">>, code_of(FromMgr)),
+    ?assertNotEqual(message_of(Frame), message_of(FromMgr)),
+
+    %% and in neither case was the connector asked to do anything
+    ?assertEqual(0, vs_driver_stub:count(reserve)).
+
+%% `with_connector/4' exists so that the three actions share exactly
+%% this: the connector may be unreachable, and all three must survive it.
+%% A branch added to `reserve' alone would be the copy-paste the factoring
+%% was written to prevent, and this is what would catch it.
+the_no_pid_branch_covers_all_three_actions() ->
+    S = joined_session(),
+    vs_driver_stub:set_pid(undefined),
+    lists:foreach(
+      fun(Action) ->
+              {[Frame], _} = handle(frame(Action, <<"r-", Action/binary>>,
+                                          #{connector_id => 1}), S),
+              ?assertEqual(<<"RETRY_LATER">>, code_of(Frame)),
+              ?assertEqual(<<"the connector is restarting; try again in a moment">>,
+                           message_of(Frame))
+      end,
+      [<<"reserve">>, <<"cancel_reservation">>, <<"stop_session">>]),
+    ?assertEqual(0, vs_driver_stub:count(reserve)),
+    ?assertEqual(0, vs_driver_stub:count(cancel)),
+    ?assertEqual(0, vs_driver_stub:count(stop_session)).
+
+%% The permanent stays permanent, and this is where the two are seen
+%% side by side: one station, one instant, one connector between crash
+%% and restart and one id that was never configured. Merging them back
+%% into a single answer fails here, whichever of the two it picked.
+an_unconfigured_connector_stays_unknown_while_another_restarts() ->
+    S = joined_session(),
+    vs_driver_stub:set_pid(undefined),
+    {[Restarting], _} = handle(frame(<<"reserve">>, <<"r-1">>, #{connector_id => 1}), S),
+    {[Unknown], _}    = handle(frame(<<"reserve">>, <<"r-2">>, #{connector_id => 99}), S),
+    ?assertEqual(<<"RETRY_LATER">>, code_of(Restarting)),
+    ?assertEqual(<<"UNKNOWN_CONNECTOR">>, code_of(Unknown)),
+    ?assertNotEqual(code_of(Restarting), code_of(Unknown)).
+
 connector_id_must_be_a_positive_integer() ->
     S = joined_session(),
     lists:foreach(fun(Payload) ->
@@ -316,9 +386,27 @@ the_two_refusals_of_section_4_1_stay_apart() ->
 
     %% and the sentence, which is the half the driver actually reads —
     %% verbatim from the "Meaning shown" column of §4.1
-    ?assertEqual(<<"your vehicle already holds a reservation elsewhere">>,
+    ?assertEqual(<<"your vehicle already holds a reservation">>,
                  message_of(Remote)),
     ?assertNotEqual(message_of(Local), message_of(Remote)).
+
+%% P12, reported by B. The sentence used to end in "elsewhere", and the
+%% first case a driver actually meets is the second reservation on the
+%% SAME station — two connectors further along the row, where "elsewhere"
+%% is false. It was false only because it was too precise: without the
+%% adverb the sentence is true in both cases and still sends the driver
+%% to cancel the other reservation, which is the whole job of this row of
+%% §4.1.
+%%
+%% Asserted as an absence rather than as a second copy of the string: the
+%% test above already pins the sentence verbatim, and what must not come
+%% back is the word.
+the_committed_refusal_does_not_say_where() ->
+    vs_driver_stub:set_reserve({error, vehicle_committed}),
+    {[Frame], _} = handle(frame(<<"reserve">>, <<"r-1">>, #{connector_id => 1}),
+                          joined_session()),
+    ?assertEqual(<<"NO_CLAIM">>, code_of(Frame)),
+    ?assertEqual(nomatch, binary:match(message_of(Frame), <<"elsewhere">>)).
 
 %% `not_your_reservation' is a real refusal of vs_connector with no code
 %% in §6: it is raised by `plugged', an event of the charge point

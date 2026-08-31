@@ -32,6 +32,10 @@ cases() ->
       fun a_connector_of_another_station_is_refused_4404/0},
      {"another station's id is refused 4404",
       fun another_stations_id_is_refused_4404/0},
+     {"a connector with no process behind it is admitted, not refused",
+      fun a_connector_with_no_pid_is_admitted/0},
+     {"a connector looked up while the manager is down is admitted",
+      fun a_connector_is_admitted_while_the_manager_is_down/0},
      {"a query string that does not parse is refused 4404",
       fun an_unparsable_query_string_is_refused_4404/0},
      {"boot is acked with everything the equipment needs",
@@ -42,6 +46,8 @@ cases() ->
       fun boot_hands_the_reported_status_over/0},
      {"boot carries the limit of a session already running",
       fun boot_carries_the_limit_of_a_running_session/0},
+     {"a connector not ready at boot says so in the reason",
+      fun a_connector_not_ready_at_boot_says_so/0},
      {"a connector lost between handshake and boot is not accepted",
       fun a_connector_lost_before_boot_is_not_accepted/0},
      {"heartbeat is acked with the station's clock",
@@ -58,6 +64,14 @@ cases() ->
       fun a_plugged_with_no_account_is_refused_nothing/0},
      {"reconciliation carries the energy already counted",
       fun reconciliation_carries_the_energy_already_counted/0},
+     {"reconciliation carries how long the hardware has been delivering",
+      fun reconciliation_carries_the_charging_seconds/0},
+     {"an ordinary plugged carries no charging_seconds at all",
+      fun an_ordinary_plugged_carries_no_charging_seconds/0},
+     {"a charging_seconds of zero says nothing and is left out",
+      fun a_zero_charging_seconds_is_left_out/0},
+     {"a charging_seconds older than the epoch is refused, not clamped",
+      fun an_impossible_charging_seconds_is_refused/0},
      {"meter readings reach the connector",
       fun meter_readings_reach_the_connector/0},
      {"unplugged reaches the connector with the final total",
@@ -139,6 +153,31 @@ an_unparsable_query_string_is_refused_4404() ->
                                         {<<"connector_id">>, <<"3">>}], opts())),
     ?assertEqual({refuse, 4404}, vs_cp_proto:handshake([], opts())).
 
+%% P10 — §1: "a connector that this station **does** have but that has no
+%% process behind it at that instant ... is **admitted**". The row is in
+%% the registry with `undefined' in it, which is what the manager writes
+%% at init and writes back on the connector's `DOWN'. Refusing here sent
+%% 4404 — the permanent code — for a fact that lasts a supervisor restart,
+%% and our own emulator dies on 4404, correctly.
+a_connector_with_no_pid_is_admitted() ->
+    vs_cp_stub:set_pid(undefined),
+    ?assertMatch({ok, #{connector_id := ?CONN}},
+                 vs_cp_proto:handshake(qs(1, ?CONN), opts())),
+    %% and it really did ask the registry: the admission is a decision
+    %% about the ANSWER, not a check that was skipped
+    ?assertEqual(1, vs_cp_stub:count(lookup_pid)).
+
+%% The other temporary one: no table at all, because this manager has not
+%% finished booting. Same verdict, and for the same reason — a charge
+%% point that dials in during the station's own start-up is early, not
+%% wrong.
+a_connector_is_admitted_while_the_manager_is_down() ->
+    vs_cp_stub:set_connectors(manager_down),
+    ?assertMatch({ok, #{connector_id := ?CONN}},
+                 vs_cp_proto:handshake(qs(1, ?CONN), opts())),
+    %% nothing was bound: §3.1 does the binding, and it has not run
+    ?assertEqual(0, vs_cp_stub:count(attach_cp)).
+
 %%%===================================================================
 %%% §3 — bring-up
 %%%===================================================================
@@ -193,14 +232,38 @@ boot_carries_the_limit_of_a_running_session() ->
     ?assertEqual(60.0, maps:get(limit_kw, payload_of(Ack))).
 
 %% §3.1: "accepted: false with a reason means the station does not
-%% recognise this connector; the charge point closes and retries with
-%% backoff." The handshake already checked, so this is the manager having
-%% gone away in between — a restart, and backoff is the right answer.
+%% recognise this connector or cannot serve it right now; the charge point
+%% closes and retries with backoff."
+%%
+%% The arrangement here is the PERMANENT one: the registry no longer holds
+%% this id at all, which since P10 means "not a connector of this station"
+%% and nothing else. It can only be reached with a manager that came back
+%% with a different configuration between the upgrade and this frame — the
+%% boot refuses it all the same, and the 4404 lands at the next handshake
+%% (vs_cp_proto §3.3). The assertion stays on the presence of a `reason'
+%% rather than its text, because the text is the other test's subject.
 a_connector_lost_before_boot_is_not_accepted() ->
     vs_cp_stub:set_connectors([]),
     {[Ack], S} = handle(frame(<<"boot">>, <<"cp-1">>, boot_payload()), session()),
     ?assertEqual(false, maps:get(accepted, payload_of(Ack))),
     ?assert(maps:is_key(reason, payload_of(Ack))),
+    ?assertEqual(false, maps:get(booted, S)),
+    ?assertEqual(0, vs_cp_stub:count(attach_cp)).
+
+%% P10 — the other half of §3.1's table, and the whole point of admitting
+%% the socket at the handshake: a charge point let in while its connector
+%% has no process must be told WHY in a word it can tell apart from the
+%% permanent one. Same `accepted: false', different `reason'.
+a_connector_not_ready_at_boot_says_so() ->
+    vs_cp_stub:set_pid(undefined),
+    {[Ack], S} = handle(frame(<<"boot">>, <<"cp-1">>, boot_payload()), session()),
+    ?assertEqual(false, maps:get(accepted, payload_of(Ack))),
+    ?assertEqual(<<"connector not ready">>, maps:get(reason, payload_of(Ack))),
+    %% and the permanent one still reads the way §3.1 says it does
+    vs_cp_stub:set_connectors([]),
+    {[Ack2], _} = handle(frame(<<"boot">>, <<"cp-2">>, boot_payload()), session()),
+    ?assertEqual(<<"unknown connector">>, maps:get(reason, payload_of(Ack2))),
+    %% nothing was attached on either path
     ?assertEqual(false, maps:get(booted, S)),
     ?assertEqual(0, vs_cp_stub:count(attach_cp)).
 
@@ -287,6 +350,49 @@ reconciliation_carries_the_energy_already_counted() ->
     {plugged, Info} = vs_cp_stub:last(plugged),
     ?assertEqual(12.317, maps:get(energy_kwh, Info)),
     ?assertEqual(58, maps:get(soc_pct, Info)).
+
+%% §6.2 — the second thing only the hardware knows. The energy says how
+%% much was delivered, this says over how long, and a `sessions' row needs
+%% both to be readable: the station lost the start of the session with the
+%% node and cannot reconstruct it from anything it holds.
+reconciliation_carries_the_charging_seconds() ->
+    Payload = (plugged_payload(?VEHICLE))#{energy_kwh => 12.042,
+                                           charging_seconds => 3600},
+    {[], _S} = handle(frame(<<"plugged">>, <<"cp-8">>, Payload), booted_session()),
+    {plugged, Info} = vs_cp_stub:last(plugged),
+    ?assertEqual(3600, maps:get(charging_seconds, Info)).
+
+%% §6: "absent or not positive, the station behaves exactly as it did
+%% before the field existed". Asserted as the **absence of the key**, not
+%% as a zero: the guarantee is that an ordinary plug builds the same map it
+%% built before, so that no path downstream can quietly come to depend on
+%% a field the contract lets equipment omit.
+an_ordinary_plugged_carries_no_charging_seconds() ->
+    {[], _S} = handle(frame(<<"plugged">>, <<"cp-8">>, plugged_payload(?VEHICLE)),
+                      booted_session()),
+    {plugged, Info} = vs_cp_stub:last(plugged),
+    ?assertNot(maps:is_key(charging_seconds, Info)).
+
+%% What a charge point sends on a cable that has just gone in — our own
+%% emulator does. §6 makes it the same statement as saying nothing, so it
+%% must not reach the connector and must not be logged as a divergence.
+a_zero_charging_seconds_is_left_out() ->
+    Payload = (plugged_payload(?VEHICLE))#{charging_seconds => 0},
+    {[], _S} = handle(frame(<<"plugged">>, <<"cp-8">>, Payload), booted_session()),
+    {plugged, Info} = vs_cp_stub:last(plugged),
+    ?assertNot(maps:is_key(charging_seconds, Info)).
+
+%% A duration longer than the station's clock: subtracting it would date the
+%% session before the epoch. Dropped rather than clamped — a clamped
+%% duration is a plausible number that is false, and §6 prefers a visibly
+%% missing one. The session still opens: the field is optional, and a bad
+%% optional field is no reason to refuse a car that is charging.
+an_impossible_charging_seconds_is_refused() ->
+    Payload = (plugged_payload(?VEHICLE))#{charging_seconds => 4000000000},
+    {[], _S} = handle(frame(<<"plugged">>, <<"cp-8">>, Payload), booted_session()),
+    {plugged, Info} = vs_cp_stub:last(plugged),
+    ?assertNot(maps:is_key(charging_seconds, Info)),
+    ?assertEqual(?VEHICLE, maps:get(vehicle_id, Info)).
 
 %%%===================================================================
 %%% §4.3 and §4.4 — the events that answer nothing
@@ -412,8 +518,10 @@ reattach_cases() ->
       fun a_down_with_no_session_reattaches_without_a_plugged/0},
      {"an unplugged is forgotten, so no ghost session comes back",
       fun an_unplugged_is_forgotten/0},
-     {"five attempts with no connector close the socket 4404",
-      fun five_attempts_with_no_connector_close_4404/0},
+     {"a stale charging_seconds is not replayed on the reattach",
+      fun a_stale_charging_seconds_is_not_replayed/0},
+     {"five attempts with no connector close the socket 1012",
+      fun five_attempts_with_no_connector_close_1012/0},
      {"a connector that comes back on the last attempt is not closed",
       fun a_connector_back_on_the_last_attempt_is_not_closed/0},
      {"the monitor is re-armed, so a second death is noticed too",
@@ -568,10 +676,42 @@ an_unplugged_is_forgotten() ->
     %% the one from before the unplug, and no second one
     ?assertEqual(1, vs_cp_stub:count(plugged)).
 
-%% The supervisor has given up: five attempts, then 4404 and let the charge
-%% point come back on its own backoff. Better a clean reconnection than a
-%% socket bound to a connector that does not exist.
-five_attempts_with_no_connector_close_4404() ->
+%% §6.2's copy stands in for a frame the charge point would send *now*, and
+%% every field of it survives that translation except this one. The energy
+%% is refreshed from the meter that arrived a moment ago; a duration cannot
+%% be refreshed from anything, and the one written down has been growing
+%% ever since. Replaying it would date the session too late by however long
+%% the copy sat here — a plausible number that is false, where leaving it
+%% out falls back to the honest behaviour every adoption had before.
+a_stale_charging_seconds_is_not_replayed() ->
+    Old = fake_connector(),
+    S0 = reattach_session(Old),
+    Reconnected = (plug_payload())#{charging_seconds => 3600},
+    {[], S1} = handle(frame(<<"plugged">>, <<"cp-2">>, Reconnected), S0),
+    %% it did reach the connector the first time, live
+    {plugged, Live} = vs_cp_stub:last(plugged),
+    ?assertEqual(3600, maps:get(charging_seconds, Live)),
+    {[], S2} = info(kill_and_collect(Old), S1),
+    New = fake_connector(),
+    vs_cp_stub:set_pid(New),
+    {[], _S3} = info(cp_reattach, S2),
+    {plugged, Replayed} = vs_cp_stub:last(plugged),
+    ?assertNot(maps:is_key(charging_seconds, Replayed)),
+    %% and the rest of the copy is replayed as it always was
+    ?assertEqual(?VEHICLE, maps:get(vehicle_id, Replayed)),
+    ?assertEqual(150, maps:get(max_kw, Replayed)).
+
+%% The supervisor has given up: five attempts, then a close and let the
+%% charge point come back on its own backoff. Better a clean reconnection
+%% than a socket bound to a connector that does not exist.
+%%
+%% **1012, and this assertion used to say 4404.** The code is the whole
+%% content of the branch — it is the only thing the equipment on the other
+%% end can read — and 4404 is the permanent condition of §1, which our own
+%% emulator (rightly) treats as fatal. Asserting it here is what would have
+%% carried the defect through any later correction, so the number is quoted
+%% against the contract and not against the implementation.
+five_attempts_with_no_connector_close_1012() ->
     Old = fake_connector(),
     S0 = charging_session(Old),
     {[], S1} = info(kill_and_collect(Old), S0),
@@ -580,7 +720,7 @@ five_attempts_with_no_connector_close_4404() ->
                              {[], S1b} = info(cp_reattach, S),
                              S1b
                      end, S1, lists:seq(1, 4)),
-    ?assertMatch({close, 4404, [], _}, info(cp_reattach, S2)),
+    ?assertMatch({close, 1012, [], _}, info(cp_reattach, S2)),
     %% and it never bound itself to anything in the meantime
     ?assertEqual(1, vs_cp_stub:count(attach_cp)).
 
@@ -639,9 +779,9 @@ a_foreign_down_is_ignored() ->
 %%% the transport — the three close codes and the command frame
 %%%===================================================================
 
-%% `vs_cp_ws' has no protocol in it, but it does own the four verdicts the
-%% contract expresses as *frames on the socket*: 4404, 4409, the shutdown
-%% and the encoding of a command. They are callbacks on a plain map, so
+%% `vs_cp_ws' has no protocol in it, but it does own the verdicts the
+%% contract expresses as *frames on the socket*: 4404, 4409, 1012, the
+%% shutdown and the encoding of a command. They are callbacks on a plain map, so
 %% they are tested here rather than behind a listener — the same reason
 %% the protocol was split out in the first place.
 
@@ -654,7 +794,7 @@ ws_test_() ->
       fun ws_shutdown_stops_the_car_before_closing/0},
      {"the DOWN of the connector reaches the protocol",
       fun() -> vs_cp_stub:reset(), flush(), ws_down_reaches_the_protocol() end},
-     {"a reattach that gives up closes the socket 4404",
+     {"a reattach that gives up closes the socket 1012",
       fun() -> vs_cp_stub:reset(), flush(), ws_give_up_closes_the_socket() end}].
 
 ws_refused_handshake_closes_4404() ->
@@ -693,7 +833,9 @@ ws_down_reaches_the_protocol() ->
     ?assertEqual({attach_cp, New, self()}, vs_cp_stub:last(attach_cp)).
 
 %% The give-up of §6 as the socket sees it: a close frame, and the charge
-%% point reconnects on its own backoff.
+%% point reconnects on its own backoff — which is true of 1012 and was not
+%% true of the 4404 this asserted before, because a client that obeys §1 to
+%% the letter treats 4404 as permanent and stops coming back.
 ws_give_up_closes_the_socket() ->
     Conn = fake_connector(),
     S0 = charging_session(Conn),
@@ -704,7 +846,7 @@ ws_give_up_closes_the_socket() ->
                                  St1
                          end, State1, lists:seq(1, 4)),
     {Frames, _State3} = vs_cp_ws:websocket_info(cp_reattach, State2),
-    ?assertEqual([{close, 4404, <<>>}], Frames).
+    ?assertEqual([{close, 1012, <<>>}], Frames).
 
 %% The frame first, the close after: a car left drawing power from a
 %% station that no longer counts it is the outcome §7.3 rules out.

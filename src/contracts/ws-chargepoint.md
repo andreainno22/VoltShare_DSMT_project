@@ -14,9 +14,11 @@ ws://<station-host>:8081/ws/cp?station_id=<id>&connector_id=<n>
 
 The charge point is the **client** and dials the station — the same way real equipment dials the operator's backend, because the hardware sits behind NAT on a site network and cannot be dialled into. One connection per connector: it keeps the routing trivial (the socket *is* the connector) and mirrors the way a multi-outlet unit reports each outlet separately.
 
-`connector_id` is globally unique, as everywhere else in the system (schema.sql). A connector id that does not belong to `station_id` is refused at the handshake with close code `4404`.
+`connector_id` is globally unique, as everywhere else in the system (schema.sql). A connector id that does not belong to `station_id` is refused at the handshake with close code `4404`. Only that one: a connector that this station **does** have but that has no process behind it at that instant — the station is still starting, or the connector process is between a crash and its restart — is **admitted**, and the answer comes at the `boot` (§3.1). `4404` at the handshake says "not a connector of this station", never "not right now".
 
 A second connection for a connector that already has one **replaces** it: hardware that reconnects after a network blip must not be locked out by its own stale socket. The old socket is closed with `4409`.
+
+A socket that outlives the connector it was bound to, and that the station cannot bind to a replacement, is closed with **`1012` (Service Restart)**. The distinction from `4404` is the one that matters to equipment, and it is why the code is a standard one rather than another `44xx`: `4404` is **permanent** — this connector is not this station's, and retrying is a loop — while a station that has lost a connector process is **temporarily** short of one, and the right answer is to reconnect with the backoff of §6.1. `1012` says exactly that in the vocabulary every WebSocket client already speaks, so a charge point that knows nothing of how this station repairs itself behind the wire does the right thing by reading the code alone.
 
 Frames are text, one JSON object each.
 
@@ -61,7 +63,12 @@ The station replies with everything the charge point needs to behave, so that th
                "server_time": 1755790000000, "limit_kw": 0 } }
 ```
 
-`accepted: false` with a `reason` means the station does not recognise this connector; the charge point closes and retries with backoff.
+`accepted: false` with a `reason` means the station does not recognise this connector **or cannot serve it right now**; the charge point closes and retries with backoff. The two are told apart by the `reason`, which is the only part of the refusal the equipment reads:
+
+| `reason` | what it means |
+|---|---|
+| `"unknown connector"` | this station has no such connector: permanent, and the next handshake will close `4404` (§1) |
+| `"connector not ready"` | the connector is this station's, but has no process behind it at this instant: temporary, and retrying is what fixes it |
 
 **Booting resets nothing.** A charge point that reconnects sends `boot` again and reports its true physical `status`; the station reconciles that against what it believes (§6). The hardware is the authority on what is plugged in, the station is the authority on what is authorised — keeping those two straight is the whole difficulty of this interface.
 
@@ -108,6 +115,8 @@ The charge point identifies the vehicle — in real equipment this is Autocharge
 | `charging` \| `closing` | any | refused, `invalid_state`; the physical state and ours have diverged, and the station logs it loudly |
 
 The battery figures come from the vehicle, not from the account: `battery_kwh` and `max_kw` drive the charging curve and cap the allocation, so a 50 kW car never receives a 150 kW share that would be wasted on it.
+
+Two further fields belong to the reconciliation of §6 and are **optional** here: `energy_kwh`, the cumulative already counted, and `charging_seconds`, how long the delivery has been running. On a cable that has just gone in they are both zero, which is the same statement as leaving them out; §6 is where they say something.
 
 ### 4.3 `meter`
 
@@ -156,9 +165,22 @@ The charge point must apply a new limit within `LIMIT_APPLY_SECONDS`. Nothing en
 The interesting failure is a station that restarts while cars are plugged in — station autonomy (SCOPE §4) means the hardware carries on delivering power meanwhile.
 
 1. The charge point notices the socket is gone and reconnects with backoff (1 s, doubling, capped at 30 s).
-2. It sends `boot` with its true `status` and, if a session is running, a `plugged` with the vehicle and the cumulative energy it has counted.
-3. The station has no memory of the session — the connector processes died with the node — so it adopts what the hardware reports: it opens a session from the reported figures rather than stopping a car that is charging happily.
+2. It sends `boot` with its true `status` and, if a session is running, a `plugged` with the vehicle, the cumulative energy it has counted and how long it has been delivering:
+
+```jsonc
+{ "action": "plugged", "request_id": "cp-8",
+  "payload": { "vehicle_id": 88, "soc_pct": 58, "battery_kwh": 58, "max_kw": 150,
+               "energy_kwh": 12.042, "charging_seconds": 3600 } }
+```
+
+3. The station has no memory of the session — the connector processes died with the node — so it adopts what the hardware reports: it opens a session from the reported figures rather than stopping a car that is charging happily. `started_at` is `now - charging_seconds x 1000` **read on the station's own clock**; every other timestamp is taken the ordinary way.
 4. Energy delivered before the crash is preserved, because the charge point counts it, not the station. The session row is written when the car unplugs, with the meter's total.
+
+`charging_seconds` is **optional**, and stays optional: absent or not positive, `started_at` is the instant of the adoption and the station behaves exactly as it did before the field existed. A charge point that does not send it is not a charge point that is broken — it is one that cannot answer the question, and the contract must be implementable by equipment that cannot.
+
+**Why a duration is admissible here where a timestamp would not be.** §7.4 says the timestamps that count are the station's, and it is not being bent: what the hardware sends is a **duration** — a physical quantity it measured itself, on its own transaction timer, the same kind of thing as `energy_kwh` — not an instant that would require two clocks to agree on when it happened. The station reads its own clock and subtracts. Two machines whose clocks are minutes apart still produce the same `started_at`, which is precisely what an absolute `started_at` from the equipment would not do. It is measured from the moment the cable went in, so it covers the same window as the cumulative energy sent beside it: that is what makes the two numbers of one row consistent with each other.
+
+Without it, a session that crossed a restart was billed the right energy over the wrong window — an hour of charging in a row that says twenty-three seconds. Nothing was miscounted, and no cost was wrong: `energy_kwh` is what is priced. But a document of record whose own two numbers contradict each other is a defect whether or not it costs anything, and the fix is one field.
 
 What is deliberately *not* attempted: reconstructing the reservation. The claim expired or belongs to a new leader's table, and re-deriving it would mean trusting hardware on a question hardware cannot answer. The car keeps charging, the session is billed, the reservation is gone.
 

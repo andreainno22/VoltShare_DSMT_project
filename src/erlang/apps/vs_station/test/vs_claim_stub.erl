@@ -33,13 +33,17 @@ calls() -> lists:reverse(persistent_term:get(?CALLS, [])).
 record(Call) ->
     persistent_term:put(?CALLS, [Call | persistent_term:get(?CALLS, [])]).
 
+%% Four elements since P14, like the real client: the second is the
+%% coordinator's `GrantedAt'. Here it is `now_ms()' — this stub IS the
+%% coordinator for these tests, so it is the one clock, which is the
+%% property claim.md §5.5 wants and not an approximation of it.
 acquire(VehicleId, UserId, StationId, ConnId) ->
     record({acquire, VehicleId, UserId, StationId, ConnId}),
     case persistent_term:get(?REPLY, ok) of
         ok ->
             ClaimId = list_to_binary("c-" ++ integer_to_list(erlang:unique_integer([positive]))),
             persistent_term:put(?LAST, ClaimId),
-            {ok, ClaimId, vs_time:in_seconds(960)};
+            {ok, ClaimId, vs_time:now_ms(), vs_time:in_seconds(960)};
         {error, _} = Err ->
             Err
     end.

@@ -792,6 +792,92 @@ an_out_of_service_connector_adopts_a_reconnected_session_test() ->
     end).
 
 %%%===================================================================
+%%% §6 — how long the hardware had been delivering
+%%%===================================================================
+
+%% The defect this closes, measured on the compose before it was: a car
+%% that had charged for two and a half minutes across a station restart
+%% produced a row covering sixty-five seconds and 5.956 kWh — 330 kW on a
+%% 150 kW outlet. `started_at' was the instant of the adoption, because it
+%% was the only instant the station had.
+%%
+%% This is the walk-in door, and it is the one that matters: a station that
+%% restarts comes back with **fresh** connector processes in `free', so the
+%% reconciliation of §6 arrives here and not at `out_of_service'.
+an_adopted_session_is_dated_from_the_charging_seconds_test() ->
+    with_connector(fun(Pid) ->
+        Before = vs_time:now_ms(),
+        ok = vs_connector:plugged(Pid, #{user_id => ?USER, vehicle_id => ?VEHICLE,
+                                         soc_pct => 58, battery_kwh => 58.0,
+                                         max_kw => 150, energy_kwh => 12.042,
+                                         charging_seconds => 3600}),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        %% an hour back, on the station's own clock and nobody else's.
+        %% P11: the ceiling is read AFTER the fact, not from `Before'. The
+        %% connector stamps `now_ms() - 3600000' when it handles the plug,
+        %% which is at or after `Before', so `=< Before - 3600000' asked the
+        %% two clock readings to land in the SAME millisecond and failed
+        %% whenever they did not. The pair of bounds still catches both
+        %% regressions: no subtraction sails past the ceiling, too much
+        %% subtraction falls through the floor below.
+        ?assert(StartedAt =< vs_time:now_ms() - 3600000),
+        ?assert(StartedAt >= Before - 3600000 - 2000),
+        %% and the row that comes out of it is readable: the energy and the
+        %% window it covers agree, which is the whole point
+        vs_connector:unplugged(Pid, 12.042),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        [Row] = vs_db_stub:rows(),
+        Seconds = (maps:get(ended_at, Row) - maps:get(started_at, Row)) / 1000,
+        ?assert(Seconds >= 3600),
+        ?assert(Seconds < 3610)
+    end).
+
+%% The controprova, at the unit the E2E measures on a real socket: a plug
+%% that says nothing about durations starts now, exactly as every plug did
+%% before the field existed. Both doors that a charge point can walk in
+%% through with no reconciliation behind it.
+a_plug_without_charging_seconds_still_starts_now_test() ->
+    with_connector(fun(Pid) ->
+        Before = vs_time:now_ms(),
+        ok = plug(Pid, ?VEHICLE),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        ?assert(StartedAt >= Before),
+        ?assert(StartedAt =< vs_time:now_ms())
+    end).
+
+a_reserved_plug_is_untouched_by_the_new_field_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        Before = vs_time:now_ms(),
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(charging, state_of(Pid)),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        ?assert(StartedAt >= Before),
+        ?assert(StartedAt =< vs_time:now_ms())
+    end).
+
+%% `vs_cp_proto' filters the field before it ever gets here, so this is the
+%% connector's own guard and not a second copy of the contract's rule: a
+%% duration longer than the epoch would date a session in 1969 and break
+%% the `epoch_ms()' the row is written with. It falls back rather than
+%% clamping, for the same reason the wire does — a clamped duration is a
+%% plausible number that is false.
+an_impossible_charging_seconds_falls_back_to_now_test() ->
+    with_connector(fun(Pid) ->
+        Before = vs_time:now_ms(),
+        ok = vs_connector:plugged(Pid, #{user_id => ?USER, vehicle_id => ?VEHICLE,
+                                         soc_pct => 22, battery_kwh => 58.0,
+                                         max_kw => 150,
+                                         charging_seconds => 4000000000}),
+        StartedAt = maps:get(started_at,
+                             maps:get(session, vs_connector:snapshot(Pid))),
+        ?assert(StartedAt >= Before)
+    end).
+
+%%%===================================================================
 %%% M2 fix 1 (D-2) — the row is written when the hardware has finished
 %%%                  talking, not when the station stops listening
 %%%===================================================================
@@ -1000,4 +1086,108 @@ a_reserved_replug_after_a_fault_bills_each_kwh_once_test() ->
         wait_until(fun() -> length(vs_db_stub:rows()) =:= 2 end),
         ?assertEqual([6.0, 4.0], [maps:get(energy_kwh, R) || R <- vs_db_stub:rows()]),
         ?assertEqual(10.0, billed())
+    end).
+
+%%%===================================================================
+%%% P14 — presenting the claim to a client that has forgotten it
+%%%===================================================================
+
+%% The claim client is a gen_server, so the connector answers with a
+%% cast; arriving at a bare test process that is the raw `{'$gen_cast',
+%% Msg}' wrapper, and unwrapping it here is cheaper than standing up a
+%% whole client to receive one message.
+%%
+%% Both helpers put a `snapshot' call between the question and the
+%% verdict, and that is what makes them deterministic rather than timed:
+%% the cast and the call travel from this process to the same one, so the
+%% connector has finished handling the rebuild before the snapshot reply
+%% comes back — whatever it sent is already in this mailbox, and `after 0'
+%% is enough. P11's rule: no assertion that a scheduler can trip.
+claim_presented(Pid) ->
+    _ = vs_connector:snapshot(Pid),
+    receive
+        {'$gen_cast', {claim_present, _, _, _, _, _, _, _} = Msg} -> Msg
+    after 0 ->
+        erlang:error(no_claim_presented)
+    end.
+
+no_claim_presented(Pid) ->
+    _ = vs_connector:snapshot(Pid),
+    receive
+        {'$gen_cast', {claim_present, _, _, _, _, _, _, _} = Msg} ->
+            erlang:error({presented_a_claim_it_does_not_have, Msg})
+    after 0 ->
+        ok
+    end.
+
+%% `held' is where the claim lives before the cable goes in, and the
+%% expiry presented is the COORDINATOR's, not the station's lease. The
+%% two are different numbers on purpose (claim.md §3.1 grants the claim
+%% longer so it cannot die under a live reservation), and the snapshot
+%% shows the lease — so comparing them is what proves the connector kept
+%% the right one rather than re-reporting what it already had.
+a_held_connector_presents_its_claim_on_rebuild_test() ->
+    with_connector(fun(Pid) ->
+        {ok, LeaseExpiresAt} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = vs_claim_stub:last_claim_id(),
+        vs_connector:claims_rebuild(Pid, self()),
+        {claim_present, Owner, Cid, Vehicle, User, ConnId, GrantedAt, ExpiresAt} =
+            claim_presented(Pid),
+        ?assertEqual(Pid, Owner),
+        ?assertEqual(ClaimId, Cid),
+        ?assertEqual(?VEHICLE, Vehicle),
+        ?assertEqual(?USER, User),
+        ?assertEqual(3, ConnId),
+        ?assert(GrantedAt =< vs_time:now_ms()),
+        ?assert(ExpiresAt > LeaseExpiresAt)
+    end).
+
+%% The other half: after `held → charging' the `#hold' is gone (D-8) and
+%% the claim lives in `#session'. Without this clause a client that
+%% restarted mid-session would never get the claim back, and §6.1 would
+%% stay open for every connector that happens to be charging.
+a_charging_connector_presents_its_claim_on_rebuild_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = vs_claim_stub:last_claim_id(),
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(charging, state_of(Pid)),
+        vs_connector:claims_rebuild(Pid, self()),
+        {claim_present, Owner, Cid, Vehicle, User, ConnId, GrantedAt, ExpiresAt} =
+            claim_presented(Pid),
+        ?assertEqual(Pid, Owner),
+        %% the same claim, and the same two coordinator timestamps, carried
+        %% across the transition that throws the reservation away
+        ?assertEqual(ClaimId, Cid),
+        ?assertEqual(?VEHICLE, Vehicle),
+        ?assertEqual(?USER, User),
+        ?assertEqual(3, ConnId),
+        ?assert(is_integer(GrantedAt)),
+        ?assert(ExpiresAt > vs_time:now_ms())
+    end).
+
+%% "Negli altri stati, silenzio" — and `free' is the state every
+%% connector boots into, so this is what the very first rebuild of a
+%% station's life gets back.
+a_free_connector_says_nothing_on_a_claims_rebuild_test() ->
+    with_connector(fun(Pid) ->
+        ?assertEqual(free, state_of(Pid)),
+        vs_connector:claims_rebuild(Pid, self()),
+        ok = no_claim_presented(Pid)
+    end).
+
+%% Not a formality: a walk-in reaches `charging' through the same door as
+%% a reserved session, and it has no claim at all (SCOPE §3.3 — no
+%% reservation is needed to plug in at a free outlet). A clause that
+%% matched `#session{}' without looking at the claim id would cast
+%% `undefined' as a claim, and the client would put into its table — and
+%% from there into the coordinator's, on the next renew — a claim nobody
+%% ever granted.
+a_walk_in_has_no_claim_to_present_test() ->
+    with_connector(fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(charging, state_of(Pid)),
+        ?assertEqual([], [C || C = {acquire, _, _, _, _} <- vs_claim_stub:calls()]),
+        vs_connector:claims_rebuild(Pid, self()),
+        ok = no_claim_presented(Pid)
     end).

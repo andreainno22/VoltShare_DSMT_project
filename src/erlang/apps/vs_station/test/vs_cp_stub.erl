@@ -36,14 +36,17 @@ reset() ->
     persistent_term:put(?K(user), identity),
     persistent_term:put(?K(pid), self).
 
-%% Ids this station owns; `manager_down' makes the dirty read raise the
-%% way a missing ETS table does.
+%% Ids this station owns. `manager_down' stands for the missing ETS table:
+%% the real `lookup_pid/1' catches its own `badarg' there and answers
+%% `no_manager', so this stub answers it directly (P10).
 set_connectors(Ids)   -> persistent_term:put(?K(connectors), Ids).
 %% Which pid the registry hands back. `self' — the default, and what every
 %% test before the reattach wanted — is the calling process. A real pid is
 %% how a test says "the connector came back as a NEW process", which is the
 %% one thing the reattach of §6 has to be able to tell apart from "the
-%% registry still names the one that just died".
+%% registry still names the one that just died". `undefined' is the third
+%% thing a real row can hold: configured, but no process behind it right
+%% now — the `no_pid' of P10.
 set_pid(Pid)          -> persistent_term:put(?K(pid), Pid).
 %% Reply :: ok | {error, Refusal} | unreachable
 set_plugged(Reply)    -> persistent_term:put(?K(plugged), Reply).
@@ -106,17 +109,27 @@ snapshot(_Pid) ->
 %%% mgr_mod
 %%%===================================================================
 
+%% P10 — the three answers of `vs_station_mgr:lookup_pid/1', arranged with
+%% the two knobs the stub already had, because the real registry has the
+%% same two: which ids the table holds, and which pid the row carries.
+%%
+%%   set_connectors(manager_down)  ->  {error, no_manager}
+%%   ConnId not in the list        ->  {error, unknown_connector}
+%%   set_pid(undefined)            ->  {error, no_pid}
+%%
+%% `undefined' is not a stand-in here: it is exactly what the manager puts
+%% in the row at init and puts back on the connector's `DOWN'.
 lookup_pid(ConnId) ->
     record({lookup_pid, ConnId}),
     case persistent_term:get(?K(connectors), []) of
         manager_down ->
-            %% `vs_station_mgr:lookup_pid/1' catches its own badarg and
-            %% answers this, so "the manager is not up" and "not my
-            %% connector" are the same answer by design.
-            {error, unknown_connector};
+            {error, no_manager};
         Ids ->
             case lists:member(ConnId, Ids) of
-                true  -> {ok, registered_pid()};
+                true  -> case registered_pid() of
+                             undefined -> {error, no_pid};
+                             Pid       -> {ok, Pid}
+                         end;
                 false -> {error, unknown_connector}
             end
     end.

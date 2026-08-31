@@ -95,7 +95,8 @@
 %%% waits `reattach_ms' — an `erlang:send_after', never a blocking wait:
 %%% this process must go on reading frames — then looks the pid up again
 %%% and reattaches, up to `reattach_tries_max' times, and gives up with a
-%%% 4404.
+%%% 1012: the connector is missing for now, not for ever, and §1 keeps the
+%%% two apart on purpose (see `retry/2').
 %%%
 %%% Reattaching is not enough on its own: the new connector has no memory,
 %%% and the hardware does. That is exactly the reconciliation §6 describes
@@ -175,13 +176,24 @@ opt(Key, Opts, Default) ->
 %% @doc The verdict on `?station_id=<id>&connector_id=<n>'.
 %%
 %% "A connector id that does not belong to `station_id' is refused at the
-%% handshake with close code 4404" (§1). Three ways to earn it, and the
-%% log line says which: a query string that does not parse, a station that
-%% is not this node, and a connector this station does not own. The last
-%% is decided by the dirty read, never by a call to the manager: a charge
-%% point dialling in while the manager is booting must not queue behind
-%% it, and the honest answer for "the registry is not there yet" is the
-%% same one as for "not mine" — come back later.
+%% handshake with close code 4404" (§1) — and P10 made that sentence true
+%% of the code as well. Three ways to earn the refusal, and the log line
+%% says which: a query string that does not parse, a station that is not
+%% this node, and a connector this station does not own.
+%%
+%% The last is decided by the dirty read, never by a call to the manager:
+%% a charge point dialling in while the manager is booting must not queue
+%% behind it. That read used to answer "not mine" to "the registry is not
+%% there yet" and to "the connector died a moment ago" too, and the socket
+%% turned all three into 4404 — the permanent code, the one cp.js dies on.
+%% The comment here argued, correctly, that the honest answer to a
+%% temporary fact is "come back later"; the code sent "never come back".
+%%
+%% Now `no_pid' and `no_manager' are ADMITTED: the socket is opened and
+%% the boot of §3.1 answers, which is the one place in this contract that
+%% can say `accepted: false' with a reason and let the equipment retry on
+%% its own backoff. In the ordinary case the supervisor has rebuilt the
+%% connector by then and the boot simply attaches.
 -spec handshake([{binary(), binary() | true}], map()) ->
           {ok, session()} | {refuse, 4404}.
 handshake(Qs, Opts) ->
@@ -192,6 +204,14 @@ handshake(Qs, Opts) ->
             Session1 = Session#{connector_id := ConnId},
             case connector(Session1) of
                 {ok, _Pid} ->
+                    {ok, Session1};
+                {error, Temporary} when Temporary =:= no_pid;
+                                        Temporary =:= no_manager ->
+                    %% Configured, just not servable this instant. §3.1 is
+                    %% the answer, not §1: admit and let the boot speak.
+                    logger:notice("charge point channel: connector ~p admitted "
+                                  "with nothing behind it yet (~p) - the boot "
+                                  "will answer", [ConnId, Temporary]),
                     {ok, Session1};
                 {error, _} ->
                     logger:notice("charge point channel: refused connector ~p - "
@@ -225,9 +245,9 @@ qs_int(Key, Qs) ->
 %% @doc One text frame in, the frames to send out and the new session.
 %%
 %% No close verdict in the return: nothing a charge point can *say* closes
-%% this socket. The two close codes of the contract come from elsewhere —
-%% 4404 from the handshake above, 4409 from the connector telling this
-%% process it has been replaced.
+%% this socket. The three close codes of §1 all come from elsewhere — 4404
+%% from the handshake above, 4409 from the connector telling this process
+%% it has been replaced, 1012 from the reattach giving up (`retry/2').
 -spec handle_text(binary(), session()) -> {[frame()], session()}.
 handle_text(Bin, Session) ->
     case decode(Bin) of
@@ -385,18 +405,34 @@ boot(ReqId, Payload, Session = #{connector_id := ConnId}) ->
             {[boot_ack(ReqId, limit_kw(Session2, Pid), Session2)],
              Session2#{booted := true}};
         {error, Reason} ->
-            %% §3.1: "`accepted: false' with a `reason' means the station
-            %% does not recognise this connector; the charge point closes
-            %% and retries with backoff". The handshake already checked
-            %% this, so reaching here means the manager went away between
-            %% the upgrade and the first frame — a restart, and backoff is
-            %% exactly the right answer to it.
+            %% §3.1: "`accepted: false' with a `reason' ... the charge
+            %% point closes and retries with backoff". Since P10 this is
+            %% not only the manager-vanished-between-upgrade-and-boot
+            %% race: the handshake now ADMITS a connector that is merely
+            %% without a process, and this is where that socket gets its
+            %% answer.
+            %%
+            %% `accepted: false' for all three reasons on purpose, the
+            %% permanent one included. `unknown_connector' can only reach
+            %% here if the manager restarted with a different
+            %% configuration between the upgrade and the first frame;
+            %% refusing the boot and letting the 4404 arrive at the NEXT
+            %% handshake is simpler than a second place in this module
+            %% that closes 4404, and costs the equipment one reconnect.
+            %% The `reason' is what tells the two apart, and it is the
+            %% only part of the ack a charge point can read: cp.js logs
+            %% it and closes either way (§3.1).
             logger:warning("charge point channel: connector ~p unreachable at "
                            "boot (~p)", [ConnId, Reason]),
             {[ack(ReqId, #{accepted => false,
-                           reason   => <<"unknown connector">>})],
+                           reason   => boot_refusal(Reason)})],
              Session}
     end.
+
+%% The two natures of §3.1's `reason', in the contract's own words.
+boot_refusal(no_pid)     -> <<"connector not ready">>;
+boot_refusal(no_manager) -> <<"connector not ready">>;
+boot_refusal(_Permanent) -> <<"unknown connector">>.
 
 %% @doc The `boot' ack of §3.1. Public so the tests read it from the
 %% contract's own vocabulary rather than from a literal in two places.
@@ -544,6 +580,46 @@ max_kw(Payload) ->
         Kw                   -> {ok, Kw}
     end.
 
+%% §6 — the other half of the reconciliation, and the opposite of `max_kw'
+%% in every way that matters. `max_kw' is mandatory and its absence refuses
+%% the session; this one is **optional and must stay optional**, because
+%% §6 promises a contract that equipment unable to answer the question can
+%% still implement. Absent or not positive, the key is simply not in the
+%% map and `vs_connector' starts the session the way it always has.
+%%
+%% Adding the key rather than defaulting it to zero is what makes that
+%% promise structural instead of conventional: every payload that does not
+%% carry the field builds the **same map, key for key**, that it built
+%% before the field existed, so no path can drift into depending on it.
+with_charging_seconds(Info, Payload, ConnId) ->
+    case charging_seconds(Payload) of
+        {ok, Secs} -> Info#{charging_seconds => Secs};
+        error      -> Info;
+        {error, Secs} ->
+            %% Positive but not a duration this station can have lived
+            %% through: subtracting it would date the session before the
+            %% epoch. §7.6 — said out loud, and the field is dropped rather
+            %% than clamped, because a clamped duration is a plausible
+            %% number that is false.
+            logger:error("charge point channel (connector ~p): plugged with an "
+                         "impossible charging_seconds (~p) - ignored, started_at "
+                         "will be the instant of the adoption", [ConnId, Secs]),
+            Info
+    end.
+
+charging_seconds(Payload) ->
+    case int(<<"charging_seconds">>, Payload, undefined) of
+        undefined       -> error;
+        %% "absent or not positive" is one answer in §6, so a zero from a
+        %% cable that has just gone in is not a divergence and says nothing
+        Secs when Secs =< 0 -> error;
+        Secs ->
+            case Secs * 1000 < vs_time:now_ms() of
+                true  -> {ok, Secs};
+                false -> {error, Secs}
+            end
+    end.
+
 authorise(Payload, VehicleId, UserId, MaxKw, Session = #{connector_id := ConnId}) ->
     Info = #{user_id     => UserId,
              vehicle_id  => VehicleId,
@@ -555,7 +631,8 @@ authorise(Payload, VehicleId, UserId, MaxKw, Session = #{connector_id := ConnId}
              %% brings the energy it has counted, and it is the only side
              %% that counted it.
              energy_kwh  => num(<<"energy_kwh">>, Payload, 0.0)},
-    case with_connector(Session, fun(Conn, Pid) -> Conn:plugged(Pid, Info) end) of
+    Info1 = with_charging_seconds(Info, Payload, ConnId),
+    case with_connector(Session, fun(Conn, Pid) -> Conn:plugged(Pid, Info1) end) of
         ok ->
             %% No frame from here: the connector sends `set_limit' itself on
             %% entering `charging', so the command reaches the socket by the
@@ -600,7 +677,7 @@ user_for_vehicle(#{db_mod := Db}, VehicleId) ->
 %% has the same two things to do with them: write the frames, or write the
 %% frames and then close.
 -spec handle_info(term(), session()) ->
-          {[frame()], session()} | {close, 4404, [frame()], session()}.
+          {[frame()], session()} | {close, 1012, [frame()], session()}.
 
 %% The connector is gone. Not the socket's death — this process is fine,
 %% and so is the cable — so nothing is torn down: a timer is armed and the
@@ -709,30 +786,58 @@ reconcile(Pid, Session = #{connector_id := ConnId, last_status := Status,
 %% since. §4.3 makes that cumulative monotonic, so the `max' can only ever
 %% pick the meter; it is written as a `max' because that is the rule the
 %% contract states, not because the two could arrive out of order.
-replayed_plugged(Plugged, undefined) ->
-    Plugged;
-replayed_plugged(Plugged, Meter) ->
-    Plugged#{<<"energy_kwh">> => max(num(<<"energy_kwh">>, Plugged, 0.0),
-                                     num(<<"energy_kwh">>, Meter, 0.0)),
-             <<"soc_pct">>    => int(<<"soc_pct">>, Meter,
-                                     int(<<"soc_pct">>, Plugged, 0))}.
-
-%% Not back yet. One more timer until the budget runs out, then 4404.
 %%
-%% 4404 is the code §1 gives to "this station has no such connector", and
-%% after `reattach_tries_max' attempts that is the literal truth: the
-%% supervisor has given up on it. Closing beats hanging on — a socket bound
-%% to nothing accepts frames it can do nothing with, while a charge point
-%% that is hung up on reconnects on its own (§6.1) and boots against
-%% whatever the station has by then.
+%% `charging_seconds' is the one field of the copy that goes **stale**, and
+%% it is dropped rather than replayed. The energy can be refreshed from the
+%% meter that arrived a moment ago; a duration cannot — the hardware states
+%% it once, and by the time this replay happens it has grown by however
+%% long the copy has been sitting here. Sending the old number would date
+%% the session too late by exactly that much: a plausible figure that is
+%% false, which §6 already prefers to avoid over a visibly wrong one. Left
+%% out, the adoption falls back to its instant, which is where every
+%% adoption started before the field existed.
+%%
+%% The socket could keep the number honest by writing down when the frame
+%% arrived, and that is a second piece of state on the most delicate
+%% boundary of this milestone for a path the equipment cannot even see.
+%% Noted in scelte_di_progetto.md instead, next to the defect it is a
+%% narrower survivor of.
+replayed_plugged(Plugged, undefined) ->
+    maps:remove(<<"charging_seconds">>, Plugged);
+replayed_plugged(Plugged, Meter) ->
+    (maps:remove(<<"charging_seconds">>, Plugged))#{
+      <<"energy_kwh">> => max(num(<<"energy_kwh">>, Plugged, 0.0),
+                              num(<<"energy_kwh">>, Meter, 0.0)),
+      <<"soc_pct">>    => int(<<"soc_pct">>, Meter,
+                              int(<<"soc_pct">>, Plugged, 0))}.
+
+%% Not back yet. One more timer until the budget runs out, then 1012.
+%%
+%% Closing beats hanging on — a socket bound to nothing accepts frames it
+%% can do nothing with, while a charge point that is hung up on reconnects
+%% on its own (§6.1) and boots against whatever the station has by then.
+%%
+%% **1012 (Service Restart), and not the 4404 this used to send.** The old
+%% code read the situation as "this station has no such connector", which
+%% after `reattach_tries_max' attempts is literally true and was still the
+%% wrong thing to say: §1 gives 4404 to a **permanent** condition — the
+%% connector is not this station's — and equipment that believes it has no
+%% reason ever to come back. Our own emulator read it exactly that way and
+%% died on it (`cp.js', `die(...)'), so the sentence this branch ends with,
+%% "the charge point will reconnect", was false against the one charge
+%% point we have. The condition here is temporary: a connector process died
+%% and its supervisor is behind. 1012 is the standard code for precisely
+%% that, it falls into the ordinary backoff branch of any client, and a
+%% charge point that has never heard of connector processes does the right
+%% thing without being taught anything.
 retry(Session = #{connector_id := ConnId, reattach_tries := Tries,
                   reattach_tries_max := Max, reattach_ms := Ms}, Why) ->
     case Tries + 1 of
         N when N >= Max ->
             logger:error("charge point channel: connector ~p did not come back "
-                         "in ~p attempts (~s) - closing 4404, the charge point "
+                         "in ~p attempts (~s) - closing 1012, the charge point "
                          "will reconnect", [ConnId, N, Why]),
-            {close, 4404, [], Session#{reattach_tries := N}};
+            {close, 1012, [], Session#{reattach_tries := N}};
         N ->
             logger:notice("charge point channel: connector ~p not back yet "
                           "(~s), attempt ~p of ~p", [ConnId, Why, N, Max]),
