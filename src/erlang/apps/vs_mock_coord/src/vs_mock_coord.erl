@@ -15,7 +15,9 @@
 %%%   * {release, ...}, {station_up, ...}, {station_stats, ...} arrive
 %%%     as gen_server:cast: the contract marks them fire-and-forget /
 %%%     announcements, with no reply defined.  ← B: this is the framing
-%%%     the station uses; vs_coord_srv must accept the same.
+%%%     the station uses; vs_coord_srv must accept the same;
+%%%   * {no_show, ...} and {show_up, ...} likewise, added in M4-A —
+%%%     erlang-java.md §2.4, the two the coordinator relays to Java.
 %%%
 %%% For the tests (and for poking at a live node) it records everything
 %%% it receives and can be told to refuse: `history/0', `reset/0',
@@ -137,6 +139,22 @@ handle_cast({station_up, StationId, Node, _Name, _WsUrl, _SiteKw, _Tariff,
     {noreply, remember(Msg, State)};
 
 handle_cast({station_stats, _StationId, _Free, _Held, _Charging} = Msg, State) ->
+    {noreply, remember(Msg, State)};
+
+%% M4-A — the penalty pair of erlang-java.md §2.4, in the arities the real
+%% coordinator matches (vs_coord_srv:247-252). Written as shape-matched
+%% heads rather than as a match on the tag alone, and that is the point of
+%% having them here at all: a `no_show' with one element too many falls
+%% into the catch-all below **in silence**, exactly as it would fall into
+%% the coordinator's own, so the test that asserts the four-element form
+%% goes red here instead of a message going missing at integration time.
+handle_cast({no_show, UserId, StationId, ConnId} = Msg, State) ->
+    logger:notice("mock-coord: no-show for user ~p at station ~p, connector ~p",
+                  [UserId, StationId, ConnId]),
+    {noreply, remember(Msg, State)};
+
+handle_cast({show_up, UserId} = Msg, State) ->
+    logger:notice("mock-coord: show-up for user ~p", [UserId]),
     {noreply, remember(Msg, State)};
 
 handle_cast(Other, State) ->

@@ -77,6 +77,8 @@
 -export([coordinator_reachable/0]).
 %% from vs_station_db, after the row is in MySQL
 -export([session_closed/1]).
+%% from the connector, when a reservation is missed or honoured (M4)
+-export([no_show/2, show_up/1]).
 %% lifecycle
 -export([start_link/0, start_link/1]).
 %% pure, and exported so the lobby's three numbers can be tested on a map
@@ -201,6 +203,59 @@ session_closed(Event) ->
     gen_server:cast(?MODULE, {session_closed, Event}).
 
 %%%===================================================================
+%%% the penalty events (M4, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% Two casts with no queue behind them, and the missing queue is the
+%% decision — not a corner that was cut.
+%%
+%% `session_closed/1' above is **at-least-once**: it wakes a sweep that
+%% re-reads a row already committed to MySQL, so a duplicate costs one
+%% early sweep and a loss costs one interval of delay. Nothing about it is
+%% counted.
+%%
+%% A no-show is the opposite shape. It lands on
+%% `UPDATE users SET no_show_count = no_show_count + 1' (UserDao) and
+%% there is no row anywhere that could be re-read to repair it: this
+%% message IS the record that the reservation was missed. So the two
+%% failure modes are not symmetrical —
+%%
+%%   * one lost: a strike never counted. A suspension arrives one missed
+%%     reservation later than it should. The rule exists to stop a habit,
+%%     and a habit keeps producing events.
+%%   * one duplicated: an account suspended for a day after missing ONE
+%%     reservation, with nothing in the database to show why.
+%%
+%% — and between a torn ticket and an unjust punishment the choice is not
+%% close. Hence **at-most-once**: `cast_leader/2` and nothing else, no
+%% retry, no buffer to drain when a leader comes back.
+%%
+%% B's half reads the same way round and is what makes this safe rather
+%% than merely cheap: `vs_coord_bo:handle_cast({penalty_event, …})' only
+%% forwards while that coordinator is the serving one, and drops it
+%% otherwise, "because relaying it from two coordinators at once would
+%% count one no-show twice — Java's counter has no way to tell the
+%% duplicates apart". Neither side deduplicates; both sides avoid
+%% duplicating.
+
+%% @doc A reservation expired with nobody arriving. Called by
+%% `vs_connector' from the lease timer of `held', and from nowhere else.
+%%
+%% The connector passes the two things it knows; the station id is added
+%% here because this is where it lives.
+-spec no_show(pos_integer(), pos_integer()) -> ok.
+no_show(UserId, ConnId) ->
+    gen_server:cast(?MODULE, {no_show, UserId, ConnId}).
+
+%% @doc The driver turned up and the streak resets — "consecutive" is the
+%% whole of SCOPE §3.3. Called by `vs_connector' from the `plugged' it
+%% accepts on a reservation, and from nowhere else: a walk-in never
+%% promised to come.
+-spec show_up(pos_integer()) -> ok.
+show_up(UserId) ->
+    gen_server:cast(?MODULE, {show_up, UserId}).
+
+%%%===================================================================
 %%% lifecycle
 %%%===================================================================
 
@@ -322,6 +377,27 @@ handle_cast({leader_hint, Node}, State) ->
 %% nobody is reading and a receipt that never arrives.
 handle_cast({session_closed, Event}, State = #state{leader = Leader}) ->
     cast_leader(Leader, {session_closed, Event}),
+    {noreply, State};
+
+%% M4 — and note that the message which LEAVES is not the message that
+%% arrived. The connector knows a user and one of its own connectors; the
+%% tuple of erlang-java.md §2.4 wants the station between them, and
+%% `vs_coord_srv' matches that arity exactly. Three elements in, four out,
+%% and the extra one comes from this process because this process is the
+%% one that knows which station it is.
+%%
+%% Getting that wrong is silent in both directions: a three-element
+%% `no_show' on the wire falls into the coordinator's catch-all, which
+%% logs "unexpected cast" into a log nobody is reading, and the strike is
+%% simply never counted. Same trap as `session_closed' above, same fix —
+%% build the tuple in one place and assert its shape in a test.
+handle_cast({no_show, UserId, ConnId},
+            State = #state{leader = Leader, station_id = StationId}) ->
+    cast_leader(Leader, {no_show, UserId, StationId, ConnId}),
+    {noreply, State};
+
+handle_cast({show_up, UserId}, State = #state{leader = Leader}) ->
+    cast_leader(Leader, {show_up, UserId}),
     {noreply, State};
 
 %% P14 — a connector answering the `{claims_rebuild, …}' this process

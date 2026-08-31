@@ -2313,3 +2313,126 @@ Non lo correggiamo, per la stessa ragione per cui §6 non ricostruisce la prenot
 colonnina può dire per quanto ha **erogato**, non per quanto il cavo è rimasto dentro dopo che
 l'erogazione è finita. Sarebbe un campo nuovo nel contratto per un caso raro, e chiederebbe
 all'hardware una risposta che l'hardware non ha.
+
+---
+
+## 23. Due garanzie diverse per due nature diverse: la penalità è at-most-once, deliberatamente (M4-A)
+
+La stazione osservava il no-show da M1 (`vs_connector.erl:455`, con accanto il commento
+«Reported, never written») e non lo diceva a nessuno: quel `notify` va al manager e da lì alle
+pagine aperte, non esce dalla stazione. `show_up` non lo mandava proprio nessuno, in tutto
+`src/`. Il lato ricevente era completo fino in fondo dal M4-B di B — `vs_coord_srv.erl:247-252`
+→ `vs_coord_bo:penalty_event/1` → `ErlangBridge.java:155-156` → `PenaltyService` → la colonna.
+Mancava l'anello nostro, e quindi il contatore restava a zero mentre ogni scadenza veniva
+osservata.
+
+M4-A lo chiude con due chiamate sole: `vs_claim_client:no_show/2` e `:show_up/1`, chiamate dal
+connettore, che castano al leader con `cast_leader/2`.
+
+### 23.1 Perché non riusiamo la garanzia di `session_closed`
+
+`session_closed` (§13.2) è **at-least-once su una scrittura idempotente**: l'evento sveglia uno
+sweep che rilegge una riga già committata in MySQL, quindi un duplicato costa uno sweep
+anticipato e una perdita costa un intervallo di ritardo. Nessuno *conta* quel messaggio.
+
+La penalità ha la forma opposta. Atterra su
+`UPDATE users SET no_show_count = no_show_count + 1` (`UserDao.java:139`) e **non esiste nessuna
+riga da rileggere**: quel messaggio *è* la registrazione che la prenotazione è stata mancata.
+I due modi di sbagliare quindi non si somigliano affatto:
+
+| | conseguenza |
+|---|---|
+| uno **perso** | uno strike mai contato: la sospensione arriva una prenotazione mancata più tardi |
+| uno **duplicato** | un account sospeso per un giorno dopo **una** sola prenotazione mancata, e in database non resta niente che spieghi perché |
+
+Fra un biglietto strappato e una punizione ingiusta la scelta non è in bilico. Quindi
+**at-most-once**: `cast_leader` e basta, nessuna coda, nessun retry, nessun buffer da svuotare
+quando un leader ritorna. Non è una robustezza che manca, è una robustezza che sarebbe un
+difetto — la stessa `#state{}` che tenesse la coda sarebbe la cosa che conta due volte lo
+strike al primo failover.
+
+All'orale la frase è: *la garanzia giusta non è la più forte, è quella che corrisponde alla
+natura della scrittura a valle — idempotente contro contatore.*
+
+### 23.2 Anche B ha scelto lo stesso verso, e questo è ciò che rende la scelta sicura
+
+`vs_coord_bo.erl:144-155` inoltra un `penalty_event` **solo** mentre quel coordinatore è quello
+che serve, e altrimenti lo scarta con un log. Il commento accanto dice perché: «relaying it from
+two coordinators at once would count one no-show twice — Java's counter has no way to tell the
+duplicates apart».
+
+Va letto per quello che è: **nessuno dei due lati deduplica; tutti e due evitano di duplicare.**
+Il gate di B protegge l'unico salto che poteva moltiplicare un evento (coordinatore → Java, con
+più coordinatori in gioco durante un handover); non protegge affatto una stazione che mandasse
+lo stesso `no_show` due volte, perché niente in Java distingue il secondo dal primo. È
+esattamente per questo che l'at-most-once deve valere anche dal nostro lato: siamo l'unico
+punto in cui quel duplicato si può ancora non creare.
+
+### 23.3 Un solo punto di partenza per ciascuno dei due eventi
+
+- **`no_show`** parte **solo** da `held(state_timeout, lease_expired, …)`. Le altre tre uscite
+  di `held` non sono no-show e non devono diventare strike: un `cancel` è il conducente che
+  mantiene la parola in anticipo; un `revoke` è il sistema che chiude la finestra (l'ha deciso
+  il coordinatore, non il driver — e succede anche per un failover o per un oldest-wins andato
+  storto, `claim.md` §5.5); una colonnina che smette di rispondere è un guasto nostro, e la
+  ragione del rilascio lo dice già (`cancelled`, non `expired`). SCOPE §3.3 penalizza una
+  prenotazione che **scade**, e quel timer è l'unica cosa nel sistema che la misura.
+- **`show_up`** parte **solo** dalla clausola `plugged` accettata di `held`. Non dal walk-in di
+  `free/3` (nessuna promessa da onorare) e non dall'adozione §6 (hardware che ritrova il cavo,
+  non un conducente che arriva). Il walk-in in particolare **deve** restare muto: SCOPE §3.3
+  lascia deliberatamente caricare senza prenotare a un account sospeso, e se il walk-in
+  azzerasse il contatore la sospensione verrebbe annullata proprio da ciò che continua a
+  concedere.
+
+Che i punti di partenza siano due si verifica con un `grep`; che restino due lo tengono i test,
+e i negativi valgono quanto i positivi — sono loro a rendere «un solo punto di partenza»
+un'affermazione sul comportamento invece che sul punto in cui una riga si trova oggi. Coperte:
+la scadenza e il `plugged` accettato (che devono segnalare); il `plugged` rifiutato, il `revoke`,
+la colonnina persa oltre la grazia, il `cancel` e il walk-in (che devono tacere) — il walk-in è
+una clausola di `free/3`, non un'uscita di `held`, ed è nell'elenco perché è quello che un
+lettore si aspetta di trovare fra le due.
+
+Resta senza asserzione propria una sola uscita di `held`: il `cp_status` `faulted`/`unavailable`.
+È la gemella della grazia scaduta — stessa `release(cancelled)`, stesso `session_interrupted`,
+stesso `out_of_service` — e non è coperta perché il valore marginale di un settimo test sulla
+stessa famiglia è basso, non perché sia stata dimenticata.
+
+### 23.4 La tupla si costruisce in un posto solo, e un test ne asserisce la forma
+
+Il connettore sa un utente e un connettore; la tupla di `erlang-java.md` §2.4 vuole la stazione
+in mezzo. L'elemento in più lo aggiunge il claim client (`{no_show, UserId, StationId, ConnId}`),
+perché è l'unico processo che sa di quale stazione si tratta.
+
+**Perché un test sulla forma e non solo sull'invio**: `vs_coord_srv` matcha quelle arità
+esattamente, e qualunque altra cade nel suo catch-all — un `logger:warning` in un log che
+nessuno legge, e lo strike semplicemente non contato. Non diventerebbe rosso da nessuna parte.
+Per questo `vs_mock_coord` ha ora le due clausole con la forma esatta (non un match sul solo
+tag): una `no_show` con un elemento di troppo cade nel *suo* catch-all senza essere registrata,
+come cadrebbe in quello del coordinatore vero, e il test va rosso qui invece che in silenzio in
+integrazione. Verificato mutando l'arità di proposito: 1 test rosso su 28.
+
+### 23.5 `vs_claim_null` ha dovuto crescere, `session_closed` no
+
+`vs_claim_null` non ha `session_closed/1` e continua a non averlo: il suo unico chiamante
+(`vs_station_db.erl:509`) avvolge la chiamata in un `try/catch` e tratta il fallimento come una
+sveglia best-effort persa — la riga è già in MySQL e lo sweep la trova comunque.
+
+I due nuovi non hanno quella rete. `vs_connector` li chiama dritti da `held/3`, perché non c'è
+niente su cui ripiegare, e un `undef` ucciderebbe il connettore nell'istante esatto in cui una
+prenotazione scade: una stazione con `CLAIM_MOD=vs_claim_null` perderebbe una presa a ogni
+no-show. Quindi lo stand-in deve rispondere — e lo fa rumorosamente sul `no_show`, come già fa
+sul grant, perché senza coordinatore la penalità di SCOPE §3.3 semplicemente non si applica e
+questo è un buco che va detto, non nascosto.
+
+La regola generale, che vale oltre questo caso: **una rete try/catch attorno a una chiamata
+iniettata è una decisione sul contratto del modulo iniettato**, non un dettaglio del chiamante.
+Dov'è, il modulo può omettere la funzione; dove non c'è, non può.
+
+### 23.6 Il difetto che l'E2E ha corretto nel piano
+
+Il piano si aspettava `no_show_count = 2` in MySQL dopo due scadenze. È falso, e lo è per una
+scelta di B che è giusta: `UserDao.suspendUntil` (riga 178-185) scrive
+`SET suspended_until = ?, no_show_count = 0` — «resets the streak: the penalty has been served
+on it». Al secondo strike il contatore torna a **0** e la prova che i due strike ci sono stati
+è `suspended_until`, più le due righe in `notifications`. Misurato: `no_show_count = 0`,
+`suspended_until = 2026-09-01 08:41:15`, terzo `reserve` rifiutato `SUSPENDED`.

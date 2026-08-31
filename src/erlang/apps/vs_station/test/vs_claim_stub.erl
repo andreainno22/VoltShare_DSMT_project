@@ -9,7 +9,7 @@
 -module(vs_claim_stub).
 
 -export([set_reply/1, calls/0, reset/0, last_claim_id/0]).
--export([acquire/4, renew/2, release/2, session_closed/1]).
+-export([acquire/4, renew/2, release/2, session_closed/1, no_show/2, show_up/1]).
 
 -define(REPLY, {?MODULE, reply}).
 -define(CALLS, {?MODULE, calls}).
@@ -61,4 +61,24 @@ release(ClaimId, Reason) ->
 %% it in the same call log lets a test assert the tuple field for field.
 session_closed(Event) ->
     record({session_closed, Event}),
+    ok.
+
+%% M4 — the two penalty events the connector reports (erlang-java.md §2.4).
+%%
+%% Recorded like everything else, and the count is the assertion here more
+%% than the shape. An at-most-once event has no reply to look at: the only
+%% observable difference between "sent once" and "sent twice" is a second
+%% entry in this log, and a second entry is a doubled counter and an
+%% unjust suspension. Hence the tests count, they do not only match.
+%%
+%% Three elements, not four: the connector knows a user and a connector,
+%% and the station id is added one hop later by `vs_claim_client'. What
+%% travels on the wire is asserted where it is built — in
+%% vs_claim_client_tests, against vs_mock_coord.
+no_show(UserId, ConnId) ->
+    record({no_show, UserId, ConnId}),
+    ok.
+
+show_up(UserId) ->
+    record({show_up, UserId}),
     ok.

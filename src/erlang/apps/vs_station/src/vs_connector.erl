@@ -453,6 +453,25 @@ held(state_timeout, lease_expired, Data = #data{hold = Hold}) ->
     %% Reported, never written: the penalty counter belongs to the back
     %% office alone (schema.sql, ownership rules).
     notify(Data, {no_show, Hold#hold.user_id}),
+    %% M4-A — and now also *said to somebody who can act on it*. The
+    %% `notify' above goes to the station manager and from there to the
+    %% open pages; it never left this station, which is why the counter
+    %% stayed at zero while every no-show was being observed. This line is
+    %% the other half: claim client → coordinator → Java → the column
+    %% (erlang-java.md §2.4).
+    %%
+    %% **Only from here.** The other three ways out of `held' are not
+    %% no-shows and must not become strikes: a `cancel' is the driver
+    %% keeping their word ahead of time, a `revoke' is the system closing
+    %% the window (the coordinator decided, not the driver), and a charge
+    %% point that stops answering is our fault, not theirs. SCOPE §3.3
+    %% penalises a reservation that *expires*, and this timer is the only
+    %% thing in the system that measures that.
+    %%
+    %% One call, no retry: see the note on `vs_claim_client:no_show/2' —
+    %% a duplicate here is a doubled counter, which is worse than a lost
+    %% strike.
+    (Data#data.claim_mod):no_show(Hold#hold.user_id, Data#data.conn_id),
     {next_state, free, Data};
 
 held({call, From}, {cancel, UserId}, Data = #data{hold = #hold{user_id = UserId}}) ->
@@ -478,6 +497,21 @@ held({call, From}, {plugged, Info}, Data = #data{hold = Hold}) ->
             Session = adopt(Info#{user_id => Hold#hold.user_id},
                             claim_of(Hold), Data),
             notify(Data, {session_started, Hold#hold.user_id}),
+            %% M4-A — the reservation has been honoured, so the
+            %% consecutive streak resets: "turning up resets the counter"
+            %% (SCOPE §3.3, erlang-java.md §2.4).
+            %%
+            %% `Hold#hold.user_id', never `maps:get(user_id, Info)': D1
+            %% again. The charge point identifies a vehicle and has no
+            %% voice on the account, so the streak that is cleared is the
+            %% holder's — the same person the session was just opened on.
+            %%
+            %% This clause and no other. The walk-in of `free/3' honours
+            %% no reservation (there was none to miss, and a walk-in is
+            %% exactly what a suspended account is still allowed to do),
+            %% and the §6 adoption is hardware finding its cable again,
+            %% not a driver arriving.
+            (Data#data.claim_mod):show_up(Hold#hold.user_id),
             %% D-8: the reservation has done its work and is discarded
             %% here. Left in place it went on being reported by
             %% `build_snapshot/2', so a connector that was charging still

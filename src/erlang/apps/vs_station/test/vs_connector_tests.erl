@@ -139,7 +139,12 @@ holder_can_cancel_test() ->
         ?assertEqual(ok, vs_connector:cancel(Pid, ?USER)),
         ?assertEqual(free, state_of(Pid)),
         ?assertMatch([{release, _, cancelled}],
-                     [C || C = {release, _, _} <- vs_claim_stub:calls()])
+                     [C || C = {release, _, _} <- vs_claim_stub:calls()]),
+        %% M4-A — and it is not a no-show. A driver who cancels is keeping
+        %% their word ahead of time and giving the outlet back early, which
+        %% is the behaviour the penalty exists to encourage: charging a
+        %% strike for it would punish exactly the right thing to do.
+        ?assertEqual([], [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
     end).
 
 others_cannot_cancel_test() ->
@@ -168,6 +173,33 @@ no_show_is_reported_not_written_test() ->
         ?assertEqual([], vs_db_stub:rows())
     end).
 
+%% M4-A — and the other half: it is reported *outwards* too, which until
+%% this milestone it was not. The `notify' above never left the station.
+%%
+%% The assertion is on the whole list, not on a match: the count is the
+%% property. `no_show' is at-most-once by design (vs_claim_client:no_show/2)
+%% because it lands on `no_show_count = no_show_count + 1', so a second
+%% call is not a harmless repeat — it is a day's suspension for a driver
+%% who missed one reservation. One entry, or this test is red.
+%%
+%% `state_of/1' before the assertion is the synchronisation, not decoration:
+%% it is a gen_statem call, so it cannot be answered until the
+%% `lease_expired' callback has run to its end — which is where the
+%% claim_mod call is. Without it the read would race a line of the callback
+%% that had not happened yet. No sleep, and none needed (P11).
+lease_expiry_reports_one_no_show_to_the_coordinator_test() ->
+    with_connector(#{lease_seconds => 0}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertMatch({no_show, ?USER}, expect_event(no_show)),
+        ?assertEqual(free, state_of(Pid)),
+        %% the connector id is the third field of erlang-java.md §2.4 and
+        %% the fixture's connector is 3 — a hard-coded 3 rather than a `_'
+        %% because the whole point of carrying it is that it identifies
+        %% which outlet was wasted
+        ?assertEqual([{no_show, ?USER, 3}],
+                     [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
+    end).
+
 %%%===================================================================
 %%% authorisation at the cable
 %%%===================================================================
@@ -179,12 +211,34 @@ right_vehicle_starts_charging_test() ->
         ?assertEqual(charging, state_of(Pid))
     end).
 
+%% M4-A — the reservation was honoured, so the streak resets (SCOPE §3.3).
+%% `plugged/2' is a call, so its return is the synchronisation: the
+%% callback has finished by the time the stub is read.
+honoured_reservation_reports_the_show_up_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertEqual(ok, plug(Pid, ?VEHICLE)),
+        ?assertEqual([{show_up, ?USER}],
+                     [C || C = {show_up, _} <- vs_claim_stub:calls()])
+    end).
+
 wrong_vehicle_is_refused_and_reservation_survives_test() ->
     with_connector(fun(Pid) ->
         {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
         ?assertEqual({error, not_your_reservation}, plug(Pid, ?OTHER_VEHICLE)),
         ?assertEqual(held, state_of(Pid)),
         ?assertEqual(?USER, maps:get(held_by, vs_connector:snapshot(Pid)))
+    end).
+
+%% M4-A — somebody else's car at the cable is not the holder turning up.
+%% The reservation survives (asserted above), so the promise is still
+%% outstanding and clearing the streak now would forgive a no-show that
+%% may still happen.
+wrong_vehicle_reports_no_show_up_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertEqual({error, not_your_reservation}, plug(Pid, ?OTHER_VEHICLE)),
+        ?assertEqual([], [C || C = {show_up, _} <- vs_claim_stub:calls()])
     end).
 
 %% Walk-in on a free connector needs no claim at all — which is also what
@@ -194,6 +248,22 @@ walk_in_needs_no_claim_test() ->
         ?assertEqual(ok, plug(Pid, ?VEHICLE)),
         ?assertEqual(charging, state_of(Pid)),
         ?assertEqual([], [C || C = {acquire, _, _, _, _} <- vs_claim_stub:calls()])
+    end).
+
+%% M4-A — and it clears no streak either, for the same reason it needs no
+%% claim: nothing was ever promised, so there is nothing to honour. It is
+%% the `free/3' clause of `plugged', not the `held/3' one, and only the
+%% latter reports a show-up.
+%%
+%% This is the assertion that keeps the rule of SCOPE §3.3 coherent: a
+%% suspended driver may still walk in and charge, and if walking in
+%% cleared the counter the suspension would be undone by the very thing it
+%% deliberately still allows.
+walk_in_reports_no_show_up_test() ->
+    with_connector(fun(Pid) ->
+        ?assertEqual(ok, plug(Pid, ?VEHICLE)),
+        ?assertEqual(charging, state_of(Pid)),
+        ?assertEqual([], [C || C = {show_up, _} <- vs_claim_stub:calls()])
     end).
 
 %%%===================================================================
@@ -360,6 +430,24 @@ revocation_frees_a_held_connector_test() ->
         vs_connector:revoke(Pid, ClaimId),
         ?assertMatch({claim_revoked, ?USER}, expect_event(claim_revoked)),
         ?assertEqual(free, state_of(Pid))
+    end).
+
+%% M4-A — a revocation frees the connector, and that is where it ends. It
+%% is NOT a no-show: the coordinator closed the window, the driver never
+%% got the chance to miss it. Penalising it would punish a driver for a
+%% failover or for oldest-wins going against them (claim.md §5.5).
+%%
+%% One of the three endings of `held' that must stay silent, and the one
+%% worth nailing down: it is the only one where somebody deliberately took
+%% the reservation away, so it is the one where a strike would look
+%% plausible in the code and be wrong in the world.
+revocation_in_held_is_not_a_no_show_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        vs_connector:revoke(Pid, claim_id_of(Pid)),
+        ?assertMatch({claim_revoked, ?USER}, expect_event(claim_revoked)),
+        ?assertEqual(free, state_of(Pid)),
+        ?assertEqual([], [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
     end).
 
 %% A revocation for a claim this connector never held is ignored: a stale
@@ -655,6 +743,26 @@ a_charge_point_gone_past_the_grace_releases_the_reservation_test() ->
         ?assertEqual(out_of_service, state_of(Pid)),
         ?assertMatch([{release, _, cancelled}],
                      [C || C = {release, _, _} <- vs_claim_stub:calls()])
+    end).
+
+%% M4-A — and it is not a no-show. The driver may well have been on their
+%% way; what failed is our hardware, and the release reason says so
+%% (`cancelled', not `expired'). Charging a strike for an outlet that
+%% stopped answering would bill the operator's fault to the customer.
+%%
+%% The last of the three silent endings of `held'. Together with the
+%% revocation above and the `cancel' — which never reaches this code at
+%% all — they are what makes the single call site of `no_show' a claim
+%% about behaviour rather than about where a line happens to sit.
+a_charge_point_gone_past_the_grace_is_not_a_no_show_test() ->
+    with_connector(#{cp_grace_ms => 100}, fun(Pid) ->
+        Cp = fake_cp(),
+        ok = vs_connector:attach_cp(Pid, Cp),
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        stop_cp(Cp),
+        ?assertMatch({session_interrupted, ?USER}, expect_event(session_interrupted)),
+        ?assertEqual(out_of_service, state_of(Pid)),
+        ?assertEqual([], [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
     end).
 
 %% "Charging that was in progress is closed with the energy last reported —

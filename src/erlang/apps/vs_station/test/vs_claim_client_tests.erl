@@ -255,6 +255,84 @@ renew_batches_the_claims_every_tick_test() ->
     end).
 
 %%%===================================================================
+%%% the penalty events (M4-A, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% These three assert the FORM on the wire, not merely that something was
+%% sent, and the reason is that getting the arity wrong fails silently in
+%% production: `vs_coord_srv' matches `{no_show, _, _, _}' and
+%% `{show_up, _}' exactly, and anything else lands in its catch-all —
+%% "unexpected cast" in a log nobody reads, and a strike that is never
+%% counted. Nothing would be red anywhere. So the equality below is on
+%% the whole tuple, against a mock that only records the shapes the real
+%% coordinator accepts.
+
+%% Four elements, and the middle one is the point: the connector passed a
+%% user and a connector, and the station id was filled in by the client
+%% out of its own state. That is the only field of the tuple nobody but
+%% this process could have supplied.
+no_show_reaches_the_leader_as_the_four_tuple_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:no_show(?USER, ?CONN),
+        ok = wait_until(fun() ->
+            history_has(fun(M) -> M =:= {no_show, ?USER, 1, ?CONN} end)
+        end)
+    end).
+
+show_up_reaches_the_leader_as_the_two_tuple_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:show_up(?USER),
+        ok = wait_until(fun() ->
+            history_has(fun(M) -> M =:= {show_up, ?USER} end)
+        end)
+    end).
+
+%% At-most-once has a failure mode, and this is it: the leader is not
+%% there, the strike is lost, and that is the accepted outcome — not a
+%% crash, and not a queue that would replay it later and count it twice
+%% (vs_claim_client:no_show/2 says why).
+%%
+%% What is asserted is the *absence* of machinery. `get_route' is a call,
+%% so it cannot be answered until both casts have been handled: by the
+%% time it returns, the client has already done whatever it was going to
+%% do with them. An empty mailbox and a live process afterwards is what
+%% "nothing was buffered, nothing is being retried" looks like from
+%% outside — there is no queue to inspect because there is no queue.
+%%
+%% No sleep anywhere: the synchronisation is the call (P11).
+%%
+%% `renew_interval_ms' is pushed out of the way for the same reason the
+%% announce already is, and it is not tidiness: `client_opts/0' shortens the
+%% renew to 50 ms so the other tests can watch a batch go by, which puts a
+%% `renew_tick' in this process's mailbox twenty times a second. The queue
+%% length below would then be sampled against a timer rather than against the
+%% two casts — green on an idle machine and red on a busy one, which is
+%% exactly the shape of the flake P11 was about. With both timers at a
+%% minute there is no periodic message left, and a zero means what it says.
+penalty_events_with_an_unreachable_leader_are_dropped_test() ->
+    {ok, Client} = vs_claim_client:start_link(
+                     maps:merge(client_opts(),
+                                #{coord_nodes       => ['nonexistent@nowhere'],
+                                  renew_interval_ms => 60000})),
+    try
+        ok = vs_claim_client:no_show(?USER, ?CONN),
+        ok = vs_claim_client:show_up(?USER),
+        %% both casts have been processed by the time this returns
+        ?assertMatch({'nonexistent@nowhere', _, _},
+                     gen_server:call(vs_claim_client, get_route)),
+        ?assert(is_process_alive(Client)),
+        ?assertEqual({message_queue_len, 0},
+                     process_info(Client, message_queue_len)),
+        %% and the claim table is untouched: a penalty event is not a claim
+        %% and must not leave a trace in the reflection
+        ?assertEqual({1, []}, holds())
+    after
+        stop([Client]),
+        wait_gone([vs_claim_client]),
+        flush()
+    end.
+
+%%%===================================================================
 %%% end to end: the revocation path (claim.md §3.2, §5.4)
 %%%===================================================================
 

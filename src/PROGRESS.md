@@ -2724,6 +2724,132 @@ conta è quello della riga.
   non cambia nient'altro.
 - **La segnalazione no-show**, l'altro pezzo di M4-A: il contatore è scritto solo da B.
 
+## 7zg. M4-A: la stazione racconta il no-show, e l'anello delle penalità si chiude — 31 agosto
+
+L'anello era aperto esattamente a metà, e la metà mancante era nostra. La stazione **osservava**
+la scadenza da M1 — `vs_connector.erl:455`, con accanto un commento onesto, «Reported, never
+written» — ma quel `notify` va al manager e da lì alle pagine aperte: non usciva dalla stazione.
+`show_up` non lo mandava nessuno, in tutto `src/`. Il lato di B era completo fino in fondo dal
+M4-B (`vs_coord_srv.erl:247-252` → `vs_coord_bo:penalty_event/1` → `ErlangBridge.java:155-156` →
+`PenaltyService` → `UserDao`), e stava in ascolto di un messaggio che non arrivava mai. Il
+contatore restava a zero mentre ogni no-show veniva visto.
+
+Due chiamate nuove sul claim client, due call-site nel connettore, e niente altro.
+
+### Le quattro verifiche bloccanti, prima di scrivere codice
+
+1. **Il gate anti-doppio-conteggio di B è sul salto coordinatore→Java, non su stazione→
+   coordinatore** (`vs_coord_bo.erl:144-155`). Inoltra solo mentre `serving = true`, «relaying
+   it from two coordinators at once would count one no-show twice — Java's counter has no way to
+   tell the duplicates apart». Letto per intero: protegge dal fan-out durante un handover, e
+   **non** deduplica affatto due `no_show` mandati dalla stessa stazione. È precisamente ciò che
+   rende l'at-most-once dal nostro lato necessario e non solo economico — siamo l'ultimo punto in
+   cui quel duplicato si può non creare.
+2. **Il mock è `vs_claim_stub` e registra per struttura, ma le clausole vanno scritte a mano**
+   (`test/vs_claim_stub.erl`): ogni callback esportata chiama `record({Tag, Args...})` in una
+   lista `persistent_term`, e `calls/0` la restituisce grezza — nessuna whitelist, ma nemmeno
+   nessun catch-all. E **`vs_claim_null` non ha `session_closed` per un motivo, non per una
+   dimenticanza**: il suo unico chiamante (`vs_station_db.erl:509`) avvolge la chiamata in un
+   `try/catch` e tratta il fallimento come una sveglia best-effort persa. I due nuovi non hanno
+   quella rete — `vs_connector` li chiama dritti da `held/3` — quindi lo stand-in **deve**
+   averli, o `CLAIM_MOD=vs_claim_null` perderebbe una presa a ogni scadenza.
+3. **La sospensione torna al coordinatore in millisecondi, in catena sincrona** con il secondo
+   strike: `ErlangBridge.handle` → `PenaltyService.onNoShow` → `suspend()` →
+   `UserDao.suspendUntil` → `ErlangBridge.notifySuspension` → `vs_coord_srv.erl:295`. Nessun
+   intervallo di polling da aspettare. Misurato nell'E2E: `suspended_until` scritto e terzo
+   `reserve` rifiutato **entro lo stesso secondo**.
+4. **Nessuno abbassa `LEASE_SECONDS` oggi**: `${LEASE_SECONDS:-900}` in tre punti del compose
+   (stazioni e coordinatori) e nient'altro fuori dai test. Il minimo sicuro non è un numero
+   assoluto ma una **direzione**: abbassarlo sulla sola `station1` lascia il claim del
+   coordinatore a 900+60 s, cioè molto più lungo della prenotazione — che è il verso giusto
+   (`claim.md` §3.1, il claim non deve mai morire sotto una prenotazione viva). Usati 5 s.
+
+### Il piano si sbagliava su un numero, ed era un numero dell'E2E
+
+Diceva «due scadenze → `no_show_count = 2`». Falso: `UserDao.suspendUntil` (righe 178-185)
+scrive `SET suspended_until = ?, no_show_count = 0` — «resets the streak: the penalty has been
+served on it». Al secondo strike il contatore torna a **zero**, e la prova che i due strike ci
+sono stati è `suspended_until` più le righe in `notifications`. Trovato leggendo `UserDao`
+durante le verifiche, prima di scrivere codice; l'E2E asserisce i valori corretti.
+
+### Catena dei chiamanti — due voci che §6 del piano non aveva
+
+1. **`vs_mock_coord`.** Il piano elencava `vs_claim_null` e `vs_claim_stub` e si fermava lì. Ma
+   il test che asserisce la *forma sul filo* passa dal coordinatore finto, e il suo
+   `handle_cast` catch-all **non registra**: senza due clausole nuove il test non avrebbe potuto
+   distinguere «mandato con la forma giusta» da «mandato con la forma sbagliata». Aggiunte con
+   la forma esatta, non con un match sul solo tag, così un elemento di troppo cade nel catch-all
+   lì come cadrebbe in quello del coordinatore vero.
+2. **`vs_driver_stub` no, e valeva controllarlo.** È `claim_mod` per `vs_driver_proto`, ma solo
+   per `coordinator_reachable/0`: nessun connettore gira con quel modulo, quindi nessuna
+   clausola da aggiungere. Verificato, non supposto.
+
+Per il resto la catena è corta per costruzione: nessuna firma esistente cambia, i due call-site
+aggiungono una riga ciascuno e non toccano transizioni, reply o rilasci. Chi guarda il manager
+non vede niente di nuovo.
+
+### Verificato — girato davvero
+
+- **Suite: 348 → 357**, `EXPECTED_TESTS` aggiornato nello stesso commit. Nove test nuovi: sei sul
+  connettore — due che devono segnalare (scadenza, `plugged` accettato) e quattro che devono
+  tacere (`plugged` rifiutato, `revoke`, colonnina persa oltre la grazia, walk-in) — e tre sul
+  client (le due forme sul filo, più il leader irraggiungibile). Più un'asserzione aggiunta al
+  test del `cancel` che già esisteva: è la quinta uscita silenziosa, e senza quella riga la frase
+  «solo dalla scadenza» era più larga di ciò che i test tenevano. Resta scoperta una sola uscita
+  di `held`, il `cp_status faulted`, gemella della grazia scaduta — stessa `release(cancelled)`,
+  stesso `out_of_service`.
+- **La mutazione, perché un test sulla forma va provato falsificandolo.** Aggiunto un quinto
+  elemento al `no_show` castato: **1 test rosso su 28** in `vs_claim_client_tests`. Senza le
+  clausole nuove del mock sarebbe rimasto verde, che è esattamente il modo in cui questo difetto
+  arriva in produzione.
+- **E2E sul compose** (7 container, `mysql` healthy, `station1` ricostruita dal branch con
+  `LEASE_SECONDS=5`, leader `vs@coord3`). Due sequenze, un solo utente perché il database ne ha
+  uno solo (id 12 `andrea`, veicolo 88 — `users`/`vehicles` sono di B e nascono alla
+  registrazione, `schema.sql` semina solo stazioni e connettori):
+  - **la sequenza che NON deve sospendere** — scadenza → `no_show_count = 1`; arrivo onorato
+    (cavo dentro col veicolo giusto prima della scadenza) → **0**; scadenza → **1**,
+    `suspended_until` ancora `NULL`. È «turning up resets the counter» di SCOPE §3.3, misurato.
+  - **la sequenza che deve sospendere** — due scadenze consecutive → `no_show_count = 0` e
+    `suspended_until = 2026-09-01 08:41:15` (un giorno esatto dal secondo strike); il `reserve`
+    successivo rifiutato **`SUSPENDED`** con il testo di `vs_driver_proto.erl:418-420`, «the
+    account is serving a no-show penalty; walk-in charging still works», su un connettore
+    **libero** — cioè il rifiuto riguarda l'account, non la presa.
+- **La catena intera nei log**, non solo agli estremi: `station1` «connector 3 lease expired for
+  user 12» → `backoffice` «No-show 1 for user 12 at station 1, connector 3». I tre campi della
+  4-tupla arrivano interi fino a Java.
+- **Il `cancel` non è uno strike**, osservato per caso e vale come misura: la prenotazione di
+  verifica finale è stata cancellata e il contatore è rimasto 0.
+
+### Un dettaglio dell'E2E che sembra un difetto e non lo è
+
+Il primo terzo `reserve` è tornato `INVALID_STATE` invece di `SUSPENDED`: il connettore 3 era
+andato `out_of_service` perché l'emulatore colonnina se n'era andato 30 s prima e la grazia era
+scaduta. Ripetuto su un connettore mai toccato da una colonnina, il rifiuto è `SUSPENDED`. Lo
+stato del connettore viene prima del controllo sull'account, che è l'ordine giusto — ma va saputo
+prima di leggere quel `INVALID_STATE` come un buco nell'enforcement.
+
+### Non provato — e perché
+
+1. **Uno strike perso durante un failover vero.** L'at-most-once dice che se il leader cade fra
+   il `cast_leader` e la consegna lo strike è perso: è la conseguenza accettata della scelta, non
+   l'ho prodotta apposta. Il gate `serving` di B (R4 della review PR #5) rende quella finestra
+   più larga di quanto serva, ed è già segnalato a B come rilievo aperto.
+2. **Due `no_show` per lo stesso utente nello stesso istante.** `UserDao.recordNoShow` è
+   transazionale con `FOR UPDATE` (letto), ma servirebbero due stazioni che scadono insieme.
+3. **`recordNoShow` su un utente inesistente.** Il codice ha il ramo («the account is gone;
+   nothing to punish») e non l'ho esercitato: il database ha un utente solo.
+4. **La sospensione che scade da sola.** `is_suspended/2` confronta con l'orologio a ogni claim,
+   quindi scade da sé — ma sarebbe stato domani. L'ambiente l'ho rimesso a posto pulendo MySQL e
+   riavviando il coordinatore che serviva, perché `notifyUnsuspension` **non ha chiamanti** e la
+   mappa in memoria del coordinatore non toglie mai una voce prima della sua scadenza.
+
+### Cosa resta fuori, e perché
+
+`{notify, UserId, Kind, Text}` e il frame `notification` di `ws-driver.md` §5.3 restano al pair
+successivo (R2 della review PR #5: il coordinatore non ha ancora la clausola, la patch è pronta
+nella nota a B). La riga «declared, not yet implemented» di `erlang-java.md` §2.4 va aggiornata
+in PR, non qui: è un file condiviso.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
