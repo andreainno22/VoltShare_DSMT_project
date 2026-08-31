@@ -908,3 +908,126 @@ the_battery_size_does_not_leak_into_the_state_frame_test() ->
                  lists:sort(maps:keys(Mine))),
     %% and it is still the same session, seen from §5.1
     ?assertEqual({false, true}, {maps:get(held_by_me, Mine), maps:get(mine, Mine)}).
+
+%%%===================================================================
+%%% §5.3 — the notification, and who is allowed to see it
+%%%===================================================================
+%%
+%% The frame is built here and pushed by `vs_driver_ws'. Both halves are
+%% tested in this module because the split is the same one the module doc
+%% describes: the shape is a decision and belongs to the protocol, while
+%% the transport contributes exactly one thing — the identity filter —
+%% and that one thing is the whole of §7.3 on this frame.
+
+the_notification_frame_has_the_shape_of_5_3_test() ->
+    Frame = vs_driver_proto:notification_frame(overstay_started, 3),
+    ?assertEqual(notification, maps:get(type, Frame)),
+    %% server-initiated: there is no request to answer
+    ?assertEqual(null, maps:get(request_id, Frame)),
+    Payload = maps:get(payload, Frame),
+    ?assertEqual(lists:sort([kind, text, connector_id]),
+                 lists:sort(maps:keys(Payload))),
+    ?assertEqual(<<"overstay_started">>, maps:get(kind, Payload)),
+    ?assertEqual(3, maps:get(connector_id, Payload)),
+    ?assertEqual(vs_driver_proto:notification_text(overstay_started),
+                 maps:get(text, Payload)).
+
+%% The six kinds this station can produce, each with a sentence of its
+%% own, and each sentence short enough for the row it will become.
+%% `notifications.kind' is VARCHAR(40) and `notifications.text' is
+%% VARCHAR(255) (schema.sql): a text that did not fit would be truncated
+%% by MySQL and the defect would be visible only in the database, only in
+%% production, and only to whoever went looking.
+every_producible_kind_has_a_sentence_that_fits_the_column_test() ->
+    lists:foreach(
+      fun(Kind) ->
+          Text = vs_driver_proto:notification_text(Kind),
+          ?assert(is_binary(Text)),
+          ?assert(byte_size(Text) > 0),
+          ?assert(byte_size(Text) =< 255),
+          ?assert(byte_size(atom_to_binary(Kind, utf8)) =< 40),
+          %% and no two kinds share a sentence: a page that said the same
+          %% thing for a full battery and for a revoked claim would be a
+          %% page that said nothing
+          ?assertEqual(1, length([K || K <- kinds(),
+                                       vs_driver_proto:notification_text(K) =:= Text]))
+      end, kinds()).
+
+kinds() ->
+    [reservation_expiring, reservation_expired, claim_revoked,
+     charge_complete, overstay_started, session_interrupted].
+
+%% `waitlist_offer' is the seventh kind of §5.3 and the one nothing can
+%% emit: the waitlist is not implemented and §5.1 declares the queue a
+%% constant. It has no row in the table on purpose, so the day somebody
+%% builds a waitlist without revisiting the table, the fallback says so
+%% out loud instead of shipping a blank notification.
+an_unknown_kind_is_answered_loudly_and_not_with_a_crash_test() ->
+    Text = vs_driver_proto:notification_text(waitlist_offer),
+    ?assert(is_binary(Text)),
+    ?assert(byte_size(Text) =< 255).
+
+%%%-------------------------------------------------------------------
+%%% the push, and the filter on it
+%%%-------------------------------------------------------------------
+%%
+%% Driven through `vs_driver_ws:websocket_info/2' directly, on a state map
+%% built by hand — the same way `vs_cp_proto_tests' drives the charge
+%% point's pushes. A cowboy handler cannot be reached from EUnit without a
+%% listener and a WebSocket client; a callback can, and it is the callback
+%% that breaks if the clause is written below the catch-all.
+
+ws_state(Session) ->
+    #{session => Session, last_state => error, last_session => undefined}.
+
+%% The socket of the driver the news is about. One text frame out, and it
+%% is the §5.3 frame encoded.
+a_notification_reaches_the_socket_of_its_own_driver_test() ->
+    {[{text, Bin}], _State} =
+        vs_driver_ws:websocket_info({driver_notification, ?USER, charge_complete, 2},
+                                    ws_state(joined_session())),
+    Decoded = jsx:decode(Bin),
+    ?assertEqual(<<"notification">>, maps:get(<<"type">>, Decoded)),
+    ?assertEqual(null, maps:get(<<"request_id">>, Decoded)),
+    ?assertEqual(#{<<"kind">>         => <<"charge_complete">>,
+                   <<"text">>         => vs_driver_proto:notification_text(charge_complete),
+                   <<"connector_id">> => 2},
+                 maps:get(<<"payload">>, Decoded)).
+
+%% §7.3, and the only thing the transport contributes to this frame. The
+%% manager broadcasts one notification to every subscriber, so on a
+%% station with a dozen open pages this is the normal outcome for eleven
+%% of them: the socket of a driver the news is not about sends nothing.
+%%
+%% Note what the identity is compared against: the user id bound by the
+%% token at `join'. There is no payload in this path at all — nothing a
+%% client could send would put it on somebody else's notification list.
+another_drivers_notification_is_not_delivered_test() ->
+    %% One session, bound once: two calls to `joined_session/0' produce
+    %% two sessions that differ in the timestamp of their at-most-once
+    %% cache entry, and the assertion here is that the state comes back
+    %% *unchanged*.
+    State = ws_state(joined_session()),
+    ?assertEqual({[], State},
+                 vs_driver_ws:websocket_info({driver_notification, 999,
+                                              charge_complete, 2}, State)).
+
+%% A socket that never joined has no identity to compare with, and gets
+%% nothing — not even a notification that happens to name `undefined'.
+a_socket_that_never_joined_receives_nothing_test() ->
+    Fresh = ws_state(session()),
+    ?assertEqual({[], Fresh},
+                 vs_driver_ws:websocket_info({driver_notification, ?USER, charge_complete, 2},
+                                             Fresh)),
+    ?assertEqual({[], Fresh},
+                 vs_driver_ws:websocket_info({driver_notification, undefined,
+                                              charge_complete, 2}, Fresh)).
+
+%% The clause has to sit ABOVE the catch-all of `websocket_info/2', or a
+%% notification becomes a debug line and the page never hears about it.
+%% Testing the callback rather than reading the source is what makes that
+%% an assertion instead of a hope — the same reason the charge point's
+%% pushes are tested this way (vs_cp_proto_tests).
+an_unrelated_message_still_falls_through_to_the_catch_all_test() ->
+    State = ws_state(joined_session()),
+    ?assertEqual({[], State}, vs_driver_ws:websocket_info(something_else, State)).

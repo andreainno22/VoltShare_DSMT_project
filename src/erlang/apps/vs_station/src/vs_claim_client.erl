@@ -79,6 +79,8 @@
 -export([session_closed/1]).
 %% from the connector, when a reservation is missed or honoured (M4)
 -export([no_show/2, show_up/1]).
+%% from the station manager, for the durable copy of a driver notification
+-export([notify/2]).
 %% lifecycle
 -export([start_link/0, start_link/1]).
 %% pure, and exported so the lobby's three numbers can be tested on a map
@@ -256,6 +258,44 @@ show_up(UserId) ->
     gen_server:cast(?MODULE, {show_up, UserId}).
 
 %%%===================================================================
+%%% the durable copy of a notification (M4-A, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% Third garanzia, third nature — and the trittico is worth stating in
+%% one place because all three look like "a cast to the leader" and none
+%% of them mean the same thing:
+%%
+%%   * `session_closed' is **at-least-once**. It wakes a sweep over a row
+%%     already committed to MySQL. A duplicate costs one early sweep; a
+%%     loss costs one interval of delay. Idempotent by construction.
+%%   * `no_show' is **at-most-once**. It lands on a counter with no row
+%%     behind it, so a duplicate is an unjust suspension and a loss is a
+%%     strike uncounted. The asymmetry decides: see above.
+%%   * `notify' is **at-most-once too, for the opposite reason**. The
+%%     duplicate here is harmless — B's own patch for R2 says so: a
+%%     second row in `notifications' is a line the driver reads once and
+%%     dismisses, and nothing counts it. What a loss costs is a
+%%     convenience: the page that was open already showed the live copy,
+%%     and the row that never arrived was the copy for a driver who was
+%%     not looking. Neither outcome is worth a queue, a retry timer, or a
+%%     buffer to drain when a leader comes back — machinery that would
+%%     exist to protect something nobody is billed for.
+%%
+%% So: `cast_leader/2' and nothing else. Same one line, three different
+%% arguments for it.
+
+%% @doc The durable half of a driver notification. Called by
+%% `vs_station_mgr' on the four kinds of ws-driver.md §5.3 that are worth
+%% a row **and have no other producer**, and from nowhere else.
+%%
+%% The text is not a parameter. It comes from `vs_driver_proto', which is
+%% where the live frame gets it too, so `notifications.jsp' and the open
+%% page cannot end up saying two different things about one event.
+-spec notify(pos_integer(), atom()) -> ok.
+notify(UserId, Kind) ->
+    gen_server:cast(?MODULE, {notify, UserId, Kind}).
+
+%%%===================================================================
 %%% lifecycle
 %%%===================================================================
 
@@ -398,6 +438,25 @@ handle_cast({no_show, UserId, ConnId},
 
 handle_cast({show_up, UserId}, State = #state{leader = Leader}) ->
     cast_leader(Leader, {show_up, UserId}),
+    {noreply, State};
+
+%% M4-A — the 4-tuple of erlang-java.md §2.4, built here and only here.
+%% Two elements in, four out: the kind becomes the binary name of §5.3 and
+%% the sentence is looked up, so the shape `ErlangBridge:onNotify' reads
+%% (`intOf', `textOf', `textOf') is decided in one place and asserted in
+%% one test.
+%%
+%% Today the far end has no clause for it. `vs_coord_srv' matches
+%% `session_closed', `no_show' and `show_up' and nothing else, so this
+%% cast lands in its catch-all at :279 and is logged as an "unexpected
+%% cast" — with the whole term, which is the useful part: B's log shows
+%% the exact tuple that is being dropped. The clause that closes the gap
+%% is R2 in `nota-per-B-review-pr5.md' §2, already written, in `vs_coord/'
+%% and therefore his. Sending anyway is deliberate: it turns an argument
+%% about a missing hop into a line in his log.
+handle_cast({notify, UserId, Kind}, State = #state{leader = Leader}) ->
+    cast_leader(Leader, {notify, UserId, atom_to_binary(Kind, utf8),
+                         vs_driver_proto:notification_text(Kind)}),
     {noreply, State};
 
 %% P14 — a connector answering the `{claims_rebuild, …}' this process

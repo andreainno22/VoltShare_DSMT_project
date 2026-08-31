@@ -2850,6 +2850,210 @@ successivo (R2 della review PR #5: il coordinatore non ha ancora la clausola, la
 nella nota a B). La riga «declared, not yet implemented» di `erlang-java.md` §2.4 va aggiornata
 in PR, non qui: è un file condiviso.
 
+## 7zh. M4-A: il frame `notification` esisteva dal M1 e non l'aveva mai emesso nessuno — 31 agosto
+
+Ultimo pezzo di M4-A. `ws-driver.md` §5.3 descrive il frame dal M1, la pagina lo sa già
+renderizzare (`js/ws.js:262` → `station.js:70`, `note(connector_id, text)`), il ponte Java lo sa
+già ricevere (`ErlangBridge.java:157` → `PenaltyService.onNotify` → `notifications`) — e in mezzo
+**non c'era mittente**. Tre buchi in fila, misurati prima di scrivere:
+
+1. il connettore osservava quasi tutte le notizie ma le diceva **solo al manager**; due
+   (`charge_complete`, `overstay_started`) non esistevano affatto e `reservation_expiring` non
+   aveva il suo timer;
+2. il manager, su ogni `connector_event`, faceva `reallocate` + `broadcast` di **solo stato** —
+   l'evento, che *è* la notizia, non raggiungeva mai i subscriber;
+3. `vs_driver_ws` non aveva una clausola per una notifica e `vs_driver_proto` non aveva il
+   builder del frame.
+
+### Le cinque verifiche bloccanti, prima di scrivere codice
+
+1. **Il catch-all del coordinatore logga il termine intero** — `vs_coord_srv.erl:279-281`,
+   `logger:warning("coordinator: unexpected cast ~p", [Unknown])`. Decide cosa può provare l'E2E
+   della copia durevole: non «arriva e sparisce muto» ma «arriva e si legge per intero nel log
+   di B». È diventato l'argomento centrale della nota per B.
+2. **`notifications`** (`schema.sql:88-98`): `kind VARCHAR(40)`, `text VARCHAR(255)`. Le sei
+   frasi stanno tutte con margine; un test asserisce le due lunghezze invece di fidarsi.
+3. **L'identità del join in `vs_driver_ws`** vive dentro `Session` (`user_id`, legato dal token
+   in `join` e da nient'altro), che sta nella mappa di stato `#{session, last_state,
+   last_session}`. La clausola nuova confronta con quello — nel **capo della clausola**, con
+   `UserId` che compare due volte, così il filtro non può essere aggirato da un payload.
+4. **La semantica OTP dei timeout, confermata sui doc locali** (`stdlib-8.0.3/doc/html/
+   gen_statem.md`): per lo `state_timeout` la doc dice esplicitamente *«A state change cancels
+   this timer»*; nella sezione del `generic_timeout` quella frase **non c'è**, e c'è invece la
+   regola del riarmo per nome. L'asimmetria è il meccanismo su cui poggia tutto il resto.
+5. **Precedente per testare un frame *spinto*: sì**, `vs_cp_proto_tests.erl:806` guida
+   `vs_cp_ws:websocket_info/2` direttamente su una mappa di stato costruita a mano. Non esiste
+   nessun `vs_driver_ws_tests.erl` — quindi i test della clausola nuova stanno in
+   `vs_driver_proto_tests`, con lo stesso metodo.
+
+### Il censimento dei subscriber: §7 del piano ne vedeva metà
+
+Il piano diceva «censisci chi chiama `vs_station_mgr:subscribe`». Farlo davvero mostra che
+**nel manager si entra da due porte**, non da una:
+
+| Porta | Chi | Tollera `{driver_notification, …}`? |
+|---|---|---|
+| `subscribe/0` (call) | `vs_driver_ws.erl:88` — una per pagina aperta | **la gestisce**: è il destinatario |
+| `subscribe/0` (call) | il processo di test, in `vs_station_mgr_tests` | sì |
+| `gen_server:cast(vs_station_mgr, {subscribe, self()})` | **`vs_claim_client.erl:303`** | **sì**, catch-all `handle_info` a `:587`, `logger:debug` |
+
+Il claim client è un subscriber di produzione a tutti gli effetti — si iscrive per alimentare
+`station_stats` per la lobby — e un grep su `subscribe(` non lo trova, perché usa la variante
+cast. Riceverà una riga di debug per ogni notifica: innocuo, ma è esattamente il tipo di cosa
+che il piano dava per «altri iscritti eventuali» e che invece esiste già.
+
+### Un timer che sopravvive a tutto, e il crash che sarebbe certo
+
+`reservation_expiring` deve usare un **timeout generico con nome**, perché in `held` lo
+`state_timeout` è già occupato dal lease e ce n'è uno solo. Il prezzo è che non si cancella mai
+da solo. `sys:get_status/1` pubblica i timer vivi, quindi non è un ragionamento ma una foto:
+
+```
+lease 900, in `held'         : {2, [{state_timeout,lease_expired}, {{timeout,expiring},expiring}]}
+dopo il plugged, in `charging': {1, [{{timeout,expiring},expiring}]}
+dopo l'unplug, in `free'      : {1, [{{timeout,expiring},expiring}]}
+lease 120, in `held'          : {1, [{state_timeout,lease_expired}]}
+```
+
+Lo `state_timeout` sparisce al cambio di stato; l'altro no — e `handle_common` matcha solo
+`{call,…}`, `cast`, `{timeout, cp_grace}` e `info`. Senza una clausola d'assorbimento è un
+`function_clause`, e ci si arriva per **due** strade ordinarie: il conducente che si presenta
+negli ultimi due minuti del lease, e — più banale ancora — **qualunque sessione breve**, che
+lascia il connettore in `free` con il timer ancora armato per altri undici minuti. Non è
+prudenza: è la conseguenza diretta della scelta del tipo di timer.
+
+`overstay_started` usa invece uno `state_timeout` proprio per la ragione opposta: muore uscendo
+da `complete`, quindi chi stacca il cavo dentro la grazia non produce niente e non c'è nessuna
+cancellazione da ricordarsi. E con grazia 0 l'evento non è schedulato ma **accodato** davanti a
+qualunque evento esterno non ancora arrivato (doc di `state_timeout`), il che rende il test
+deterministico senza un solo `sleep`.
+
+### Verificato — girato davvero
+
+**Suite: 357 → 379, 0 failures** (`./src/scripts/eunit_check.sh`, `EXPECTED_TESTS` aggiornato
+nello stesso commit). I 22 nuovi:
+
+- la funzione pura sui tre numeri di §8: `expiring_delay(900000) → 780000`,
+  `expiring_delay(90000) → none`, `expiring_delay(120000) → none`;
+- l'armamento del timer letto da `sys:get_status/1` (lease 900 sì, lease 120 no) e la sua
+  sopravvivenza a `held → charging`;
+- `charge_complete` **una volta sola e solo dal target**: una seconda lettura piena in `complete`
+  non produce niente (assorbita), e né lo stop del conducente né la revoca lo producono;
+- `overstay_started` con grazia 0 scatta e con grazia 3600 no; chi stacca dentro la grazia non lo
+  produce; e con grazia 0 la macchina è in `complete` mentre lo snapshot riporta `overstay` — le
+  due risposte separate, che è tutto il disegno del pair overstay;
+- manager: i sei kind → `{driver_notification, UserId, Kind, ConnId}` ai subscriber; **quattro su
+  sei** → `notify` sul claim mod, e i due live-only asseriti sull'*assenza* della chiamata, che è
+  l'unico osservabile che una cast at-most-once abbia; e il negativo su sette eventi che non
+  sono notizie, `no_show` compreso — che è una coppia `{Kind, UserId}` identica alle altre e che
+  solo una lista esplicita distingue;
+- proto/ws: la forma esatta di §5.3, le lunghezze contro le colonne, l'unicità delle frasi, il
+  kind sconosciuto che non fa crashare nessuno; il frame spinto sul socket del suo conducente e
+  **non** su quello di un altro, né su uno che non ha fatto join; e la clausola che sta sopra il
+  catch-all, asserito guidando la callback e non leggendo il sorgente;
+- claim client: la 4-tupla esatta su `vs_mock_coord`, il testo identico fra copia live e durevole,
+  e il leader irraggiungibile che non fa esplodere niente e non lascia coda.
+
+**E2E live** (`LEASE_SECONDS=130 OVERSTAY_GRACE_SECONDS=10` su `station1`, client WebSocket
+esterno perché il browser interno non passa i WS cross-origin):
+
+```
+10:19:48.251 --> stop_session connector 3
+10:19:58.255 {"type":"notification","request_id":null,"payload":{
+               "text":"The grace period is over: the time the car stays plugged in is now billed.",
+               "connector_id":3,"kind":"overstay_started"}}
+
+10:22:01.738 ack reserve conn 1, lease 130 s
+10:22:11.739 {"kind":"reservation_expiring","text":"Your reservation expires in less than two minutes."}
+10:24:11.732 {"kind":"reservation_expired","text":"Your reservation expired and the connector was released."}
+```
+
+Dieci secondi esatti dopo lo stop (la grazia), e i due avvisi della prenotazione a T−2min e a T
+esatti — cioè l'aritmetica di `expiring_delay/1` misurata sul filo e non solo in EUnit.
+
+**E2E durevole**: nello stesso millisecondo del frame live, sul coordinatore si legge
+
+```
+=WARNING REPORT==== 31-Aug-2026::10:19:58.255626 ===
+coordinator: unexpected cast {notify,12,<<"overstay_started">>,
+                                     <<"The grace period is over: the time the car stays plugged in is now billed.">>}
+```
+
+e **nessun cast per `reservation_expiring`** da nessuna parte: la tabella `durable/1` misurata
+end-to-end. R2 è ancora aperto, quindi nessuna riga dalla nostra strada arriva in
+`notifications` — verificato, e con una precisazione che conta (sotto).
+
+*(L'E2E ha girato con `reservation_expired` ancora fra i durevoli — è la sua cast, arrivata a
+`coord3`, che si vede citata qui sotto. La decisione presa subito dopo l'ha tolto dalla lista:
+oggi quella cast non parte più, e il frame live resta.)*
+
+### Una riga in `notifications` è comparsa, e non è la nostra
+
+Il piano diceva: se una riga compare, qualcosa ha scavalcato R2 — fermarsi e segnalare. Una riga
+è comparsa (`id 5`, `kind = reservation_expired`, alle 10:24:11, l'istante della scadenza) e
+**non viene da noi**. Il testo lo dimostra: «Your reservation expired without the vehicle
+arriving. 1 of 2 …», che è `PenaltyService.java:83` — la strada **no-show**, che scrive la sua
+notifica da M4-B e che stamattina ha fatto quello che fa da sempre. La nostra frase è «Your
+reservation expired and the connector was released.» e in tabella non c'è. Nessuna riga
+`overstay_started`, che è la prova più pulita perché per quel kind non esiste nessun altro
+produttore.
+
+**E la scoperta era più utile del sospetto.** La stessa scadenza del lease manda a B *due*
+messaggi — il `no_show`, che fa scrivere quella riga col conteggio degli strike, e (dopo R2) il
+nostro `notify`. Applicata la patch, un no-show avrebbe scritto **due righe sullo stesso fatto**,
+e la nostra sarebbe stata la più povera delle due.
+
+**Deciso da Caleb, e fatto nello stesso commit: `reservation_expired` esce dai durevoli** e resta
+live-only. Restano quattro kind durevoli — `claim_revoked`, `charge_complete`,
+`overstay_started`, `session_interrupted` — e nessuno dei quattro ha un altro produttore. Costo
+della correzione, presa prima che R2 esistesse: una riga in `durable/1`, un test e le carte;
+presa dopo, sarebbe stata una colonna sporca in produzione.
+
+L'argomento con cui `notify` è at-most-once («un duplicato è innocuo») è vero e non c'entrava:
+riguarda due copie dello *stesso* messaggio, non due messaggi diversi sullo stesso evento. La
+regola che ne esce sta in §24.6 di `scelte_di_progetto.md`: **una copia durevole è per un fatto
+che non registra nessun altro**, e la domanda da farsi non è «quanto costa un duplicato?» ma
+«chi scrive già questo fatto?», guardando *tutti* i messaggi che un evento genera.
+
+### Un'altra cosa misurata: la cast del walk-in va a un follower
+
+L'`overstay_started` è arrivato a `coord1`, che era in standby, mentre il leader era `coord3`;
+la `reservation_expired` è arrivata a `coord3`. La differenza non è un difetto: `#state.leader`
+del claim client si aggiorna quando un coordinatore **concede** un claim, e una sessione walk-in
+non ne chiede nessuno — la stazione resta sul primo nodo di `COORD_NODES` finché non impara
+altro. È esattamente il caso «cold-boot» che B nomina nel test che suggerisce per R2, e rende la
+sua scelta di **non** mettere il gate `serving` su `notify` una necessità e non una preferenza:
+col gate, tutte le notifiche delle sessioni senza prenotazione sparirebbero.
+
+### Non provato — e perché
+
+1. **Lo scatto del timer `expiring` fuori da `held`.** L'assorbimento in `handle_common` non è
+   osservato sotto fuoco. Il ritardo è `Remaining - 120000` con `Remaining` che nasce da un lease
+   in secondi interi: il più piccolo ottenibile è **1000 ms**, venti volte il tetto di P11. Quello
+   che è provato è il meccanismo — il timer è ancora armato in `charging` e in `free`, letto da
+   `sys:get_status/1` — cioè che senza quella clausola il crash arriverebbe. Non è forzato con
+   uno sleep di proposito.
+2. **La pagina vera in Chrome.** L'estensione non era collegata a nessun browser, quindi la
+   verifica è stata fatta con un client WebSocket esterno che stampa i frame verbatim: prova che
+   il frame esce da cowboy con la forma di §5.3 e il testo giusto, **non** che `station.js` lo
+   dipinga. Quella metà è letta nel sorgente (`onNotification` → `note(connector_id, text)`,
+   `station.js:69-73`) e resta da guardare con gli occhi.
+3. **`charge_complete` sul filo.** Coperto da tre test, non dall'E2E: l'allocatore taglia la
+   potenza di una batteria quasi piena (taper), quindi arrivare al 100 % con l'emulatore richiede
+   minuti anche partendo dal 95 %. Il percorso è lo stesso `notify` degli altri tre.
+4. **`claim_revoked` sul filo.** Servirebbe un secondo claim in conflitto o un failover; è
+   coperto da test, e la sua emissione esisteva già da M1 — l'unica cosa nuova su quel percorso è
+   l'instradamento nel manager, che i test del manager coprono per tutti e sei i kind insieme.
+
+### Cosa resta fuori, e perché
+
+- **La clausola di R2**: è `src/erlang/apps/vs_coord/`, di B. Il pair finisce sul confine anche
+  dove basterebbero due clausole.
+- **La waitlist e `waitlist_offer`**: non è M4. Il contratto ora dichiara il kind non producibile
+  invece di lasciarlo sembrare implementato.
+- **`erlang-java.md` §2.4**: file condiviso, si tocca in PR.
+- **Retry o code per `notify`**: deliberato, §24.1 di `scelte_di_progetto.md`.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha

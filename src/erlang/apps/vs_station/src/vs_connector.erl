@@ -83,7 +83,7 @@
 %% boundary) without an hour of wall clock is to hand it timestamps.
 %% `vs_time' is the real clock and is not injectable, and P11 forbids
 %% tests that wait.
--export([cp_grace_ms/0, overstay_seconds/3]).
+-export([cp_grace_ms/0, overstay_seconds/3, expiring_delay/1]).
 %% state functions
 -export([free/3, held/3, charging/3, complete/3, closing/3, out_of_service/3]).
 
@@ -123,6 +123,14 @@
                  | retry_later | not_yours | not_your_reservation | invalid_state.
 
 -export_type([refusal/0]).
+
+%% M4-A — how far ahead of the end of a lease the `reservation_expiring'
+%% notice of ws-driver.md §5.3 goes out. Two minutes, and a constant
+%% rather than a variable of §10: it is a number the contract's own
+%% diagram (§8) draws as "T-2min", so a station that could be configured
+%% to warn at a different moment would be a station that stopped matching
+%% the document a driver was shown.
+-define(EXPIRING_LEAD_MS, 120000).
 
 %% P14 — four timestamps in two pairs, and the pairs are not the same
 %% thing. `granted_at'/`expires_at' are the STATION's reservation: this
@@ -441,7 +449,8 @@ held(enter, _Old, Data = #data{hold = Hold}) ->
     %% state_timeout is cancelled automatically by any state change, so the
     %% lease cannot outlive the state it belongs to.
     Remaining = vs_time:remaining_ms(Hold#hold.expires_at),
-    {keep_state, Data, [{state_timeout, Remaining, lease_expired}]};
+    {keep_state, Data, [{state_timeout, Remaining, lease_expired},
+                        expiring_action(Remaining)]};
 
 %% No-show. The connector frees itself: no operator action, no cooperation
 %% from a client that may well be offline (P3 — leasing).
@@ -473,6 +482,19 @@ held(state_timeout, lease_expired, Data = #data{hold = Hold}) ->
     %% strike.
     (Data#data.claim_mod):no_show(Hold#hold.user_id, Data#data.conn_id),
     {next_state, free, Data};
+
+%% M4-A — the notice of ws-driver.md §5.3 that the diagram of §8 has been
+%% promising since M1: two minutes before the lease dies, and only if the
+%% lease was long enough for "two minutes before" to be in the future.
+%%
+%% Nothing else happens. The reservation is not touched, no state changes:
+%% this is the one connector event that is *only* a notification, which is
+%% also why it is the one kind with no durable copy — a warning that is
+%% still true for 120 seconds is worth pushing to an open page and worth
+%% nothing in a table read tomorrow.
+held({timeout, expiring}, expiring, Data = #data{hold = #hold{user_id = U}}) ->
+    notify(Data, {reservation_expiring, U}),
+    keep_state_and_data;
 
 held({call, From}, {cancel, UserId}, Data = #data{hold = #hold{user_id = UserId}}) ->
     release(Data, cancelled),
@@ -632,6 +654,19 @@ charging(cast, {meter, Reading}, Data = #data{session = S}) ->
             logger:notice("connector ~p: battery full for user ~p - stopping "
                           "the charge", [Data#data.conn_id, S2#session.user_id]),
             send_cp(Data, stop_cmd(target_reached)),
+            %% M4-A — `charge_complete' of §5.3, and this is its ONLY
+            %% site (decided with Caleb). The other two ways a charge
+            %% ends already say what the driver needs to hear: he pressed
+            %% stop himself, or the coordinator revoked the claim and
+            %% `claim_revoked' goes out on that path. A `charge_complete'
+            %% there would be a second notification for a thing he just
+            %% did, and the frame is a notice, not a state feed — §5.1
+            %% already carries the state.
+            %%
+            %% Emitted before the transition, so the manager sees it
+            %% ahead of the `state_changed' that `complete(enter, ...)'
+            %% raises: news first, then the snapshot that agrees with it.
+            notify(Data, {charge_complete, S2#session.user_id}),
             {next_state, complete, charge_ended(Data#data{session = S2})};
         false ->
             {keep_state, Data#data{session = S2}}
@@ -739,7 +774,13 @@ charging(EventType, Event, Data) ->
 %% a state that entered and left on a value which moves by itself would
 %% fire `enter' callbacks for nothing. A `{state_timeout, Grace, overstay}'
 %% is what the notification of ws-driver §5.3 will need when R2 opens; it
-%% would slot in here and change nothing else.
+%% is what the notification of ws-driver §5.3 will need when R2 opens; it
+%% would slot in here and change nothing else. **M4-A did exactly that**,
+%% below, and the sentence above still holds where it counts: the timer
+%% emits a notification and returns `keep_state'. `overstay' is still
+%% derived in `reported_state/2', still has no `enter' callback of its
+%% own, and the page still learns the phase from the snapshot rather than
+%% from the moment a timer happened to fire.
 %%
 %% What it costs, stated rather than discovered: the session stays in RAM
 %% until the cable comes out, which may be minutes. That was already true
@@ -772,7 +813,33 @@ complete(enter, _Old, Data = #data{session = S}) ->
     %% admits only `charging' and `suspended') and puts the new state on
     %% every open page in the same step.
     notify(Data1, {state_changed, complete}),
-    {keep_state, Data1};
+    %% M4-A — the one moment in the whole machine where a timer exists to
+    %% say something rather than to do something. It is a `state_timeout'
+    %% on purpose: it dies with the state, so a driver who unplugs inside
+    %% the grace produces no notification at all, with no cancellation to
+    %% write and no way to forget one. The generic timeout of `held' had
+    %% to be the other kind and pays the difference in a clause of
+    %% `handle_common' (see there).
+    %%
+    %% With `OVERSTAY_GRACE_SECONDS' at 0 the event is not scheduled at
+    %% all but enqueued ahead of any external event yet to arrive
+    %% (gen_statem, `generic_timeout'/`state_timeout': "if Time is
+    %% relative and 0 ... the time-out event is enqueued"), which is what
+    %% lets the test observe it without sleeping for a grace.
+    {keep_state, Data1,
+     [{state_timeout, Data1#data.overstay_grace_s * 1000, overstay_started}]};
+
+%% The grace is over and the car has not moved: from here on the seconds
+%% are billed (`overstay_seconds/3' counts from exactly this instant) and
+%% `reported_state/2' starts answering `overstay'. Both were already true
+%% without this clause — what was missing was anybody telling the driver.
+%%
+%% `keep_state', not a transition: see the note above.
+complete(state_timeout, overstay_started, Data = #data{session = #session{user_id = U}}) ->
+    logger:notice("connector ~p: overstay grace over for user ~p",
+                  [Data#data.conn_id, U]),
+    notify(Data, {overstay_started, U}),
+    keep_state_and_data;
 
 %% The cable is out. Same shape as `charging': the event is posted
 %% forward so that `closing' stays the one place that reads an
@@ -1060,6 +1127,24 @@ handle_common(cast, _Event, _State, _Data) ->
 handle_common({timeout, cp_grace}, _Content, _State, _Data) ->
     keep_state_and_data;
 
+%% M4-A, and this one is not prudence: it is the price of the timer in
+%% `held(enter, ...)' being a **generic** one.
+%%
+%% A `state_timeout' is cancelled by any state change; a named generic
+%% timeout is not — the OTP documentation says a state change cancels the
+%% first and says nothing of the sort about the second, and that asymmetry
+%% is the whole mechanism. `expiring' is armed at T−2min of the lease, and
+%% a driver who plugs in during those last two minutes takes the connector
+%% to `charging' with the timer still running. It then fires in a state
+%% that never expected it and reaches here — with no clause, a
+%% `function_clause' and a dead connector under a live car. Not a corner
+%% case: it is every driver who arrives with two minutes to spare.
+%%
+%% Absorbed rather than acted on, because the notice is about a
+%% reservation that no longer exists: the driver arrived.
+handle_common({timeout, expiring}, _Content, _State, _Data) ->
+    keep_state_and_data;
+
 %% The socket died. Not "the connector is broken": §1 plans for the blip,
 %% so the verdict is deferred by exactly three missed heartbeats and
 %% `attach_cp/2' cancels it if the hardware comes back in time.
@@ -1209,6 +1294,44 @@ overstay_seconds(undefined, _EndedAt, _GraceS) ->
     0;
 overstay_seconds(ChargeEndedAt, EndedAt, GraceS) ->
     max(0, (EndedAt - ChargeEndedAt) div 1000 - GraceS).
+
+%% @doc How long to wait before warning that a lease is nearly over, given
+%% what is left of it — or `none' when there is no useful moment left.
+%%
+%% Exported and pure because it is the only part of the `expiring' notice
+%% that can be tested at all under P11: the timer itself cannot fire in
+%% under two minutes by construction (the delay is `Remaining - 120000'
+%% and it only exists while `Remaining' is larger), so a test that watched
+%% it fire would be a test that slept. What CAN be checked without a clock
+%% is the arithmetic and whether the timer was armed — the numbers here,
+%% and `sys:get_status/1' for the arming.
+%%
+%% The boundary belongs to `none' rather than to `0': a lease with exactly
+%% two minutes to run would otherwise produce a "expires in less than two
+%% minutes" that is true only in the sense that 120 is not less than 120,
+%% pushed in the same instant as the reservation itself. A notice that
+%% arrives with the thing it announces is not a notice.
+-spec expiring_delay(integer()) -> pos_integer() | none.
+expiring_delay(RemainingMs) when RemainingMs > ?EXPIRING_LEAD_MS ->
+    RemainingMs - ?EXPIRING_LEAD_MS;
+expiring_delay(_TooLateToWarn) ->
+    none.
+
+%% Arm or cancel — never "arm or leave alone", and the difference is not
+%% cosmetic. A generic timeout outlives the state that armed it, so the
+%% `none' branch would otherwise inherit whatever an earlier stay in
+%% `held' had left running. Today that cannot bite: `held' is entered from
+%% exactly one place (`free', on `reserve') and always with
+%% `now + lease_ms', so within one process every entry arms or none does.
+%% This makes the timer after `held(enter, ...)' a function of *this*
+%% hold, rather than a fact that has to be re-proved from the shape of the
+%% rest of the module. Cancelling a timer that is not running is a
+%% documented no-op.
+expiring_action(RemainingMs) ->
+    case expiring_delay(RemainingMs) of
+        none  -> {{timeout, expiring}, cancel};
+        Delay -> {{timeout, expiring}, Delay, expiring}
+    end.
 
 %% The claim a `#hold' or a `#session' carries, in the shape `adopt/3' and
 %% `present_claim/5' both want. One function over two records because it

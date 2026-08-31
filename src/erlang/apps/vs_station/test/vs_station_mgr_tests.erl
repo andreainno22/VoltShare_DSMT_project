@@ -417,3 +417,124 @@ count_pushes(N) ->
     after 0 -> N
     end.
 
+
+%%%===================================================================
+%%% M4-A — the fan-out of the notifications (ws-driver.md §5.3)
+%%%===================================================================
+%%
+%% The manager is where the list lives: which connector events are news
+%% for a driver, and which of those are worth a row in `notifications'.
+%% Both halves are asserted from the outside — a message in this process's
+%% mailbox, and a call recorded by the claim stub.
+
+%% Sends one connector event and returns what the manager did with it.
+%%
+%% **The synchronisation is the call, not a sleep** (P11). A gen_server
+%% handles its mailbox in order, so by the time `station_state' has
+%% answered, the event sent just before it has been fully handled and
+%% anything it was going to push is already here. `after 0' is then exact
+%% rather than optimistic, and — this is the point for the negative tests
+%% — an absence measured this way is a real absence and not a race the
+%% test happened to win.
+what_happens_to(Event) ->
+    vs_claim_stub:reset(),
+    vs_station_mgr ! {connector_event, 1, Event},
+    _ = vs_station_mgr:station_state(),
+    {notification_in_mailbox(), vs_claim_stub:calls()}.
+
+%% Every connector event also produces a state push (`reallocate' +
+%% `broadcast'), and this process is subscribed to those too. They are
+%% skipped rather than asserted on: what they contain is the subject of
+%% the tests above.
+notification_in_mailbox() ->
+    receive
+        {driver_notification, _U, _K, _C} = Msg -> Msg;
+        {station_state, _}                      -> notification_in_mailbox()
+    after 0 -> none
+    end.
+
+%% All six kinds of §5.3 this station can produce, live. The connector id
+%% travels with them: the page needs to know which outlet the sentence is
+%% about, and the sentence itself never says (vs_driver_proto).
+every_kind_of_news_reaches_the_open_pages_test() ->
+    with_station(fun() ->
+        ok = vs_station_mgr:subscribe(),
+        lists:foreach(
+          fun(Kind) ->
+              {Notification, _Calls} = what_happens_to({Kind, ?USER}),
+              ?assertEqual({driver_notification, ?USER, Kind, 1}, Notification)
+          end,
+          [reservation_expiring, reservation_expired, claim_revoked,
+           charge_complete, overstay_started, session_interrupted])
+    end).
+
+%% Four of the six also go to the coordinator. The two that do not are the
+%% two halves of one rule: **a durable copy is for a fact nobody else
+%% records**.
+%%
+%%   * `reservation_expiring' — nobody records it, and nobody should: the
+%%     warning is true for two minutes and a row read the next day is
+%%     either wrong (he arrived) or already said by the expiry.
+%%   * `reservation_expired' — somebody already does. The same lease timer
+%%     reports the no-show, and `PenaltyService.onNoShow' writes a
+%%     `RESERVATION_EXPIRED' row **with the strike count**. Ours would be a
+%%     second, poorer sentence about one fact.
+%%
+%% Both assertions below are on the *absence* of a call, which is the only
+%% observable an at-most-once cast has: nothing comes back to look at, so a
+%% cast that should not have gone out is invisible anywhere else.
+four_of_the_six_are_also_worth_a_row_test() ->
+    with_station(fun() ->
+        ok = vs_station_mgr:subscribe(),
+        lists:foreach(
+          fun(Kind) ->
+              {_Notification, Calls} = what_happens_to({Kind, ?USER}),
+              ?assertEqual([{notify, ?USER, Kind}], Calls)
+          end,
+          [claim_revoked, charge_complete, overstay_started,
+           session_interrupted]),
+        lists:foreach(
+          fun(Kind) ->
+              {Notification, Calls} = what_happens_to({Kind, ?USER}),
+              %% live yes, durable no — the page still hears about it
+              ?assertEqual({driver_notification, ?USER, Kind, 1}, Notification),
+              ?assertEqual([], Calls)
+          end,
+          [reservation_expiring, reservation_expired])
+    end).
+
+%% The negative, and it is the reason the routing is an explicit list
+%% rather than a shape test. `no_show' is a `{Kind, UserId}' pair exactly
+%% like the six above — same arity, same types — and it must produce
+%% nothing at all: it is reported to the coordinator by its own path, as a
+%% penalty, and a driver who missed a reservation is being told so by the
+%% `reservation_expired' raised in the same breath. `session_closed'
+%% carries a map where the others carry a user id, and would have been
+%% caught by a shape test; the other three would not.
+what_is_not_news_says_nothing_test() ->
+    with_station(fun() ->
+        ok = vs_station_mgr:subscribe(),
+        lists:foreach(
+          fun(Event) ->
+              ?assertEqual({none, []}, what_happens_to(Event))
+          end,
+          [{state_changed, free},
+           {state_changed, charging},
+           {session_started, ?USER},
+           {no_show, ?USER},
+           {reservation_cancelled, ?USER},
+           {session_closed, #{user_id => ?USER, energy_kwh => 1.0}},
+           {reserved, ?USER, vs_time:now_ms()}])
+    end).
+
+%% The station keeps working when the news is for somebody who is not
+%% watching: the manager holds pids, not identities, so it sends to
+%% everyone and the filtering happens in the socket (vs_driver_ws, §7.3).
+%% Here that means the subscriber gets a notification naming a user it is
+%% not — which is exactly right, and the reason the ws test exists.
+the_manager_does_not_filter_by_identity_test() ->
+    with_station(fun() ->
+        ok = vs_station_mgr:subscribe(),
+        {Notification, _Calls} = what_happens_to({charge_complete, 999}),
+        ?assertEqual({driver_notification, 999, charge_complete, 1}, Notification)
+    end).

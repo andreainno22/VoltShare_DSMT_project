@@ -9,7 +9,8 @@
 -module(vs_claim_stub).
 
 -export([set_reply/1, calls/0, reset/0, last_claim_id/0]).
--export([acquire/4, renew/2, release/2, session_closed/1, no_show/2, show_up/1]).
+-export([acquire/4, renew/2, release/2, session_closed/1, no_show/2, show_up/1,
+         notify/2]).
 
 -define(REPLY, {?MODULE, reply}).
 -define(CALLS, {?MODULE, calls}).
@@ -81,4 +82,20 @@ no_show(UserId, ConnId) ->
 
 show_up(UserId) ->
     record({show_up, UserId}),
+    ok.
+
+%% M4-A — the durable copy of a driver notification, as the STATION
+%% MANAGER asks for it: two elements, because the kind is all the manager
+%% knows and the sentence is looked up one hop later. What actually
+%% reaches the coordinator is the 4-tuple, and it is asserted where it is
+%% built (vs_claim_client_tests, against vs_mock_coord).
+%%
+%% Counting matters here as much as matching, for the mirror image of the
+%% no-show reason: four kinds pass through this call and only four, so a
+%% fifth entry means the manager decided something was durable that the
+%% product decision says is not — `reservation_expiring', whose row would
+%% be stale, and `reservation_expired', whose row `PenaltyService' already
+%% writes with the strike count.
+notify(UserId, Kind) ->
+    record({notify, UserId, Kind}),
     ok.

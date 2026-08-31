@@ -776,3 +776,80 @@ a_rebuilt_claim_with_a_stale_expiry_is_asked_about_not_dropped_test() ->
         end)
     end).
 
+
+%%%===================================================================
+%%% the durable copy of a notification (M4-A, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% Same reason as the penalty pair above: the shape on the wire is
+%% asserted where the shape is built, because getting it wrong is silent.
+%% `ErlangBridge:onNotify' reads three elements behind the tag and calls
+%% `PenaltyService.onNotify(int, String, String)'; a tuple of any other
+%% arity would be dropped by whatever it reached, with a log line nobody
+%% is reading and a notification that simply never appears.
+%%
+%% What is *not* asserted here is that the real coordinator accepts it —
+%% today it does not. `vs_coord_srv' has no `notify' clause (R2, still
+%% open, `nota-per-B-review-pr5.md' §2) and the cast lands in its
+%% catch-all. The mock is the contract's shape written down on our side,
+%% so that the day B applies the patch there is nothing left to change
+%% here.
+
+%% Four elements. The two the manager passed became a user id, the binary
+%% name of the kind as §5.3 spells it, and the sentence — looked up in
+%% `vs_driver_proto', which is where the live frame gets it too.
+a_notification_reaches_the_leader_as_the_four_tuple_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:notify(?USER, overstay_started),
+        ok = wait_until(fun() ->
+            history_has(fun(M) ->
+                M =:= {notify, ?USER, <<"overstay_started">>,
+                       vs_driver_proto:notification_text(overstay_started)}
+            end)
+        end)
+    end).
+
+%% The page and the row say the same words, and this is where that stops
+%% being a comment. Both sides read the same table, so the assertion is
+%% that the text on the wire is byte-for-byte the text in the live frame.
+the_durable_copy_carries_the_same_sentence_as_the_live_one_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:notify(?USER, charge_complete),
+        ok = wait_until(fun() -> history_has(fun is_notify/1) end),
+        [{notify, ?USER, Kind, Text}] =
+            [M || M <- vs_mock_coord:history(), is_notify(M)],
+        #{payload := Payload} = vs_driver_proto:notification_frame(charge_complete, 3),
+        ?assertEqual(maps:get(kind, Payload), Kind),
+        ?assertEqual(maps:get(text, Payload), Text)
+    end).
+
+is_notify(M) -> is_tuple(M) andalso element(1, M) =:= notify.
+
+%% At-most-once, and its accepted failure mode: no leader, no row, no
+%% crash — and above all no queue to replay it from later. The assertion
+%% is the absence of machinery, exactly as for the penalty pair: the call
+%% below cannot be answered until the cast before it has been handled, so
+%% an empty mailbox afterwards means nothing was buffered.
+%%
+%% A notification is the one of the three where a duplicate would be
+%% harmless and it *still* has no retry: what would be protected is a
+%% convenience, and the live copy has already reached whoever was
+%% actually watching.
+a_notification_with_an_unreachable_leader_is_dropped_test() ->
+    {ok, Client} = vs_claim_client:start_link(
+                     maps:merge(client_opts(),
+                                #{coord_nodes       => ['nonexistent@nowhere'],
+                                  renew_interval_ms => 60000})),
+    try
+        ok = vs_claim_client:notify(?USER, session_interrupted),
+        ?assertMatch({'nonexistent@nowhere', _, _},
+                     gen_server:call(vs_claim_client, get_route)),
+        ?assert(is_process_alive(Client)),
+        ?assertEqual({message_queue_len, 0},
+                     process_info(Client, message_queue_len)),
+        ?assertEqual({1, []}, holds())
+    after
+        stop([Client]),
+        wait_gone([vs_claim_client]),
+        flush()
+    end.

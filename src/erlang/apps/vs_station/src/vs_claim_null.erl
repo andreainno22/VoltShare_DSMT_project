@@ -12,7 +12,7 @@
 %%%-------------------------------------------------------------------
 -module(vs_claim_null).
 
--export([acquire/4, renew/2, release/2, no_show/2, show_up/1]).
+-export([acquire/4, renew/2, release/2, no_show/2, show_up/1, notify/2]).
 
 %% Four elements since P14: `GrantedAt' is the second one, and here it is
 %% the local clock because there is no other — the whole point of this
@@ -73,4 +73,27 @@ no_show(UserId, ConnId) ->
 -spec show_up(pos_integer()) -> ok.
 show_up(UserId) ->
     logger:debug("vs_claim_null: show-up for user ~p goes nowhere", [UserId]),
+    ok.
+
+%%%===================================================================
+%%% M4-A — the durable copy of a driver notification
+%%%===================================================================
+
+%% Mandatory for a harder reason than the two above, and worth writing
+%% down: this one is called by `vs_station_mgr', not by a connector. An
+%% `undef' here would kill the **manager** — the process that owns the
+%% connector registry, the power split and every open page's subscription
+%% — on an ordinary event like a battery filling up. A station started
+%% with `CLAIM_MOD=vs_claim_null' for a shell session would fall over the
+%% first time a charge finished.
+%%
+%% Debug, not warning: the live copy of the notification does not come
+%% through here at all (it is a message from the manager straight to the
+%% sockets), so what is lost with no coordinator is the row a driver would
+%% have read later — a convenience, and one this stand-in exists to do
+%% without.
+-spec notify(pos_integer(), atom()) -> ok.
+notify(UserId, Kind) ->
+    logger:debug("vs_claim_null: notification ~p for user ~p goes nowhere",
+                 [Kind, UserId]),
     ok.

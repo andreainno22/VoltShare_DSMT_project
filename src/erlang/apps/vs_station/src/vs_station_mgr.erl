@@ -326,9 +326,12 @@ handle_info({connector_event, ConnId, {connector_up, Pid}}, State0) ->
 %% "on every arrival, every departure"): arrivals and departures are
 %% connector events, and this clause is where they all pass. Recomputing
 %% *before* broadcasting is not incidental — see reallocate/1.
-handle_info({connector_event, _ConnId, _Event}, State) ->
+handle_info({connector_event, ConnId, Event}, State) ->
     State1 = reallocate(State),
     broadcast(State1),
+    %% M4-A — and after the snapshot, on purpose: the page gets the world
+    %% as it now is, then the sentence explaining why it changed.
+    announce(ConnId, Event, State1),
     {noreply, State1};
 
 %% The other moment: the periodic re-split of §3.5. It is the only thing
@@ -509,6 +512,100 @@ broadcast(State = #state{subs = Subs}) ->
     Msg = {station_state, build_state(State)},
     maps:foreach(fun(Pid, _Ref) -> Pid ! Msg end, Subs),
     ok.
+
+%%%===================================================================
+%%% M4-A — the notifications of ws-driver.md §5.3
+%%%===================================================================
+%%
+%% **Why the fan-out is here and not in the connector.** The six events
+%% below are already in flight as `connector_event': every one of them is
+%% raised by a `notify/2' the connector was making anyway, from six
+%% clauses across three states. Reading them here costs zero new calls at
+%% those six sites and leaves exactly one place that knows which events
+%% are news and which of those deserve a row. The alternative — each
+%% clause calling `claim_mod:notify/2' for itself — spreads the same list
+%% over six sites of three states, where the next kind has to be added
+%% six times or (worse) five.
+%%
+%% Neither arrangement lets a connector make a remote call: the hop to the
+%% coordinator is `cast_leader/2' inside the claim client either way. What
+%% is chosen here is only where the list lives.
+
+%% ws-driver.md §5.3, as one table.
+%%
+%%   `true'  — news, and worth a row in `notifications';
+%%   `false' — news, live only;
+%%   `none'  — not news.
+%%
+%% The catch-all is the point of the table as much as the entries are.
+%% `state_changed', `session_started', `session_closed',
+%% `reservation_cancelled' and `no_show' all reach this function and all
+%% must produce nothing — and `no_show' in particular is a `{Kind,
+%% UserId}' pair exactly like the six above it, so nothing but an explicit
+%% list separates it from them. It is reported to the coordinator by its
+%% own path, as a penalty, and a driver who missed a reservation is told
+%% by `reservation_expired' in the same breath; a second frame saying he
+%% has a strike is not this channel's job.
+%%
+%% **Two kinds are live-only, for two different reasons.**
+%%
+%% `reservation_expiring' is a warning with a two-minute life. A row
+%% written for it would be read the next day, when it is either wrong —
+%% the driver arrived — or redundant, because the `reservation_expired'
+%% written two minutes later says how it ended.
+%%
+%% `reservation_expired' is live-only because **the row already exists,
+%% and it is a better row than ours would be**. The same lease timer that
+%% raises this event also reports the no-show, and that path ends in
+%% `PenaltyService.onNoShow' (:82-86), which writes a
+%% `RESERVATION_EXPIRED' notification carrying the strike count — "1 of
+%% 2 — reaching 2 suspends reservations for 1 day(s)". Sending our own
+%% would put a second, poorer sentence about one fact next to it the day
+%% R2 opens. Measured on 31/08 before it could happen, and the rule it
+%% settles is worth more than the case: **two producers for one fact is
+%% the defect, not the redundancy** — the question is never "is a
+%% duplicate harmful?" but "who already writes this?".
+durable(reservation_expiring) -> false;
+durable(reservation_expired)  -> false;
+durable(claim_revoked)        -> true;
+durable(charge_complete)      -> true;
+durable(overstay_started)     -> true;
+durable(session_interrupted)  -> true;
+durable(_NotNews)             -> none.
+
+announce(ConnId, {Kind, UserId}, State) ->
+    case durable(Kind) of
+        none ->
+            ok;
+        false ->
+            live(ConnId, Kind, UserId, State);
+        true ->
+            live(ConnId, Kind, UserId, State),
+            %% Fire-and-forget, no retry, no queue — and unlike the
+            %% no-show it is the *duplicate* that is harmless here and
+            %% the loss that is tolerable: a second row is a line the
+            %% driver reads once, a lost one is a convenience nobody is
+            %% billed for. See vs_claim_client:notify/2.
+            (claim_mod(State)):notify(UserId, Kind)
+    end;
+announce(_ConnId, _Event, _State) ->
+    ok.
+
+%% The same message to every subscriber, filtered by nobody here: which
+%% socket may see it is a question about the token that opened it, and
+%% only that socket knows the answer (vs_driver_ws, §7.3). This process
+%% holds pids, not identities, and keeping it that way is what stops the
+%% manager from ever becoming a second place where identity is decided.
+live(ConnId, Kind, UserId, #state{subs = Subs}) ->
+    Msg = {driver_notification, UserId, Kind, ConnId},
+    maps:foreach(fun(Pid, _Ref) -> Pid ! Msg end, Subs),
+    ok.
+
+%% The module the connectors were given, so a test that runs the manager
+%% with `vs_claim_stub' sees the durable copy in the stub's log instead of
+%% casting into the void. `init/1' fills the key in unconditionally.
+claim_mod(#state{child_opts = ChildOpts}) ->
+    maps:get(claim_mod, ChildOpts, vs_claim_client).
 
 %% CONNECTORS="1:150,2:150,3:150,4:50" — conn_id:rated_kw, comma-separated.
 %% A malformed entry is skipped with a warning, never a boot failure

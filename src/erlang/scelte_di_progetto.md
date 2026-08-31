@@ -2436,3 +2436,154 @@ scelta di B che è giusta: `UserDao.suspendUntil` (riga 178-185) scrive
 on it». Al secondo strike il contatore torna a **0** e la prova che i due strike ci sono stati
 è `suspended_until`, più le due righe in `notifications`. Misurato: `no_show_count = 0`,
 `suspended_until = 2026-09-01 08:41:15`, terzo `reserve` rifiutato `SUSPENDED`.
+
+## 24. Il trittico delle garanzie si chiude, e il fan-out sta nel manager (M4-A)
+
+Ultimo pezzo di M4-A: il frame `notification` di `ws-driver.md` §5.3, che esisteva dal M1 e
+che **nessuno aveva mai emesso**. Tre buchi in fila, misurati prima di toccare il codice: il
+connettore osservava quasi tutte le notizie ma le diceva solo al manager; il manager, su ogni
+`connector_event`, faceva `reallocate` + `broadcast` di **solo stato** (`{station_state, …}`),
+buttando via l'evento che *era* la notizia; e `vs_driver_ws` non aveva una clausola per una
+notifica, né `vs_driver_proto` un builder per il frame.
+
+### 24.1 Tre nature, tre garanzie — e la terza non è una svista
+
+Con `notify` il trittico si chiude. Tutti e tre i messaggi verso il coordinatore sono una
+`cast_leader/2` e sembrano la stessa cosa; non lo sono, e la differenza sta in **cosa costa
+perderne uno e cosa costa duplicarne uno**:
+
+| Messaggio | Garanzia | Duplicato | Perdita | Perché |
+|---|---|---|---|---|
+| `session_closed` | at-**least**-once | uno sweep anticipato | un intervallo di ritardo | la riga è già in MySQL: il messaggio è una sveglia, non il dato |
+| `no_show` | at-**most**-once | una sospensione ingiusta | uno strike non contato | va su un contatore senza riga a cui appoggiarsi |
+| `notify` | at-**most**-once | **innocuo** | una comodità | una seconda riga che il driver legge una volta e archivia |
+
+Le prime due sono già §23. La terza è at-most-once **per la ragione opposta** alla seconda:
+non perché il duplicato faccia danno — non ne fa, e lo dice la patch di R2 di B — ma perché
+non c'è niente da proteggere. Chi aveva la pagina aperta ha già ricevuto la copia live; la
+riga che non arriva è la copia per chi non stava guardando. Una coda, un retry, un buffer da
+drenare al ritorno di un leader: macchinari che esisterebbero per difendere una cosa per cui
+nessuno viene addebitato. Quindi `cast_leader/2` e basta — la stessa riga, il terzo argomento
+diverso per giustificarla.
+
+**La regola che ne esce**, e che vale oltre questo caso: *at-most-once non è «la versione
+pigra di at-least-once». È una scelta che si giustifica guardando l'asimmetria fra le due
+modalità di guasto, e l'asimmetria può puntare da entrambe le parti.*
+
+### 24.2 Il fan-out sta nel manager, non nel connettore
+
+I sei kind-notizia hanno **due** sink: la pagina aperta e il coordinatore. E sono tutti già in
+volo come `connector_event`, emessi da sei clausole sparse su tre stati.
+
+Metterli nel manager costa **zero chiamate nuove in quei sei siti** e lascia un posto solo che
+sa cosa è notizia e cosa è durevole (`vs_station_mgr:durable/1`). L'alternativa — ogni clausola
+che chiama `claim_mod:notify/2` per conto suo — spargerebbe la stessa lista su sei siti di tre
+stati, dove il kind successivo va aggiunto sei volte o (peggio) cinque.
+
+Il principio «i connettori non fanno chiamate remote» è rispettato in entrambi i casi: il salto
+remoto lo fa comunque solo `cast_leader/2`, dentro il claim client. Quello che si sceglie qui è
+soltanto **dove sta la lista**.
+
+Perché allora il `no_show` parte dal connettore? Perché lì il fatto ha **un solo sink** ed è
+contabile: §2.4 dice «the station detects it», e il connettore è chi lo rileva. Le due scelte
+non si contraddicono, rispondono a due domande diverse — quanti sink ha il fatto, e chi lo sa
+per primo.
+
+### 24.3 I due timer non sono lo stesso timer, e la differenza costa una clausola
+
+Le due notifiche nuove che nascono da un timer usano **due tipi diversi di timeout**, e la
+scelta è misurata sui doc di OTP (`stdlib-8.0.3/doc/html/gen_statem.md`), non ricordata:
+
+* `overstay_started` è uno **`state_timeout`**. La doc: *«A state change cancels this timer, if
+  it is running»*. Quindi muore uscendo da `complete`: chi stacca il cavo dentro la grazia non
+  produce niente, e non c'è nessuna cancellazione da scrivere né da dimenticare.
+* `reservation_expiring` è un **timeout generico con nome** (`{{timeout, expiring}, …}`). La sua
+  sezione della doc dice cosa succede riarmandolo (*«Setting a timer with the same Name while it
+  is running will restart it»*) e **non dice nulla** sul cambio di stato: non si cancella. Deve
+  essere di questo tipo perché in `held` c'è già lo `state_timeout` del lease, e ce n'è uno solo.
+
+La seconda scelta ha un prezzo, e non è ipotetico. Il timer sopravvive a `held` e scatta dovunque
+il connettore si trovi allora. Senza una clausola in `handle_common` è un **`function_clause`**:
+`handle_common` matcha `{call,…}`, `cast`, `{timeout, cp_grace}` e `info`, e nient'altro.
+Verificato guardando, non ragionando — `sys:get_status/1` pubblica i timer vivi:
+
+```
+lease 900, in `held'    : {2, [{state_timeout,lease_expired}, {{timeout,expiring},expiring}]}
+dopo il plugged, in `charging': {1, [{{timeout,expiring},expiring}]}   ← lo state_timeout è sparito
+lease 120, in `held'    : {1, [{state_timeout,lease_expired}]}         ← e questo non è mai armato
+```
+
+Due strade lo fanno scattare fuori posto, ed è la seconda a rendere il crash *ordinario*:
+
+1. il driver arriva negli ultimi due minuti del lease → `charging` col timer ancora armato;
+2. **qualunque sessione breve**: prenoto, carico, stacco, il connettore torna `free` — e il timer
+   è ancora lì, undici minuti dopo, in uno stato che non sa cosa farsene.
+
+Non è una difesa «per prudenza»: è la conseguenza diretta della prima scelta, e i due test che la
+inchiodano guardano il timer invece di aspettarlo.
+
+**Arma-o-cancella, mai arma-o-lascia-stare.** Nel ramo `none`, `held(enter, …)` emette
+`{{timeout, expiring}, cancel}` invece di non fare nulla. Oggi non può servire — in `held` si
+entra da un solo posto e sempre con `now + lease_ms`, quindi dentro un processo o armano tutte le
+entrate o nessuna — e sta lì per una ragione più piccola e più duratura: rende lo stato del timer
+dopo `held(enter, …)` una funzione di *questa* prenotazione, invece di un fatto da ridimostrare
+ogni volta guardando il resto del modulo. Cancellare un timer che non c'è è un no-op documentato.
+
+### 24.4 Una tabella di frasi sola, e perché non sta nel claim client
+
+La frase che il driver legge sta in `vs_driver_proto:notification_text/1`, esportata, e la
+leggono **entrambe** le copie: il frame live e la tupla durevole. Un secondo posto con le stesse
+frasi diverge alla seconda modifica, e diverge in silenzio — la pagina aperta e
+`notifications.jsp` direbbero due cose sullo stesso evento e nessun test se ne accorgerebbe.
+
+Il corollario è che **le frasi non nominano il connettore**: il frame porta `connector_id` come
+campo suo, e la copia durevole non ha nessun connettore da nominare (`notifications` ha `kind` e
+`text`, schema.sql). Una frase con dentro un numero sarebbe costruibile su un lato solo dei due.
+
+`waitlist_offer` non ha una clausola nella tabella, di proposito: è il settimo kind di §5.3 e
+l'unico che nessun percorso può emettere. Cade nel catch-all rumoroso — modellato su `refusal/2`
+— così il giorno che qualcuno implementa la waitlist senza ripassare di qui, lo dice.
+
+### 24.5 Il perimetro finisce sul confine, e il mittente serve proprio a quello
+
+La clausola che riceve `{notify, …}` nel coordinatore (R2 di `nota-per-B-review-pr5.md` §2) è
+in `vs_coord/`, che è di B. Non l'abbiamo scritta, e mandiamo i cast lo stesso.
+
+Non è una posa: `vs_coord_srv.erl:279-281` logga il termine intero
+(`logger:warning("coordinator: unexpected cast ~p")`), quindi da oggi nel log del leader si
+**vede** la 4-tupla che muore. È l'argomento più efficace della nota per B — un buco visibile nei
+suoi log invece che un buco descritto a parole — e il giorno che applica la patch non c'è più
+niente da cambiare da questa parte.
+
+### 24.6 «Un duplicato è innocuo» non è la domanda giusta: la domanda è chi lo scrive già
+
+`reservation_expired` doveva essere durevole. Non lo è, e la ragione è arrivata dall'E2E invece
+che dal piano — vale la pena scriverla perché è una regola, non un caso.
+
+Nell'E2E della copia durevole la riga in `notifications` **non doveva comparire**: R2 è aperto,
+il nostro cast muore nel catch-all. Una riga è comparsa lo stesso, ed è stato il testo a
+identificarla: «Your reservation expired without the vehicle arriving. 1 of 2 …», cioè
+`PenaltyService.onNoShow:82-86`. Non la nostra — la nostra frase in tabella non c'era, e non
+c'era nessuna riga `overstay_started`, che è la prova più pulita perché per quel kind non esiste
+nessun altro produttore.
+
+Quindi R2 non era stato scavalcato. Ma la scoperta era più utile del sospetto: **la stessa
+scadenza del lease produce due messaggi verso B** — il `no_show` (che fa scrivere quella riga,
+col conteggio degli strike) e, dopo R2, il nostro `notify`. Applicata la patch, un no-show
+avrebbe scritto due righe sullo stesso fatto, e la nostra sarebbe stata la più povera delle due.
+
+L'argomento con cui `notify` era stato reso at-most-once — «un duplicato è innocuo» (§24.1) —
+è vero e **non c'entra**. Riguarda due copie *dello stesso messaggio*, non due messaggi diversi
+sullo stesso evento scritti da due produttori. La domanda che non ci eravamo posti non è «quanto
+costa un duplicato?» ma **«chi scrive già questo fatto?»**, e va posta guardando *tutti* i
+messaggi che un evento genera, non quello che si sta aggiungendo.
+
+Regola, di portata più larga del caso: **una copia durevole è per un fatto che non registra
+nessun altro.** Applicata alla tabella, lascia quattro kind durevoli — `claim_revoked`,
+`charge_complete`, `overstay_started`, `session_interrupted` — e due live-only per due ragioni
+diverse: `reservation_expiring` perché nessuno lo registra *e nessuno dovrebbe* (un avviso che
+vive due minuti), `reservation_expired` perché qualcuno lo registra già e meglio.
+
+Costo della correzione, presa prima che R2 esistesse: una riga in `durable/1`, un test, e le
+carte. Presa dopo, sarebbe stata una colonna sporca in produzione e una discussione su chi
+smette di scrivere.
