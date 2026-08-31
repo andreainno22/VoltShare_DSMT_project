@@ -195,8 +195,17 @@ public class UserDao {
     public List<long[]> activeSuspensions() throws SQLException {
         try (Connection c = Db.getConnection();
              PreparedStatement ps = c.prepareStatement(
+                     // The cut-off is computed here, not with MySQL's NOW().
+                     //
+                     // The column is written with this JVM's clock, so filtering it with the
+                     // database's own clock compares two readings that need not agree. In the
+                     // compose both run on UTC and it happens to work; on a developer machine
+                     // in another zone the suspension would silently stretch or shrink by the
+                     // offset. Reported by A, R5 of the review of PR #5 — related to the
+                     // truncation fix, but not covered by it.
                      "SELECT id, suspended_until FROM users "
-                             + "WHERE suspended_until IS NOT NULL AND suspended_until > NOW()")) {
+                             + "WHERE suspended_until IS NOT NULL AND suspended_until > ?")) {
+            ps.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
             try (ResultSet rs = ps.executeQuery()) {
                 List<long[]> out = new ArrayList<>();
                 while (rs.next()) {

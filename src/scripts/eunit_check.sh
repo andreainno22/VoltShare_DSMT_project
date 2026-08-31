@@ -23,7 +23,7 @@
 # the line below in the same commit. A number nobody compares is not an
 # assertion.
 # ---------------------------------------------------------------------------
-EXPECTED_TESTS=333
+EXPECTED_TESTS=336
 
 set -u
 

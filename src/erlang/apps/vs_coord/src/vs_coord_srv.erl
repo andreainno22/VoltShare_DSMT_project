@@ -26,7 +26,7 @@
 -export([start_link/0,
          claim/5, renew/2, release/2,
          station_up/1, station_stats/4, session_closed/1,
-         stations/0, claims/0, mode/0,
+         stations/0, claims/0, suspensions/0, mode/0,
          become_leader/0, become_follower/1, suspend/0]).
 
 %% gen_server callbacks
@@ -124,6 +124,17 @@ stations() ->
 claims() ->
     gen_server:call(?SERVER, claims).
 
+%% @doc The suspended accounts this coordinator is enforcing, for the shell.
+%%
+%% A `{From, get_suspensions}' message used to do this, and contracts/erlang-java.md
+%% described the back office asking for it after a restart. Java never sent it: recovery
+%% is a push — the back office repeats every running suspension on each `{leader, _}'
+%% announcement — so the request form was a branch nobody could reach. Removed for the
+%% same reason as the legacy renew clauses, and replaced by a plain accessor.
+-spec suspensions() -> [{pos_integer(), non_neg_integer()}].
+suspensions() ->
+    gen_server:call(?SERVER, suspensions).
+
 -spec mode() -> serving | rebuilding | suspended | standby.
 mode() ->
     gen_server:call(?SERVER, mode).
@@ -191,6 +202,9 @@ handle_call(stations, _From, State) ->
 handle_call(claims, _From, State) ->
     {reply, [claim_to_map(C) || C <- maps:values(State#state.claims)], State};
 
+handle_call(suspensions, _From, State) ->
+    {reply, maps:to_list(State#state.suspended), State};
+
 handle_call(mode, _From, State) ->
     {reply, State#state.mode, State};
 
@@ -214,6 +228,14 @@ handle_cast({release, ClaimId, Reason}, State) ->
 %% passes it on to the leader it knows about. Wrapped in `forwarded' so the
 %% second hop handles it and never relays again: two coordinators that briefly
 %% disagree about who leads cannot bounce a message between them.
+%% A message one of our peers received while not being the leader, passed on to
+%% us. Handled here and never relayed again, so two coordinators that briefly
+%% disagree about who leads cannot bounce it between them.
+handle_cast({forwarded, Msg}, State) when element(1, Msg) =:= no_show;
+                                          element(1, Msg) =:= show_up ->
+    vs_coord_bo:penalty_event(Msg),
+    {noreply, State};
+
 handle_cast({forwarded, Msg}, State) ->
     {noreply, apply_announcement(Msg, State)};
 
@@ -236,21 +258,39 @@ handle_cast({session_closed, Event}, State) ->
     vs_coord_bo:session_closed(Event),
     {noreply, State};
 
-%% Penalty accounting (M4). Same shape as session_closed and for the same
-%% reason: the station observes, the coordinator relays, and **only Java writes
-%% the counter** — nothing here keeps a second copy of it.
+%% M4 notifications: something a station wants the driver to read later.
+%%
+%% This clause was missing, and Java has been dispatching on the `notify' tag
+%% since M4-B — so a station's cast would have fallen into the catch-all below,
+%% logged and dropped, and the notification would never have reached the table.
+%% Nothing would have looked broken: the same "one side of the bridge without
+%% the other" that has now bitten this project three times. Found by A in the
+%% review of PR #5.
+%%
+%% Ungated on purpose, exactly like session_closed: forwarding a duplicate
+%% inserts at worst a second row the driver reads once, while dropping one loses
+%% the only copy there is — unlike a session, a notification has no row in MySQL
+%% to fall back on.
+handle_cast({notify, _UserId, _Kind, _Text} = Event, State) ->
+    vs_coord_bo:notify(Event),
+    {noreply, State};
+
+%% Penalty accounting (M4). The station observes, the coordinator relays, and
+%% **only Java writes the counter** — nothing here keeps a second copy of it.
 %%
 %% Note what is not done: this coordinator does not suspend anybody on its own
 %% initiative. It learns of a suspension when Java tells it (`user_suspended'),
 %% because the rule "two consecutive no-shows" needs history that lives in the
 %% database, not in a process that any election can replace.
-handle_cast({no_show, _UserId, _StationId, _ConnId} = Event, State) ->
-    vs_coord_bo:penalty_event(Event),
-    {noreply, State};
-
-handle_cast({show_up, _UserId} = Event, State) ->
-    vs_coord_bo:penalty_event(Event),
-    {noreply, State};
+%%
+%% A follower forwards instead of dropping, like the announcements above. The
+%% gate that used to sit on the far side of this was meant to stop one strike
+%% being counted twice — but a station casts to one node only, so there was
+%% never a second copy to guard against, and the gate simply lost strikes in the
+%% window where a station still believes in the old leader. Also A's, R4.
+handle_cast(Msg, State) when element(1, Msg) =:= no_show;
+                             element(1, Msg) =:= show_up ->
+    {noreply, relay_penalty(Msg, State)};
 
 %% --- what the election tells us (M3) ---------------------------------
 
@@ -288,12 +328,22 @@ handle_info({From, get_stations}, State) ->
     From ! {stations_update, station_tuples(State)},
     {noreply, State};
 
-handle_info({From, get_suspensions}, State) ->
-    From ! {suspensions, maps:to_list(State#state.suspended)},
-    {noreply, State};
 
+%% Recorded whatever our mode, because being told is cheap and the entry costs
+%% nothing until this node serves. But say so when we are not the leader: the
+%% back office addresses the node it last heard announce itself, so a suspension
+%% landing on a follower means its idea of the leader is stale. The republish
+%% closes that within 30 seconds (see vs_coord_bo), so this is a note, not an
+%% alarm — it just should not be silent. Raised by A, residue of R1.
 handle_info({user_suspended, UserId, UntilEpochSeconds}, State) ->
-    logger:notice("user ~p suspended until ~p", [UserId, UntilEpochSeconds]),
+    case State#state.mode of
+        serving ->
+            logger:notice("user ~p suspended until ~p", [UserId, UntilEpochSeconds]);
+        Mode ->
+            logger:warning("user ~p suspended until ~p, but this node is ~p: "
+                           "the back office is addressing a node that is not serving",
+                           [UserId, UntilEpochSeconds, Mode])
+    end,
     Suspended = maps:put(UserId, UntilEpochSeconds, State#state.suspended),
     {noreply, State#state{suspended = Suspended}};
 
@@ -504,6 +554,23 @@ renew_one({ClaimId, VehicleId, ConnId, UserId, GrantedAt}, StationId, NewExpiry,
 renew_one(Malformed, StationId, _NewExpiry, Acc) ->
     logger:warning("renew from station ~p: unusable entry ~p, skipped", [StationId, Malformed]),
     Acc.
+
+%% A penalty event goes to Java if we are the one serving, and to whoever is
+%% otherwise. Dropping it — which is what the gate in vs_coord_bo used to do —
+%% loses a strike outright: unlike a session, a no-show leaves no row anywhere,
+%% so this message is the only record that it happened.
+relay_penalty(Event, State) ->
+    case {State#state.mode, State#state.leader} of
+        {serving, _} ->
+            vs_coord_bo:penalty_event(Event);
+        {_, undefined} ->
+            %% No leader to pass it to. Rare and bounded — the election settles
+            %% in a second — but say so, because a lost strike is invisible.
+            logger:warning("penalty event dropped, no leader known: ~p", [Event]);
+        {_, Leader} ->
+            gen_server:cast({?SERVER, Leader}, {forwarded, Event})
+    end,
+    State.
 
 %% The two announcement casts, applied to our own table. Separated out so that
 %% a forwarded copy takes exactly the same path as a direct one.

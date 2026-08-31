@@ -18,7 +18,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, publish/1, announce_leader/0, standing_by/0,
-         session_closed/1, penalty_event/1]).
+         session_closed/1, penalty_event/1, notify/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(SERVER, ?MODULE).
@@ -82,15 +82,26 @@ session_closed(Event) ->
 %% @doc Relay a `no_show' or `show_up' observed by a station (M4).
 %%
 %% Unlike the station list, this is **not** a snapshot: a lost `no_show' is a
-%% strike that never gets counted, and no later message repairs it. That is
-%% accepted rather than fixed, and it is the right trade here — the penalty
-%% exists to stop a habit, so missing one strike delays a suspension instead of
-%% corrupting anything. The alternative, making the cluster responsible for
-%% delivering it, would put durable state back into a process that any election
-%% can replace.
+%% strike that never gets counted, and no later message repairs it. So it is
+%% worth one hop of effort to keep — vs_coord_srv routes it to the leader
+%% instead of dropping it on a follower — but not more than that. Making the
+%% cluster responsible for delivering it would put durable state back into a
+%% process that any election can replace, and missing a strike only delays a
+%% suspension rather than corrupting anything.
 -spec penalty_event(tuple()) -> ok.
 penalty_event(Event) ->
     gen_server:cast(?SERVER, {penalty_event, Event}).
+
+%% @doc Relay a `{notify, UserId, Kind, Text}' a station wants the driver to
+%% read next time they look (M4).
+%%
+%% Like `session_closed' and unlike the station list, this is not a snapshot:
+%% nothing later repeats it. Unlike `session_closed', there is not even a row in
+%% MySQL behind it — this message IS the notification. So it is never gated and
+%% never dropped on purpose.
+-spec notify(tuple()) -> ok.
+notify(Event) ->
+    gen_server:cast(?SERVER, {notify, Event}).
 
 %%%===================================================================
 %%% gen_server
@@ -141,16 +152,20 @@ handle_cast({session_closed, Event}, State) ->
     send(State, Event),
     {noreply, State};
 
-%% Gated on `serving', unlike session_closed: a station talks to the leader, so
-%% a penalty event reaching a follower means the routing is already confused,
-%% and relaying it from two coordinators at once would count one no-show twice.
-%% Java's counter has no way to tell the duplicates apart.
-handle_cast({penalty_event, Event}, State = #state{serving = true}) ->
+%% No longer gated on `serving'. The gate was meant to stop one no-show being
+%% counted twice, but a station casts to a single node, so there was never a
+%% second copy to guard against — and vs_coord_srv now forwards to the leader
+%% rather than letting a follower drop the event. What the gate actually did was
+%% lose strikes in the window where a station still believed in the old leader.
+%% Reported by A, R4 of the review of PR #5.
+handle_cast({penalty_event, Event}, State) ->
     send(State, Event),
     {noreply, State};
 
-handle_cast({penalty_event, Event}, State) ->
-    logger:info("not serving: dropping penalty event ~p", [Event]),
+%% A notification. Ungated for the stronger reason: a duplicate inserts one row
+%% the driver reads once, while dropping one loses the only copy there is.
+handle_cast({notify, Event}, State) ->
+    send(State, Event),
     {noreply, State};
 
 handle_cast(_Msg, State) ->

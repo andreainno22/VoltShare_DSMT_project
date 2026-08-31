@@ -75,6 +75,17 @@ public final class PenaltyService {
     public void onNoShow(int userId, int stationId, int connectorId) {
         try {
             int strikes = users.recordNoShow(userId);
+
+            // Zero means the account does not exist: the counter after an increment is always
+            // at least one, so the value is unambiguous. Carrying on would insert a
+            // notification for a missing user and fail on the foreign key, logged as "cannot
+            // record a no-show" — an error message pointing at the wrong thing. Reported by A
+            // among the minor findings of the review of PR #5.
+            if (strikes == 0) {
+                LOG.log(Level.WARNING, "No-show for unknown user {0}, ignored", userId);
+                return;
+            }
+
             LOG.log(Level.INFO, "No-show {0} for user {1} at station {2}, connector {3}",
                     new Object[]{strikes, userId, stationId, connectorId});
 
@@ -162,10 +173,21 @@ public final class PenaltyService {
 
         users.suspendUntil(userId, until);
 
-        notifications.add(userId, Notification.SUSPENDED,
-                "Reservations are suspended until " + Times.format(until)
-                        + " after " + strikesAllowed + " missed reservations in a row. "
-                        + "Charging at a free connector without reserving is still available.");
+        // Caught separately, so that a failed INSERT here cannot stop the coordinator from
+        // being told. Telling the driver and enforcing the rule are two different jobs, and
+        // the one that matters is enforcement: a suspension that exists in `users` but that
+        // no coordinator knows about is a penalty that does not apply. Without this the method
+        // would exit halfway, with the row written and the cluster unaware — raised by A as
+        // R3 of the review of PR #5.
+        try {
+            notifications.add(userId, Notification.SUSPENDED,
+                    "Reservations are suspended until " + Times.format(until)
+                            + " after " + strikesAllowed + " missed reservations in a row. "
+                            + "Charging at a free connector without reserving is still available.");
+        } catch (SQLException e) {
+            LOG.log(Level.WARNING,
+                    "Suspension of user " + userId + " applied, but the notice could not be stored", e);
+        }
 
         // The coordinator is what actually enforces it, on the next claim. Telling it is the
         // last step on purpose: if this message is lost the database still knows, and the next

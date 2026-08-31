@@ -54,14 +54,18 @@ public class NotificationDao {
     }
 
     /**
-     * The text is truncated rather than rejected: the column is 255 characters and a
-     * notification arriving from a station is not worth losing over its length.
+     * Both fields are truncated rather than rejected: a notification arriving from a station is
+     * not worth losing over its length.
+     *
+     * <p>{@code kind} is truncated too, at 40. It was not, and that undid the very case this
+     * method claims to absorb — a station inventing a longer kind would have failed the INSERT
+     * instead of being stored as-is. Reported by A in the review of PR #5.
      */
     public void add(int userId, String kind, String text) throws SQLException {
         try (Connection c = Db.getConnection();
              PreparedStatement ps = c.prepareStatement(INSERT)) {
             ps.setInt(1, userId);
-            ps.setString(2, kind);
+            ps.setString(2, kind.length() > 40 ? kind.substring(0, 40) : kind);
             ps.setString(3, text.length() > 255 ? text.substring(0, 255) : text);
             ps.executeUpdate();
         }
