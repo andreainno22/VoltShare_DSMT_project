@@ -487,7 +487,12 @@ wire_connector(C, UserId) ->
 %% `offline' is the manager's word for "no process answers for this
 %% connector"; the enum of §5.1 does not have it. `out_of_service' is
 %% what it means to a driver: it exists, it cannot be used. The other
-%% four names are identical on both sides and pass through.
+%% four names of the machine are identical on both sides and pass
+%% through, and so — through the catch-all — do the three the connector
+%% *derives* rather than lives in: `suspended' since M2 step 2,
+%% `complete' and `overstay' since M4. There is one translation to make
+%% here and it is `offline'; a whitelist would only be a second place to
+%% forget a name in.
 wire_connector_state(offline)  -> out_of_service;
 wire_connector_state(free)     -> free;
 wire_connector_state(held)     -> held;
@@ -560,16 +565,27 @@ session_payload(Connector) ->
       eta_seconds      => eta_seconds(maps:get(battery_kwh, Session, 0),
                                       SocPct, PowerKw),
       started_at       => maps:get(started_at, Session, 0),
-      %% M4. §5.2 declares the field, so it travels as a zero rather than
-      %% as a missing key — the same reason `waitlist' is a constant in
-      %% §5.1 — and the semantics (net of the grace period) are already
-      %% agreed with B.
-      overstay_seconds => 0}.
+      %% M4. Read, not computed: the connector owns the grace and the
+      %% clock and puts the live net into its own snapshot, so this
+      %% channel reports a number rather than deriving a second one that
+      %% could disagree with the one written to `sessions'. The default
+      %% keeps §5.2's shape for a snapshot that has no such key — a
+      %% hand-built map in a test, a session sub-map from an older node —
+      %% the same reason `waitlist' is a declared constant in §5.1.
+      overstay_seconds => maps:get(overstay_seconds, Session, 0)}.
 
 %% §5.2's enum is `charging | suspended | complete | overstay | closed'.
-%% Three of the five are producible from a snapshot: `closed' is not
+%% Four of the five are producible from a snapshot: `closed' is not
 %% derived at all — it is what `session_push/3' sends once the session has
-%% left the snapshot — and `overstay' waits for M4.
+%% left the snapshot.
+%%
+%% The order of the clauses is the contract's own precedence, and since M4
+%% the first two carry the weight. `complete' and `overstay' are states of
+%% the connector, decided by the state machine that owns the session and
+%% the clock, and they must win over anything derived here: a session that
+%% reached `complete' through a full battery reports `soc_pct: 100' for
+%% the whole overstay, so a `soc >= 100' clause read first would say
+%% `complete' for ever and `overstay' would never be producible at all.
 %%
 %% `suspended' is read off the connector's reported state, where M2 step 2
 %% already derives it from a limit of zero. It is deliberately **not**
@@ -577,12 +593,18 @@ session_payload(Connector) ->
 %% power is ambiguous between a starved allocation and a deep taper, and
 %% the two mean opposite things to whoever is waiting for the car.
 %%
-%% `complete' wins over `suspended' on purpose. A full battery is finished
-%% whatever the allocator did with the last few kilowatts, and telling a
-%% driver that his full car is "paused" would be a worse answer than none.
-%% If `soc_pct' never reaches 100 the phase stays `charging': the station
-%% does not know that a car has stopped asking, and saying so is better
-%% than simulating it.
+%% The `soc >= 100' clause stays, below the two states, and still earns
+%% its place: it covers the window between the `meter' that fills the
+%% battery and the transition that acts on it, and the case the station
+%% cannot act on at all — a car that reports 100 % while the connector is
+%% `suspended' by the allocator. `complete' wins over `suspended' there on
+%% purpose: a full battery is finished whatever the allocator did with the
+%% last few kilowatts, and telling a driver that his full car is "paused"
+%% would be a worse answer than none. If `soc_pct' never reaches 100 the
+%% phase stays `charging': the station does not know that a car has
+%% stopped asking, and saying so is better than simulating it.
+phase(complete, _SocPct)                                    -> complete;
+phase(overstay, _SocPct)                                    -> overstay;
 phase(_State, SocPct) when is_number(SocPct), SocPct >= 100 -> complete;
 phase(suspended, _SocPct)                                   -> suspended;
 phase(_State, _SocPct)                                      -> charging.

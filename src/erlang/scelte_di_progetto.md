@@ -2205,3 +2205,111 @@ connettori uno per uno. La stessa frase stava nella colonna «Meaning shown» di
 §4.1 ed è stata cambiata **nello stesso commit**: un test la confronta alla lettera, e un testo
 che il contratto cita e il codice non pronuncia è un contratto che ha smesso di descrivere il
 codice.
+
+## 22. L'overstay è tempo che passa, non un settimo stato (M4-A)
+
+`sessions.overstay_seconds` è stato zero cablato dalla prima riga scritta fino a M4, e il
+motivo non era una formula mancante: era che il sistema **confondeva due fatti** che il dominio
+tiene separati — la ricarica è finita, e il cavo è fuori. `stop_session` in `charging` andava
+dritto in `closing`, `settle/1` scriveva la riga nello stesso respiro, e tra la fine della
+ricarica e la scrittura non passava mai tempo che qualcuno potesse misurare. Il campo non era
+"da implementare": era **strutturalmente** sempre zero, e nessun test poteva accorgersene
+perché tutti asserivano quel comportamento.
+
+### 22.1 Uno stato nuovo, e uno derivato
+
+`complete` è uno stato vero della macchina: ci si entra dalle tre fini *morbide* — lo stop del
+driver, la batteria piena, il claim revocato — cioè tutte quelle in cui l'hardware parla
+ancora, e ci si resta finché non arriva l'`unplugged`. `overstay` **non** è un settimo stato:
+è `complete` con `now >= charge_ended_at + grazia`, derivato in `reported_state/2` esattamente
+come `suspended` è `charging` a limite zero.
+
+L'argomento è lo stesso di allora, e vale la pena scriverlo di nuovo perché la tentazione è
+identica: uno stato vero entrerebbe e uscirebbe su un valore che **scorre da solo**, firerebbe
+`enter` e `exit` per un millisecondo che passa e obbligherebbe a un `{state_timeout, Grazia, …}`
+per svegliarsi. Uno derivato non può oscillare, perché non c'è niente che oscilli — c'è un
+confronto, fatto quando qualcuno guarda. La pagina si aggiorna sul suo `STATE_TICK_MS` di 5 s,
+che per un fenomeno da minuti è più che sufficiente; misurato nella prova manuale del 30/08, la
+fase è passata a `overstay` 3 s dopo la scadenza della tolleranza.
+
+Il timer servirà, e non è un ripensamento: la notifica `overstay_started` di ws-driver §5.3 ha
+bisogno di un istante e non di un'occhiata. Quando R2 si aprirà, si aggiunge un
+`{state_timeout, Grazia, overstay}` in `complete(enter, …)` e non cambia nient'altro — lo stato
+c'è già, il campo c'è già, la derivazione resta la fonte per lo snapshot.
+
+### 22.2 Il `>=` non è pignoleria
+
+`reported_state/2` confronta con `>=` e non con `>`. Con la grazia a zero — che è come i test
+ottengono un overstay deterministico senza aspettarne uno — lo **stesso** millisecondo in cui
+la ricarica finisce deve già leggersi `overstay`, o l'asserzione dipende da quanto è veloce la
+macchina. È la lezione di P11 applicata a un operatore di confronto: un test a cronometro non
+si riconosce solo dagli `sleep`.
+
+### 22.3 Perché la riga si scrive all'unplug, e non due volte
+
+L'alternativa era scrivere la riga alla fine della ricarica e **aggiornarla** all'unplug. Costa
+due scritture per sessione, obbliga a ripensare l'idempotenza di `session_closed` (oggi:
+at-least-once su un INSERT idempotente) e fa leggere a B una riga che cambia sotto di lui. Il
+costo di non farlo è tenere la sessione in RAM qualche minuto in più, che era già vero per
+tutta la durata della ricarica.
+
+`ended_at` resta l'istante in cui **l'occupazione** finisce, cioè adesso l'unplug e non più lo
+stop. Verificato lato B prima di toccare il codice: nessuno ricalcola l'overstay dai due
+timestamp — `BillingService` e `SessionView.getOverstayMinutes()` leggono solo la colonna. La
+sola conseguenza visibile è che la durata mostrata in `history.jsp`
+(`Duration.between(startedAt, endedAt)`) adesso comprende anche l'overstay, il che è esatto:
+descrive per quanto l'outlet è stato occupato.
+
+### 22.4 Le due cose che si azzerano entrando in `complete`
+
+`power_kw` e `limit_kw` vanno a zero sull'`enter`, e nessuna delle due è cosmetica.
+
+`power_kw` viaggia nel frame §5.2 e in `complete` i `meter` vengono assorbiti: senza azzerarlo,
+la pagina del driver mostrerebbe «150 kW» per tutta la durata dell'overstay. Prima di M4 il
+difetto non era visibile perché `closing` durava due secondi.
+
+`limit_kw` è più insidioso: una colonnina che si riavvia durante l'overstay lo rilegge dal boot
+ack (`vs_cp_proto:limit_kw/2`) e `cp.js` lo riapplica. Con 150 kW nell'ack, un blip di socket
+farebbe **ripartire l'erogazione** su un tetto che la stazione aveva annullato un minuto prima.
+Zero è la parola che §5 usa già per «la sessione resta aperta e non tira niente».
+
+### 22.5 Chi legge l'enum degli stati, e uno che il piano non aveva
+
+Aggiungere due valori a `state` significa cercare per struttura chi lo legge, non chi lo
+nomina. `vs_power:is_live/1` ammette solo `charging|suspended` e quindi esclude `complete` da
+solo — la potenza torna nel pool senza toccare l'allocatore. `vs_driver_proto:wire_connector_state/1`
+ha un catch-all e li lascia passare. `vs_claim_client:count_stats/1` **no**: sarebbe finito nel
+suo catch-all e un connettore occupato da un'auto ferma sarebbe sparito dai tre numeri della
+lobby — né libero, né tenuto, né in carica. È esattamente il difetto che la clausola
+`suspended` era stata scritta per evitare, nel posto in cui sarebbe durato minuti invece di
+due secondi. Le due clausole ci sono e un test le copre.
+
+### 22.6 Il riaggancio §6 durante l'overstay: nessuna clausola è la clausola giusta
+
+`complete` non ha una clausola `plugged`, e non è una dimenticanza. Tracciato prima di
+scrivere: un `plugged` di ri-annuncio su un connettore in `charging` **non** ha mai avuto una
+clausola nemmeno lì — `handle_common` risponde `invalid_state`, `vs_cp_proto` lo logga come
+divergenza (§7.6) e non manda nessun comando. Ciò che fa funzionare il riaggancio di P4/P10 è
+un altro pezzo: l'`attach_cp` del `boot`, che in `handle_common` cancella il timer di grazia in
+**qualunque** stato. `complete` eredita quel trattamento gratis, e una clausola propria potrebbe
+solo fare peggio — rimetterebbe a zero un orologio su un'auto che non si è mossa.
+
+### 22.7 Il limite noto: una stazione che riparte durante l'overstay
+
+Se la stazione riparte mentre un connettore è in `complete`, la colonnina si riattacca e la
+sessione viene **riadottata in `charging`** (§6.2), non in `complete`: il processo connettore
+nasce in `free` e la porta d'ingresso è quella del walk-in. `charge_ended_at` è andato con il
+processo, quindi l'overstay già maturato è perso.
+
+Il piano di M4 diceva «il prossimo `meter` a soc 100 lo rimanda in `complete` e l'orologio
+riparte». Vale **solo** per l'overstay nato da una batteria piena, e solo se la colonnina
+continua a mandare `meter` dopo lo stop — il nostro emulatore, misurato, tace
+(`cp.js:343-344`, `delivering=false`). Per l'overstay nato da uno stop del driver o da una
+revoca il soc non arriverà mai a 100: il connettore resta `charging` fino all'`unplugged` e la
+riga esce con `overstay_seconds = 0`. In entrambi i casi lo scarto è a favore del driver, ed è
+questo il verso in cui deve stare.
+
+Non lo correggiamo, per la stessa ragione per cui §6 non ricostruisce la prenotazione: la
+colonnina può dire per quanto ha **erogato**, non per quanto il cavo è rimasto dentro dopo che
+l'erogazione è finita. Sarebbe un campo nuovo nel contratto per un caso raro, e chiederebbe
+all'hardware una risposta che l'hardware non ha.

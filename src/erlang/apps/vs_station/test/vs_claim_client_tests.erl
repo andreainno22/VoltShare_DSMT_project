@@ -297,6 +297,25 @@ suspended_counts_as_charging_in_the_lobby_stats_test() ->
     ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(
                               Push([offline, suspended]))).
 
+%% M4, and the same trap one state later. `complete' and `overstay' are
+%% what a connector reports once the charge is over and the cable has not
+%% come out — the definition of an outlet that is taken and not usable —
+%% and an overstay lasts minutes where a `closing' lasts two seconds.
+%% Without their own clauses the catch-all would drop them, and the lobby
+%% would show a site as emptiest exactly when it is most blocked: the
+%% failure `suspended' taught us, in the place where it would be visible
+%% for longest.
+a_finished_charge_still_occupies_the_outlet_in_the_lobby_stats_test() ->
+    Push = fun(States) ->
+                   #{connectors => [#{connector_id => N, state => S}
+                                    || {N, S} <- lists:enumerate(States)]}
+           end,
+    ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(Push([complete]))),
+    ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(Push([overstay]))),
+    %% and they add to the same total as the other occupied states
+    ?assertEqual({1, 0, 4}, vs_claim_client:count_stats(
+                              Push([free, charging, suspended, complete, overstay]))).
+
 revocation_travels_from_coordinator_to_connector_test() ->
     with_station(fun() ->
         {ok, Pid} = vs_station_mgr:connector_pid(?CONN),

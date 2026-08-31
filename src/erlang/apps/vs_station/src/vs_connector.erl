@@ -8,14 +8,26 @@
 %%% States, and the events that move between them:
 %%%
 %%%   free ──reserve (claim granted)──▶ held ──plugged (right vehicle)──▶ charging
-%%%    ▲                                 │                                   │
-%%%    │◀──cancel │ lease expired │ revoked                    stop │ unplug │
-%%%    │                                                             ▼
+%%%    ▲                                 │                              │      │
+%%%    │◀──cancel │ lease expired │ revoked                  stop │ full │      │
+%%%    │                                                           ▼      │
+%%%    │                                                       complete   │ unplug
+%%%    │                                                           │ unplug│
+%%%    │                                                           ▼      ▼
 %%%    └──────session written · claim released────────────────── closing
 %%%   free ──plugged, no reservation (walk-in)──────────────────▶ charging
 %%%
 %%%   any ──charge point faulted │ gone past the grace──▶ out_of_service
 %%%   out_of_service ──charge point boots `available'──▶ free
+%%%
+%%% M4 — `complete' is the state that exists so that two facts the domain
+%%% keeps apart stop being conflated: **the charge is over** and **the
+%%% cable is out**. Every soft ending (the driver's stop, a full battery,
+%%% a revoked claim) tells the hardware to stop and comes here; the row is
+%%% written at the `unplugged', and the seconds in between, less the
+%%% grace, are the overstay. `overstay' is not a seventh state: it is
+%%% `complete' past the grace, derived in `reported_state/2' exactly as
+%%% `suspended' is derived from a limit of zero.
 %%%
 %%% Two rules are structural rather than checked:
 %%%
@@ -64,9 +76,16 @@
 %% pure — exported so that the halving of the heartbeat budget (D-9) can be
 %% asserted against `vs_cp_ws:idle_timeout_ms/0' rather than restated in a
 %% test, the same way vs_station_db exports its row and clock helpers.
--export([cp_grace_ms/0]).
+%%
+%% M4 — `overstay_seconds/3' is here for the same reason and a sharper
+%% one: it is the arithmetic a `sessions' row is billed on, and the only
+%% way to test it on the numbers that matter (seven minutes, four, the
+%% boundary) without an hour of wall clock is to hand it timestamps.
+%% `vs_time' is the real clock and is not injectable, and P11 forbids
+%% tests that wait.
+-export([cp_grace_ms/0, overstay_seconds/3]).
 %% state functions
--export([free/3, held/3, charging/3, closing/3, out_of_service/3]).
+-export([free/3, held/3, charging/3, complete/3, closing/3, out_of_service/3]).
 
 -type conn_id()    :: pos_integer().
 -type user_id()    :: pos_integer().
@@ -75,11 +94,17 @@
 %% ws-chargepoint.md §4.1 — the four the hardware may report.
 -type cp_status()  :: available | occupied | faulted | unavailable.
 %% ws-chargepoint.md §5 — the reasons a `stop' command may carry. The
-%% connector raises three of the six; `not_your_reservation' is built by
+%% connector raises four of the six; `not_your_reservation' is built by
 %% `vs_cp_proto' (it answers a refused `plugged', which never becomes a
-%% transition here), `station_shutdown' by `vs_cp_ws' on the way down, and
-%% `target_reached' waits for the allocator of M2 step 2.
--type stop_reason() :: driver_stopped | claim_revoked | faulted.
+%% transition here) and `station_shutdown' by `vs_cp_ws' on the way down.
+%%
+%% M4 — `target_reached' is the fourth, and until now it was in the
+%% contract and in nobody's code: the comment here said it "waits for the
+%% allocator of M2 step 2", the allocator arrived, and the wire was never
+%% pulled. It is raised by `charging/3' on the first `meter' that reports
+%% a full battery, which is the only place the station learns that a car
+%% has stopped needing power.
+-type stop_reason() :: driver_stopped | target_reached | claim_revoked | faulted.
 
 -export_type([cp_status/0, stop_reason/0]).
 
@@ -130,6 +155,16 @@
                   claim_granted_at :: vs_time:epoch_ms() | undefined,
                   claim_expires_at :: vs_time:epoch_ms() | undefined,
                   started_at  :: vs_time:epoch_ms(),
+                  %% M4 — when the charge ended, on the station's clock.
+                  %% `undefined' for every session that never passed
+                  %% through `complete': a fault, a charge point gone past
+                  %% the grace, an unplug straight out of `charging'. Those
+                  %% endings leave no measurable overstay — the cable came
+                  %% out, or the hardware stopped talking and no
+                  %% `unplugged' will ever arrive — and `undefined' is what
+                  %% makes `overstay_seconds/3' answer 0 for them without a
+                  %% branch at the call site.
+                  charge_ended_at = undefined :: vs_time:epoch_ms() | undefined,
                   energy_kwh  = 0.0 :: float(),
                   %% D-1. The charge point counts from *its* start and
                   %% knows nothing about sessions ending (§4.3, §6), so a
@@ -160,6 +195,14 @@
                cp_grace_ms :: pos_integer(),
                %% D-2: how long `closing' listens before it writes.
                settle_ms   :: pos_integer(),
+               %% M4: the tolerance between the end of the charge and the
+               %% first billable second of overstay (ws-chargepoint.md
+               %% §10). Photographed at the birth of the process and never
+               %% read again — the same note of method every other env var
+               %% in this module carries: a session must be billed by the
+               %% rule that was in force when it started, not by whatever
+               %% the environment says at the settle.
+               overstay_grace_s :: non_neg_integer(),
                %% D-1: the cumulative the hardware will report next, if it
                %% still has the cable. Set by `settle/1' on the two paths
                %% that end a session without the cable coming out; read and
@@ -286,7 +329,9 @@ init(Opts) ->
                  notify_to  = maps:get(notify_to, Opts, undefined),
                  cp_grace_ms = maps:get(cp_grace_ms, Opts, cp_grace_ms()),
                  settle_ms   = maps:get(closing_settle_ms, Opts,
-                                        closing_settle_ms())},
+                                        closing_settle_ms()),
+                 overstay_grace_s = maps:get(overstay_grace_s, Opts,
+                                             overstay_grace_s())},
     %% Announce to whoever tracks connectors (vs_station_mgr). This runs
     %% at first boot AND at every supervisor restart, which is how the
     %% manager's registry heals after a crash without polling anyone. It
@@ -533,11 +578,30 @@ charging(enter, _Old, Data = #data{session = S, rated_kw = Rated}) ->
     send_cp(Data1, #{command => set_limit, limit_kw => Limit}),
     {keep_state, Data1};
 
+%% M4 — the reading that ends the charge, and the only way the station
+%% ever learns that a battery is full. `target_reached' has been in
+%% ws-chargepoint.md §5 since M2 and had no sender: the equipment reports
+%% the state of charge (§4.3) and it is the station that has to draw the
+%% conclusion, because the split of §7.1 gives the equipment no say in
+%% when a session ends.
+%%
+%% The reading is applied **before** the transition, not dropped with it:
+%% the last few hundred watt-hours are energy that was delivered, and the
+%% snapshot the page reads a millisecond later should show the full
+%% battery it just reported rather than the reading before it.
 charging(cast, {meter, Reading}, Data = #data{session = S}) ->
     S2 = (apply_meter(Reading, S))#session{
            power_kw = maps:get(power_kw, Reading, S#session.power_kw),
            soc_pct  = maps:get(soc_pct,  Reading, S#session.soc_pct)},
-    {keep_state, Data#data{session = S2}};
+    case S2#session.soc_pct >= 100 of
+        true ->
+            logger:notice("connector ~p: battery full for user ~p - stopping "
+                          "the charge", [Data#data.conn_id, S2#session.user_id]),
+            send_cp(Data, stop_cmd(target_reached)),
+            {next_state, complete, charge_ended(Data#data{session = S2})};
+        false ->
+            {keep_state, Data#data{session = S2}}
+    end;
 
 %% §5: stored **and** forwarded. Stored because the page and the allocator
 %% both read it back off the snapshot; forwarded because the hardware is
@@ -548,9 +612,15 @@ charging(cast, {set_limit, Kw}, Data = #data{session = S}) ->
     send_cp(Data1, #{command => set_limit, limit_kw => Limit}),
     {keep_state, Data1};
 
+%% M4 — `complete', not `closing'. The driver's stop ends the *charge*;
+%% it does not pull the cable, and ws-driver.md §120 has always said so
+%% ("stopping does not end the overstay clock: the cable is still in the
+%% car"). Going straight to `closing' wrote the row in the same breath,
+%% which left no interval for anyone to measure and made §4.3 contradict
+%% §120 in the same document. The ack the driver gets is unchanged.
 charging({call, From}, {stop_session, UserId}, Data = #data{session = #session{user_id = UserId}}) ->
     send_cp(Data, stop_cmd(driver_stopped)),
-    {next_state, closing, Data, [{reply, From, ok}]};
+    {next_state, complete, charge_ended(Data), [{reply, From, ok}]};
 
 charging({call, From}, {stop_session, _Other}, _Data) ->
     {keep_state_and_data, [{reply, From, {error, not_yours}}]};
@@ -565,11 +635,20 @@ charging(cast, {unplugged, EnergyKwh}, Data) ->
 %% A revocation while charging still wins (claim.md §5.4). It is the rarest
 %% path in the system and the one most worth getting right: the contract
 %% says the station obeys, so the session stops and the driver is told why.
+%%
+%% M4 — a third soft ending, so `complete' like the other two: the
+%% coordinator took the reservation away, it did not pull the cable, and a
+%% car left plugged in after a revocation is an overstay like any other.
+%% The `claim_revoked' notification stays here, at the moment of the
+%% revocation; only the row moves to the unplug. `release(completed)' on a
+%% claim the coordinator has already revoked was happening on this path
+%% before M4 too — a few seconds earlier, and just as harmlessly (claim.md
+%% §5.6 makes a release best-effort).
 charging(cast, {revoke, ClaimId}, Data = #data{session = #session{claim_id = ClaimId, user_id = U}}) ->
     logger:warning("connector ~p claim ~s revoked mid-session", [Data#data.conn_id, ClaimId]),
     notify(Data, {claim_revoked, U}),
     send_cp(Data, stop_cmd(claim_revoked)),
-    {next_state, closing, Data};
+    {next_state, complete, charge_ended(Data)};
 
 %% P14, the other half. `held → charging' hands the reservation in and
 %% throws the `#hold' away (D-8), so after the cable goes in the claim
@@ -613,6 +692,128 @@ charging(EventType, Event, Data) ->
     handle_common(EventType, Event, charging, Data).
 
 %%%===================================================================
+%%% complete — M4
+%%%===================================================================
+
+%% The charge is over and the cable is still in. One state for the three
+%% soft endings, and the only place in the machine where time passing is
+%% itself the thing being measured.
+%%
+%% What it is **not**: a timer. `overstay' is derived in
+%% `reported_state/2' from the clock and `charge_ended_at', the way
+%% `suspended' is derived from a limit of zero, and for the same reason —
+%% a state that entered and left on a value which moves by itself would
+%% fire `enter' callbacks for nothing. A `{state_timeout, Grace, overstay}'
+%% is what the notification of ws-driver §5.3 will need when R2 opens; it
+%% would slot in here and change nothing else.
+%%
+%% What it costs, stated rather than discovered: the session stays in RAM
+%% until the cable comes out, which may be minutes. That was already true
+%% for the whole charge, and it is the price of the alternative being two
+%% writes per session and a `sessions' row that changes under the back
+%% office (see PIANO_OVERSTAY §4).
+%%
+%% `plugged' has no clause on purpose. A charge point that reconnects
+%% during the overstay re-announces the cable (§6.2), and `handle_common'
+%% answers `invalid_state' — which is **exactly** what a connector in
+%% `charging' answers today, and what `vs_cp_proto' logs and drops without
+%% sending any command. The blip therefore costs nothing here either: the
+%% `attach_cp' of the boot has already cancelled the grace timer in
+%% `handle_common', the session is untouched and `charge_ended_at' keeps
+%% running. A clause of our own could only do worse — it would restart the
+%% clock on a car that never moved.
+complete(enter, _Old, Data = #data{session = S}) ->
+    %% Delivery is over, so the two numbers that describe delivery say so.
+    %% Not cosmetics: `power_kw' travels to the driver's page in the §5.2
+    %% frame and `meter' is absorbed below, so a stale reading would sit
+    %% there for the whole overstay claiming the car is still drawing
+    %% ninety kilowatts. `limit_kw' matters on a different path — a charge
+    %% point that reboots mid-overstay reads it back out of the boot ack
+    %% (`vs_cp_proto:limit_kw/2') and would resume delivering on a ceiling
+    %% the station cancelled a minute ago. Zero is §5's own word for "the
+    %% session stays open and draws nothing".
+    Data1 = Data#data{session = S#session{power_kw = 0.0, limit_kw = 0.0}},
+    %% The manager reallocates and broadcasts on any connector event, so
+    %% this one hands the power back to the pool (`vs_power:is_live/1'
+    %% admits only `charging' and `suspended') and puts the new state on
+    %% every open page in the same step.
+    notify(Data1, {state_changed, complete}),
+    {keep_state, Data1};
+
+%% The cable is out. Same shape as `charging': the event is posted
+%% forward so that `closing' stays the one place that reads an
+%% `unplugged' and settles on the total it carries.
+complete(cast, {unplugged, EnergyKwh}, Data) ->
+    {next_state, closing, Data, [{next_event, cast, {unplugged, EnergyKwh}}]};
+
+%% P14, the third half. A state that did not answer the rebuild would
+%% reopen the regression in the place where a session now spends minutes
+%% rather than milliseconds: the claim still exists, this process still
+%% owns it, and a claim client that restarted has no other way to find it.
+%% Presented exactly as `charging/3' presents it, walk-in clause included.
+complete(cast, {claims_rebuild, Client}, Data = #data{session = S}) ->
+    present_claim(Client, claim_of(S),
+                  S#session.vehicle_id, S#session.user_id, Data),
+    keep_state_and_data;
+
+%% The claim of a session that is already over. Absorbed, not obeyed:
+%% there is no charge left to stop and no reservation left to release —
+%% `settle/1' will release it at the unplug, and a release of a claim the
+%% coordinator has already revoked is a no-op it expects (claim.md §5.6).
+%% This is the ordinary ending of a long overstay, where the lease simply
+%% runs out under a car nobody has moved, so it is a log line and not a
+%% warning.
+complete(cast, {revoke, ClaimId}, Data = #data{session = #session{claim_id = ClaimId}}) ->
+    logger:notice("connector ~p: claim ~s revoked after the charge ended - "
+                  "nothing to stop", [Data#data.conn_id, ClaimId]),
+    keep_state_and_data;
+
+%% §4.3's monotone total stops here. The charge is over, so energy must
+%% not grow on a reading: the true final figure comes with the
+%% `unplugged' and goes through `final_energy/2' exactly as it always
+%% has. Measured on the emulator (`cp.js:343-344'): after a `stop' it
+%% sets `delivering = false' and the meter goes silent, so in practice
+%% this clause is a defence against equipment that keeps talking rather
+%% than a path anything walks.
+complete(cast, {meter, Reading}, Data) ->
+    logger:debug("connector ~p: meter after the charge ended, ignored: ~p",
+                 [Data#data.conn_id, Reading]),
+    keep_state_and_data;
+
+complete({call, From}, {reserve, _U, _V}, _Data) ->
+    {keep_state_and_data, [{reply, From, {error, already_held}}]};
+
+%% §4.1, as in `charging': the hardware is authoritative, the row is
+%% written with the energy last measured and the overstay accrued so far,
+%% and the connector goes out of service. The `stop' goes out again even
+%% though the charge is already over — it is idempotent by contract and
+%% it is what makes cp.js report its final total on this path too.
+complete(cast, {cp_status, Status}, Data = #data{session = #session{user_id = U}})
+  when Status =:= faulted; Status =:= unavailable ->
+    logger:error("connector ~p: charge point reports ~p after the charge ended - "
+                 "closing with the last measured energy", [Data#data.conn_id, Status]),
+    send_cp(Data, stop_cmd(faulted)),
+    notify(Data, {session_interrupted, U}),
+    {next_state, closing, Data#data{after_closing = out_of_service}};
+
+complete(cast, {cp_status, _Status}, _Data) ->
+    keep_state_and_data;
+
+%% D3, in the state where it hurts most: the hardware went quiet during
+%% the overstay, so no `unplugged' will ever arrive. Write what has
+%% accrued up to now — the overstay is real up to the moment measurement
+%% stopped — and go out of service, as `charging' does.
+complete({timeout, cp_grace}, _Content, Data = #data{session = #session{user_id = U}}) ->
+    logger:warning("connector ~p: no charge point for ~p ms after the charge "
+                   "ended - closing with the last measured energy",
+                   [Data#data.conn_id, Data#data.cp_grace_ms]),
+    notify(Data, {session_interrupted, U}),
+    {next_state, closing, Data#data{after_closing = out_of_service}};
+
+complete(EventType, Event, Data) ->
+    handle_common(EventType, Event, complete, Data).
+
+%%%===================================================================
 %%% closing
 %%%===================================================================
 
@@ -620,13 +821,13 @@ charging(EventType, Event, Data) ->
 %% happens in one place — `settle/1' — but that place is now the way
 %% **out** of this state rather than the way in.
 %%
-%% D-2. The old shape wrote on entry, and on the two paths that get here
-%% by *telling the hardware to stop* (`stop_session', `revoke') that is a
-%% frame too early: §5 has the charge point apply the command and report
-%% back, and it reports back with the `unplugged' carrying the true total
-%% (cp.js answers `stop' with exactly that). The row was written from the
-%% last `meter' instead, losing up to METER_INTERVAL_S of energy — at
-%% 150 kW, a fifth of a kilowatt-hour off every driver-ended session.
+%% D-2. The old shape wrote on entry, and on the paths that get here by
+%% *telling the hardware to stop* that is a frame too early: §5 has the
+%% charge point apply the command and report back, and it reports back
+%% with the `unplugged' carrying the true total (cp.js answers `stop'
+%% with exactly that). The row was written from the last `meter' instead,
+%% losing up to METER_INTERVAL_S of energy — at 150 kW, a fifth of a
+%% kilowatt-hour off every driver-ended session.
 %%
 %% So `closing' listens for `settle_ms' before it writes. In that window a
 %% `meter' still counts and an `unplugged' ends the wait at once, because
@@ -634,6 +835,16 @@ charging(EventType, Event, Data) ->
 %% to wait for. Nothing else about the state changes: late casts are
 %% absorbed as before, calls still rebound `invalid_state', and
 %% `after_closing' still decides where the connector goes next.
+%%
+%% M4 narrowed which endings still need that window, and it is worth
+%% saying which. The three soft ones no longer arrive here from
+%% `charging' at all: they go to `complete' and wait for the `unplugged'
+%% for as long as it takes, because that wait is the overstay and a two
+%% second deadline would be an arbitrary cap on it. What is left is the
+%% fault paths — a `faulted' status, a charge point past its grace,
+%% raised from `charging' or from `complete' — where the hardware may
+%% still get one last word in and where no `unplugged' is ever coming if
+%% it does not. Those are the sessions this timeout exists for now.
 %%
 %% What it costs, stated rather than discovered: the outlet stays in
 %% `closing' up to `settle_ms' longer, the claim is released that much
@@ -679,9 +890,16 @@ settle(Data = #data{session = S, after_closing = Next}) ->
             station_id   => Data#data.station_id,
             connector_id => Data#data.conn_id,
             started_at   => S#session.started_at,
+            %% M4 — still the instant the occupation ended, which is now
+            %% the unplug rather than the stop on the soft paths. It
+            %% describes how long the outlet was taken; the overstay has
+            %% its own column and B reads that one (BillingService), never
+            %% the difference of the two timestamps.
             ended_at     => EndedAt,
             energy_kwh   => S#session.energy_kwh,
-            overstay_seconds => 0},          %% overstay arrives in M4
+            overstay_seconds => overstay_seconds(S#session.charge_ended_at,
+                                                 EndedAt,
+                                                 Data#data.overstay_grace_s)},
     %% A cast: it queues the row and returns. The connector must never wait
     %% for a database — if it did, a slow MySQL would hold an outlet in
     %% `closing' and a dead one would hold it there for the timeout, which
@@ -829,7 +1047,7 @@ handle_common(info, Info, State, Data) ->
 build_snapshot(State, Data = #data{hold = Hold, session = S}) ->
     Base = #{connector_id => Data#data.conn_id,
              rated_kw     => Data#data.rated_kw,
-             state        => reported_state(State, S),
+             state        => reported_state(State, Data),
              held_by      => case Hold of
                                  #hold{user_id = U} -> U;
                                  _ -> undefined
@@ -862,7 +1080,20 @@ build_snapshot(State, Data = #data{hold = Hold, session = S}) ->
                                 max_kw      => S#session.max_kw,
                                 %% for the `boot' ack of §3.1, which hands
                                 %% the charge point the limit in force
-                                limit_kw    => S#session.limit_kw}}
+                                limit_kw    => S#session.limit_kw,
+                                %% M4, ws-driver.md §5.2 — the live net,
+                                %% zero while the grace is running.
+                                %% Computed **here** and nowhere else: one
+                                %% process owns the grace and the clock,
+                                %% and `vs_driver_proto' reads a number
+                                %% instead of re-deriving one from fields
+                                %% it would have to be handed anyway. The
+                                %% same figure `settle/1' will write, one
+                                %% call earlier.
+                                overstay_seconds =>
+                                    overstay_seconds(S#session.charge_ended_at,
+                                                     vs_time:now_ms(),
+                                                     Data#data.overstay_grace_s)}}
     end.
 
 %% M2 step 2 — `suspended' is derived here, and is deliberately **not** a
@@ -877,9 +1108,29 @@ build_snapshot(State, Data = #data{hold = Hold, session = S}) ->
 %% would enter and leave on every recomputation that crossed the floor,
 %% firing `enter' and `exit' callbacks for a value that changed; a derived
 %% one cannot oscillate because there is nothing to oscillate.
-reported_state(charging, #session{limit_kw = Limit}) when Limit =:= +0.0 ->
+%% M4 — `overstay' is the second derived name, on exactly the same
+%% argument. It is `complete' once the grace has run out, and it is shown
+%% on the station page as well as on the driver's: whoever is waiting for
+%% an outlet is entitled to know that it is blocked by a car that has
+%% finished, not by one that is charging. `suspended' already leaks there
+%% the same way — one `reported_state', two pages that agree.
+%%
+%% The comparison is `>=', and that is deliberate rather than sloppy:
+%% with a grace of zero — which is how the tests get a deterministic
+%% overstay without waiting for one — the very millisecond the charge
+%% ends must already read `overstay', or the assertion depends on how
+%% fast the machine is.
+reported_state(charging, #data{session = #session{limit_kw = Limit}})
+  when Limit =:= +0.0 ->
     suspended;
-reported_state(State, _Session) ->
+reported_state(complete, #data{session = #session{charge_ended_at = EndedAt},
+                               overstay_grace_s = GraceS})
+  when is_integer(EndedAt) ->
+    case vs_time:now_ms() >= EndedAt + GraceS * 1000 of
+        true  -> overstay;
+        false -> complete
+    end;
+reported_state(State, _Data) ->
     State.
 
 %% The three doorways into `charging' all go through these two, so the
@@ -896,6 +1147,34 @@ adopt(Info, Claim, #data{energy_billed = Billed}) ->
 
 consumed(Data) ->
     Data#data{energy_billed = 0.0}.
+
+%% M4 — the instant the charge ended, stamped once on the way into
+%% `complete'. Written by all three soft transitions and by none of the
+%% others, which is the whole of the rule "a session that never reached
+%% `complete' has no measurable overstay". The station's clock, like every
+%% timestamp that ends up in a row (ws-chargepoint.md §7.4).
+charge_ended(Data = #data{session = S}) ->
+    Data#data{session = S#session{charge_ended_at = vs_time:now_ms()}}.
+
+%% @doc Billable overstay seconds: how long the cable stayed in after the
+%% charge ended, less the grace, never negative.
+%%
+%% The **net**, and this is the one place in the system that subtracts it
+%% — agreed with B in `risposta-per-B-M2.md' §2 and written into
+%% ws-chargepoint.md §10 and erlang-java.md: six minutes past the end of
+%% the charge with a five minute grace is `60', four minutes is `0'. The
+%% back office multiplies by the station's rate and never re-derives the
+%% seconds from `started_at'/`ended_at' (BillingService, SessionView).
+%%
+%% `div', so the last incomplete second is not billed; the boundary
+%% second is free for the same reason. B rounds the *minutes* up, which is
+%% where the deterrent lives.
+-spec overstay_seconds(vs_time:epoch_ms() | undefined, vs_time:epoch_ms(),
+                       non_neg_integer()) -> non_neg_integer().
+overstay_seconds(undefined, _EndedAt, _GraceS) ->
+    0;
+overstay_seconds(ChargeEndedAt, EndedAt, GraceS) ->
+    max(0, (EndedAt - ChargeEndedAt) div 1000 - GraceS).
 
 %% The claim a `#hold' or a `#session' carries, in the shape `adopt/3' and
 %% `present_claim/5' both want. One function over two records because it
@@ -1132,3 +1411,13 @@ cp_grace_ms() ->
 %% much and nothing more.
 closing_settle_ms() ->
     vs_env:get_int("CLOSING_SETTLE_MS", 2000).
+
+%% M4 — §10's `OVERSTAY_GRACE_SECONDS'. Read once, in `init/1', and kept
+%% in `#data': the note of method on environment variables in this system
+%% is that they are photographed at the birth of the process, so a session
+%% is billed by the tolerance that was in force when it started rather
+%% than by whatever the environment says minutes later at the settle.
+%% The override from `Opts' exists for the same reason
+%% `closing_settle_ms' has one — a test needs the behaviour, not the wait.
+overstay_grace_s() ->
+    vs_env:get_int("OVERSTAY_GRACE_SECONDS", 300).

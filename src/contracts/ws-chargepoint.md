@@ -154,6 +154,10 @@ Always server-initiated, `request_id: null`. The charge point applies them and r
 | `set_limit` | `limit_kw` | ceiling for this connector, recomputed on every arrival, departure and tick (SCOPE §3.5). `0` means suspended: the session stays open and draws nothing |
 | `stop` | `reason` | end delivery now. Reasons: `driver_stopped`, `target_reached`, `claim_revoked`, `not_your_reservation`, `station_shutdown`, `faulted` |
 
+A `stop` ends the **delivery**, never the occupation: nothing on this channel can pull a cable, and the station does not assume one has been pulled. After a `stop` the equipment may sit with the cable still in the car for minutes, and the `unplugged` of §4.4 arrives whenever the driver comes back. That gap is the overstay, and the station measures it — the connector stays in `complete` (ws-driver.md §5.1) and the `sessions` row is written at the `unplugged`, with the final total and the overstay in the same breath. Equipment that *can* release the cable by itself is free to unplug at once; equipment that cannot simply says nothing until it happens, and both are correct.
+
+The three reasons this holds for are the soft ones — `driver_stopped`, `target_reached`, `claim_revoked` — where the hardware is healthy and still talking. `faulted` is not one of them: the station closes the session there and then with the energy last measured (§3.2), because equipment that has faulted may never send another frame and an overstay nobody can measure is not one worth inventing.
+
 `set_limit` is sent on every recomputation even when the value is unchanged; it is cheap, and it means a charge point that missed a frame is corrected within one tick rather than staying on a stale limit. Idempotence by repetition is easier to reason about than delta tracking, and this channel has no ordering problem to justify the alternative.
 
 The charge point must apply a new limit within `LIMIT_APPLY_SECONDS`. Nothing enforces that here — real hardware ramps — but the emulator honours it, and the demo's power scenario is timed against it.
@@ -256,4 +260,4 @@ CP conn3                                       station1
 | `METER_INTERVAL_S` | `5` | meter period handed to the charge point at boot |
 | `LIMIT_APPLY_SECONDS` | `5` | window within which a new limit must be honoured |
 | `MIN_CHARGE_KW` | `6` | below this the session is suspended (`set_limit 0`) rather than starved |
-| `OVERSTAY_GRACE_SECONDS` | `300` | after charging completes, before the overstay charge starts |
+| `OVERSTAY_GRACE_SECONDS` | `300` | tolerance between the end of the charge and the first billable second. **Subtracted by the station and nowhere else**: `sessions.overstay_seconds` and the `overstay_seconds` of ws-driver.md §5.2 are both the net, already billable — six minutes with the cable in gives `60`, four minutes gives `0`. The back office prices those seconds; it must not subtract the grace a second time |

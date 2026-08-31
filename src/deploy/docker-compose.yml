@@ -60,6 +60,14 @@ services:
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
+      # M4, ws-chargepoint.md §10. Here for the same reason LEASE_SECONDS is:
+      # five minutes of tolerance is right on a real site and is five minutes
+      # of nothing happening in a demo. `OVERSTAY_GRACE_SECONDS=10 docker
+      # compose up -d station1` makes the whole cycle — charge over, grace,
+      # overstay, row — fit inside a minute. The station photographs it at
+      # boot, so it takes a restart to change, which is deliberate: a session
+      # is billed by the rule that was in force when it started.
+      OVERSTAY_GRACE_SECONDS: ${OVERSTAY_GRACE_SECONDS:-300}
       # ≥32 bytes: jjwt refuses shorter HS256 keys (B's requirement, kept)
       VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
       # Must mirror the seed rows of contracts/schema.sql for this station:
@@ -94,6 +102,7 @@ services:
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
+      OVERSTAY_GRACE_SECONDS: ${OVERSTAY_GRACE_SECONDS:-300}
       VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
       # Station 2 owns connectors 5..7 in the seed.
       SITE_POWER_KW: 180

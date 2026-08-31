@@ -115,9 +115,17 @@ Frees the connector immediately and releases the claim. Cancelling a reservation
   "payload": { "connector_id": 3 } }
 ```
 
-Stops charging on a connector the caller owns. The session then closes on its own: the station tells the charge point to stop, writes the session row, releases the claim and returns the power to the pool. `INVALID_STATE` if the connector is not `charging`, `NOT_YOURS` if the session belongs to another account.
+Stops charging on a connector the caller owns. The ack says the station accepted the command and nothing more. `INVALID_STATE` if the connector is not `charging`, `NOT_YOURS` if the session belongs to another account.
 
-Stopping does **not** end the overstay clock: the cable is still in the car. The grace period starts when charging ends, however it ended (§5.2).
+What follows the ack happens in two moments, not one, because ending a charge and ending an occupation are two different events:
+
+| | when | why there |
+|---|---|---|
+| the charge point is told to stop | at once | it is the only thing that can actually stop the current |
+| the connector goes to `complete` and its share of the power returns to the pool | at once | the car is not drawing any more, and holding an allocation for it would starve the cars that are |
+| the `sessions` row is written and the claim released | when the cable comes out (`unplugged`) | the row is the record of the whole occupation, and the occupation is still going on |
+
+Stopping does **not** end the overstay clock: the cable is still in the car. The grace period starts when charging ends, however it ended (§5.2) — and that is why the row cannot be written at the stop. A row written before the cable came out would have to carry an `overstay_seconds` for a period that had not happened yet; the only honest place for it is the unplug, which is also where the final energy total arrives (ws-chargepoint.md §4.4).
 
 ### 4.4 `join_waitlist` / `leave_waitlist`
 
@@ -173,7 +181,11 @@ Sent on join, on every change, and on a `STATE_TICK_MS` heartbeat. It is a **com
 }
 ```
 
-Connector `state` is one of `free`, `held`, `charging`, `closing`, `suspended`, `out_of_service`. `suspended` means an active session whose share fell below `MIN_CHARGE_KW` — the session is alive but drawing nothing, which is the honest way to show a starved allocation. `out_of_service` means the charge point is faulted or has not reported in (ws-chargepoint.md §6).
+Connector `state` is one of `free`, `held`, `charging`, `suspended`, `complete`, `overstay`, `closing`, `out_of_service`. `suspended` means an active session whose share fell below `MIN_CHARGE_KW` — the session is alive but drawing nothing, which is the honest way to show a starved allocation. `complete` means the charge has ended and the cable is still in; `overstay` is the same thing once `OVERSTAY_GRACE_SECONDS` have passed (ws-chargepoint.md §10) and the meter is running. `out_of_service` means the charge point is faulted or has not reported in (ws-chargepoint.md §6).
+
+`complete` and `overstay` appear **here**, on the station snapshot everybody sees, and not only in the session frame of §5.2 that goes to the owner. That is deliberate: this list is what a driver looking for an outlet reads, and "occupied by a car that finished twenty minutes ago" is a different fact from "occupied by a car that is charging" — it tells him whether waiting is worth it, and it is the only way the site's own pressure is visible to the person feeling it. It costs nothing: `suspended` already reaches this list by exactly the same route, one `state` derived by the connector and rendered by two pages.
+
+Neither is reservable and neither offers an action: a `reserve` on them is `ALREADY_HELD` (the outlet is physically taken) and a `stop_session` is `INVALID_STATE` (there is nothing left to stop).
 
 Why the whole snapshot rather than a delta: a client that applies deltas has state of its own, and a client with state of its own can drift from the server after one missed frame — the failure P6 exists to prevent. The payload is a handful of connectors; sending all of it costs nothing and removes an entire class of bug. `held_by_me` and `mine` are computed **server-side** from the token, so the page never has to reason about identity.
 
@@ -205,7 +217,11 @@ Sent every `SESSION_TICK_MS` to the owner of a running session, on every meter r
 }
 ```
 
-`phase` is `charging` \| `suspended` \| `complete` \| `overstay` \| `closed`. `eta_seconds` is an estimate derived from the current allocation and the vehicle's charging curve; it is advisory and may jump when another car arrives and the allocation is recomputed — that jump is the visible proof of P5 and should not be smoothed away.
+`phase` is `charging` \| `suspended` \| `complete` \| `overstay` \| `closed`. The first four are the connector's own state as §5.1 reports it, read and not re-derived; `closed` is the extra frame sent once, when the session leaves the snapshot. `eta_seconds` is an estimate derived from the current allocation and the vehicle's charging curve; it is advisory and may jump when another car arrives and the allocation is recomputed — that jump is the visible proof of P5 and should not be smoothed away.
+
+`overstay_seconds` is the **billable** figure: seconds past the end of the charge with `OVERSTAY_GRACE_SECONDS` already subtracted, so it is `0` for the whole of the grace and starts counting from the first second that will be charged for. Exactly the same number, computed by the same station in the same way, ends up in `sessions.overstay_seconds` when the row is written (erlang-java.md) — one name, one meaning, on both channels. The alternative, raw seconds on the page and net seconds in the database, would give a driver a counter that starts the moment his charge ends and an invoice that disagrees with it. What tells him the grace is running is the `phase`: it turns from `complete` to `overstay` at the moment the money starts.
+
+The field is live: it is computed when the frame is built, not when the session ends, so a page left open watches it grow. `power_kw` is `0` from `complete` onwards — the delivery is over — and `eta_seconds` is `null` for the same reason.
 
 Money never appears here. Cost is computed by the back office after the session row is written (schema.sql, ownership rules): the station knows energy and time, not tariffs applied to an account.
 

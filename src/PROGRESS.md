@@ -2573,6 +2573,157 @@ fattorizzata.
 reservation"*, senza l'avverbio. Stazione lasciata come trovata: quattro connettori `free`,
 supervisore ripreso, quattro figli.
 
+## 7zf. M4-A: `overstay_seconds` smette di essere zero — 30-31 agosto
+
+Il campo non era «da implementare»: era **strutturalmente** zero, e nessun test poteva
+accorgersene perché tutti asserivano quel comportamento. Il sistema confondeva due fatti che il
+dominio tiene separati — *la ricarica è finita* e *il cavo è fuori*. `stop_session` in `charging`
+andava dritto in `closing` (`vs_connector.erl:551-553`), `settle/1` scriveva la riga con
+`overstay_seconds => 0` cablato, e fra le due cose non passava mai tempo che qualcuno potesse
+misurare. Il terzo pezzo era l'emulatore: `cp.js` rispondeva a **qualunque** stop con un
+`unplugged` immediato, quindi il cavo non restava mai dentro nemmeno volendo.
+
+E il contratto si contraddiceva da solo, il che è la firma di questa famiglia di difetti:
+`ws-driver.md` §4.3 diceva che lo stop «writes the session row», §120 dello stesso file che lo
+stop non ferma l'orologio dell'overstay. Se la riga è scritta allo stop, l'overstay dopo uno
+stop non può finirci dentro.
+
+**La forma della correzione.** Uno stato nuovo, `complete`, fra `charging` e `closing`, in cui si
+entra dalle tre fini *morbide* (`driver_stopped`, `target_reached`, `claim_revoked`) e da cui si
+esce con l'`unplugged`. `overstay` **non** è un settimo stato: è `complete` oltre la grazia,
+derivato in `reported_state/2` come `suspended` è `charging` a limite zero — un valore che scorre
+da solo non può far entrare e uscire da uno stato. Niente timer: la pagina si aggiorna sul suo
+tick da 5 s, e il timer servirà solo alla notifica, che è fuori perimetro. L'aritmetica sta in una
+funzione pura esportata, `overstay_seconds/3`, perché i numeri che contano sono minuti e `vs_time`
+non è iniettabile (lezione di §7zb: niente test a cronometro).
+
+### Le verifiche bloccanti — due hanno cambiato il lavoro
+
+1. **Nessuno, lato B, ricalcola l'overstay dai timestamp.** Cercato per struttura in tutto
+   `src/backoffice/`: `SessionDao:24,86,134`, `SessionView:77-83`, `BillingService:158-172`
+   leggono **solo la colonna**. L'unica derivazione da `started_at`/`ended_at` è
+   `SessionView:70`, che è la *durata* mostrata nello storico. Se qualcuno l'avesse ricalcolato,
+   spostare `ended_at` all'unplug avrebbe raddoppiato il conto e sarebbe servita una decisione.
+2. **Dopo uno stop `cp.js` tace** (`cp.js:343-344`, `delivering=false`): la clausola `meter` di
+   `complete` è difesa contro hardware che continua a parlare, non un percorso che qualcuno
+   percorre. Detto nel commento, così com'è.
+3. **Nessuna vista live si rompe.** `js/session.js:128-131` ha **già** `complete` e `overstay`
+   nella mappa `PHASE`, con fallback; `js/station.js:140` stampa lo stato verbatim e `171-176`
+   non offre azioni per uno stato che non conosce, che è la risposta giusta. `driver.js:736`
+   stampa e basta. Unico buco, cosmetico: `station.jsp:61-66` non ha `.conn-complete` /
+   `.conn-overstay` e quei connettori resteranno senza striscia colorata — il badge scrive
+   comunque il nome, come dice il commento alla riga 59. È sotto `src/backoffice/`: **non
+   toccato**, segnalato a B con le due righe di CSS pronte.
+4. **`target_reached` arriva sul filo.** Tracciata tutta la catena — `stop_cmd/1` → `send_cp/2`
+   → `vs_cp_ws:89-90` → `command_frame/1` → `jsx:encode` — e **non c'è nessun formatter con una
+   whitelist**: il payload viaggia verbatim. Verificato sul filo vero, non solo sul tipo.
+5. **La promessa di `risposta-per-B-M2.md` §17 NON era mantenuta.** `ws-chargepoint.md` §10
+   diceva il valore della grazia e non la conseguenza. Riscritta: la tolleranza è sottratta lì e
+   in nessun altro posto, e il numero che esce è già fatturabile.
+6. **Il riaggancio §6 non ha mai avuto una clausola `plugged`, nemmeno in `charging`.** Il piano
+   supponeva un meccanismo «probabilmente in `vs_cp_proto`». Non c'è: il `plugged` di ri-annuncio
+   viene **rifiutato** `invalid_state` da `handle_common` e `vs_cp_proto:647-655` lo logga come
+   divergenza senza mandare comandi. Ciò che salva la sessione è l'`attach_cp` del `boot`, che in
+   `handle_common` cancella il timer di grazia in **qualunque** stato. Conseguenza pratica: per
+   `complete` la cosa giusta era **non scrivere una clausola**, e una clausola propria avrebbe
+   solo potuto rimettere a zero l'orologio di un'auto che non si è mossa.
+
+### Tre chiamanti che la tabella del piano non aveva
+
+1. **`vs_claim_client:count_stats/1`** (`804-814`) manda al coordinatore i tre numeri della
+   lobby. `complete` e `overstay` sarebbero finiti nel catch-all e un connettore con un'auto
+   ferma sopra sarebbe sparito da tutti e tre: né libero, né tenuto, né in carica. È
+   letteralmente il difetto che la clausola `suspended` era stata scritta per evitare, nel posto
+   dove sarebbe durato minuti invece di due secondi.
+2. **`vs_driver_proto:phase/2` — l'ordine delle clausole era una trappola silenziosa.** La prima
+   clausola era `soc >= 100 -> complete`, e una sessione finita per batteria piena riporta 100
+   per tutto l'overstay: `overstay` non sarebbe **mai** stata producibile, e il test naturale
+   (stop del driver, soc 41) non l'avrebbe mostrato. Le due clausole di stato ora vengono prima,
+   e un test discrimina con `state => overstay, soc_pct => 100`.
+3. **La suite è un chiamante**, e quattro test asserivano il difetto. Riscritti, non cancellati:
+   i due sullo stop e sulla revoca ora aspettano l'`unplugged` per la riga; i due sulla finestra
+   di `closing` (D-2) sono stati ribasati sul `faulted` di §4.1, che è l'unico percorso per cui
+   quella finestra serva ancora — le tre fini morbide adesso aspettano il cavo senza scadenza,
+   perché quell'attesa *è* l'overstay.
+
+### Due campi azzerati entrando in `complete`, e nessuno dei due è cosmetico
+
+`power_kw` viaggia nel frame §5.2 e in `complete` i `meter` sono assorbiti: senza azzerarlo la
+pagina del driver avrebbe mostrato «150 kW» per tutta la durata dell'overstay. Prima di M4 il
+difetto non era visibile perché `closing` durava due secondi.
+
+`limit_kw` è il caso che il piano non aveva previsto e che vale il commento più lungo:
+`vs_cp_proto:limit_kw/2` lo rilegge nel boot ack e `cp.js:224` lo riapplica, quindi una colonnina
+che si riavvia durante l'overstay avrebbe **fatto ripartire l'erogazione** su un tetto che la
+stazione aveva annullato un minuto prima. Zero è la parola che §5 usa già per «la sessione resta
+aperta e non tira niente».
+
+### Verificato — girato davvero
+
+**Suite: 348 test** (333 + 15), `./src/scripts/eunit_check.sh` verde con `EXPECTED_TESTS`
+aggiornato nello stesso change-set. La funzione pura eseguita in una shell, non dedotta:
+`(T, T+420000, 300) → 120`, `(T, T+240000, 300) → 0`, `(T, T+300000, 300) → 0`,
+`(T, T+360000, 300) → 60`, `(undefined, …) → 0` — i quattro numeri concordati con B in
+`risposta-per-B-M2.md` §2, il secondo di confine incluso.
+
+**E2E sul compose** (sette container, `mysql` healthy, Docker Desktop controllato prima), con
+`station1` ricostruita dal branch e `OVERSTAY_GRACE_SECONDS=10` per non aspettare cinque minuti.
+Tre corse, osservate da un client del canale driver vero e dalla riga in MySQL:
+
+| corsa | come finisce la ricarica | fasi viste sul canale driver | riga in `sessions` |
+|---|---|---|---|
+| `--soc 99 --battery 1 --linger 20` | il primo `meter` a soc 100 → **`target_reached`**, il filo mai tirato prima di oggi | `charging` → `complete` **4 ms** dopo (via `connector_event`) → `overstay` al tick successivo alla grazia, `overstay_seconds` 3 → 8 → `closed` | id 8, **`overstay_seconds = 10`**, `cost_cents 50` |
+| `--soc 40 --linger 20`, `stop_session` vero sul canale | `driver_stopped`; un secondo `stop_session` risponde **`INVALID_STATE`** come da §4.3 | `charging` → `complete` in 3 ms → `overstay` (2 → 7) → `closed` | id 9, **`overstay_seconds = 10`**, 0.417 kWh, `cost_cents 69` |
+| **senza `--linger`** | stop e `unplugged` nello **stesso millisecondo** (17:01:25.970) | — | id 10, **`overstay_seconds = 0`** |
+
+Il calcolo atteso, scritto prima di guardare: ricarica finita alle 16:58:11.03 sull'orologio
+della stazione, `unplugged` alle 16:58:31.04 → 20 s → meno 10 di grazia → **10**. Osservato 10.
+La terza corsa è la controprova che serviva davvero: senza il flag il comportamento di prima di
+M4 è intatto bit per bit, quindi nessuno script e nessun test esistente cambia significato.
+
+**La catena a valle è chiusa da sola**: `cost_cents = 50` è `round(0.005 × 45) = 0` di energia
+più `(10+59)/60 = 1` minuto × 50 c. B ha fatturato un overstay senza che nessuno gli dicesse
+niente, dal solo campo — che è esattamente ciò che il contratto prometteva e che finora non era
+mai stato messo alla prova con un numero diverso da zero.
+
+**Una cosa da sapere prima della demo, perché sembra un disallineamento e non lo è:** l'ultimo
+frame che il driver vede dice `overstay_seconds=8` e la riga dice `10`. Il frame `closed` porta
+per costruzione i valori dell'**ultimo tick** con la sola `phase` cambiata
+(`vs_driver_proto:closed_frame/1`), e `energy_kwh` ha la stessa proprietà da M2. Il numero che
+conta è quello della riga.
+
+### Non provato — e perché
+
+- **La pagina di B guardata con gli occhi.** I client sono stati censiti per struttura e il
+  codice letto, ma nessun browser è stato aperto su un connettore in `overstay`: la mancanza di
+  `.conn-complete` in `station.jsp` è letta nel CSS, non vista sullo schermo. Serve una password
+  che non ho — la stessa che manca alla verifica del fuso di `history.jsp`.
+- **Un overstay più lungo del lease del claim, con hardware che parla ancora.** La clausola
+  `revoke` in `complete` (assorbi e continua a misurare) è coperta in unità con una revoca
+  esplicita, ma non è mai girata una demo con un lease scaduto sotto un overstay: servirebbero
+  `LEASE_SECONDS` bassissimi e un coordinatore che revochi davvero.
+- **Il riavvio della stazione durante `complete`.** Ragionato e messo agli atti in
+  `scelte_di_progetto.md` §22.7, **non riprodotto**. E lì il piano si sbagliava: diceva che «il
+  prossimo `meter` a soc 100 lo rimanda in `complete` e l'orologio riparte», che vale solo per
+  l'overstay da batteria piena e solo se la colonnina continua a mandare `meter` — la nostra
+  tace. Per un overstay nato da uno stop del driver il soc non arriverà mai a 100: il connettore
+  resta `charging` fino all'unplug e la riga esce con 0. In entrambi i casi lo scarto è a favore
+  del driver, che è il verso giusto.
+- **Hardware che manda `meter` dopo uno `stop`.** Coperto da un test unitario, esercitato da
+  nessun emulatore (verifica 2).
+- **`driver.js` in scenario completo** contro le stazioni nuove. Il ragionamento è che nessuno
+  dei tre scenari passa `--linger`, quindi la fine di sessione è identica a prima; ma è un
+  ragionamento, non una corsa.
+
+### Cosa resta fuori da M4-A, e perché
+
+- **Il frame `notification`** di ws-driver §5.3 (`charge_complete`, `overstay_started`): bloccato
+  da **R2**, il coordinatore di B non inoltra i `{notify, …}` e non c'è una risposta alla review
+  della PR #5. Quando si aprirà, la fase arriva comunque alla pagina via snapshot entro un tick,
+  e il timer da aggiungere è un `{state_timeout, Grazia, overstay}` in `complete(enter, …)` che
+  non cambia nient'altro.
+- **La segnalazione no-show**, l'altro pezzo di M4-A: il contatore è scritto solo da B.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha

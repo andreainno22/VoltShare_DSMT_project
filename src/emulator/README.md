@@ -28,11 +28,29 @@ node cp.js --url ws://localhost:9201/ws/cp --station 1 --connector 3 \
 # a 50 kW car on station 2 / connector 6, cable in after 10 s, charging until Ctrl-C
 node cp.js --url ws://localhost:9202/ws/cp --station 2 --connector 6 \
            --vehicle 5 --soc 40 --battery 40 --max-kw 50 --plug-after 10
+
+# an overstay: the driver stops the charge and leaves the cable in for 7 minutes
+node cp.js --url ws://localhost:9201/ws/cp --station 1 --connector 3 \
+           --vehicle 88 --soc 22 --battery 58 --max-kw 150 --linger 420
 ```
 
 `--limit-apply <s>` (default 5) is the LIMIT_APPLY_SECONDS ramp of §5; `--quiet` silences the
 per-frame log. Ctrl-C unplugs properly instead of vanishing. The last line printed is
 `final energy_kwh = …`, which is the number the station's `session closed` log must match.
+
+`--linger <s>` is what makes an overstay reproducible. Without it the emulator answers any
+stop with an immediate `unplugged`, so the cable is never in the car after the charge ends and
+`sessions.overstay_seconds` can only ever be zero — which is what it always was before M4.
+With it, a **soft** stop (`driver_stopped`, `target_reached`, `claim_revoked`) leaves the cable
+in for `<s>` seconds: delivery stops at once, the meter goes quiet, and the `unplugged` with
+the true total arrives at the end. The station puts the connector in `complete`, derives
+`overstay` once its `OVERSTAY_GRACE_SECONDS` have passed, and writes the net into the row —
+`--linger 420` against the default grace of 300 gives `overstay_seconds = 120`.
+
+`faulted` is not a soft stop and never lingers: the station has already written the row and
+taken the connector out of service, so a late `unplugged` would arrive at a session that no
+longer exists. `station_shutdown` and `not_your_reservation` are untouched by the flag, and so
+is Ctrl-C — that is a driver pulling the cable, which is immediate by definition.
 
 ---
 

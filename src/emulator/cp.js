@@ -25,7 +25,15 @@ const USAGE = `
 usage: node cp.js --url ws://host:port/ws/cp --station <id> --connector <id>
                   --vehicle <id> --soc <pct> --battery <kwh> --max-kw <kw>
                   [--plug-after <s>] [--unplug-at-soc <pct>]
-                  [--limit-apply <s>] [--quiet]
+                  [--limit-apply <s>] [--linger <s>] [--quiet]
+
+  --linger <s>  after a soft stop (driver_stopped, target_reached,
+                claim_revoked) keep the cable in for <s> seconds before
+                sending the unplugged. This is what an overstay looks
+                like from the hardware: delivery is over, the outlet is
+                still occupied. Absent, a stop is answered by an
+                immediate unplug, which is what every script written
+                before this flag expects.
 `;
 
 const DEFAULTS = {
@@ -42,6 +50,12 @@ const DEFAULTS = {
   // honoured. The station does not hand it over at boot — it is the
   // station's own tolerance — so it is a flag with the contract's default.
   'limit-apply': 5,
+  // How long the cable stays in after a soft stop. `null' is "not asked
+  // for", and it has to stay the default: the emulator's answer to a stop
+  // has been an immediate unplug since M2, and every demo script and
+  // integration run in the tree is written against that. Nobody's meaning
+  // changes unless the flag is passed.
+  linger: null,
   quiet: false,
   // §3.1 says the equipment carries no configuration of its own, so these
   // are placeholders until the boot ack replaces them.
@@ -102,11 +116,16 @@ if (major < MIN_NODE_MAJOR || typeof WebSocket !== 'function') {
 //               is, and for the same reason — this is the box that was
 //               there. Sent as a *duration*, never as an instant: see the
 //               `charging_seconds` note in plugged() below.
+//   lingering — the charge is over and the cable is still in (--linger).
+//               It survives a reconnection for the same reason `plugged`
+//               does: a socket dying does not pull a cable, and it does
+//               not restart a delivery that has ended either.
 const car = {
   energyKwh: 0,
   socPct: cfg.soc,
   plugged: false,
   delivering: false,
+  lingering: false,
   chargingSinceMs: null,
 };
 
@@ -126,6 +145,8 @@ let ws = null;
 let requestSeq = 0;
 let backoffMs = 1000;
 const timers = { heartbeat: null, meter: null, plug: null };
+// The `--linger' countdown lives outside `timers' on purpose: see onStop().
+let lingerTimer = null;
 let stopping = false;
 
 // ---------------------------------------------------------------- log
@@ -268,7 +289,11 @@ function plugged(why) {
   // not, which is the whole point of it surviving here.
   if (car.chargingSinceMs === null) car.chargingSinceMs = Date.now();
   car.plugged = true;
-  car.delivering = true;
+  // Announcing the cable is not the same as resuming the delivery. On a
+  // first plug the two coincide; on the §6.2 re-announcement during a
+  // linger they must not, or a socket blip would restart a charge the
+  // station ended minutes ago and the overstay would go on billing energy.
+  car.delivering = !car.lingering;
   const chargingSeconds = Math.round((Date.now() - car.chargingSinceMs) / 1000);
   const id = send('plugged', {
     vehicle_id: cfg.vehicle,
@@ -366,6 +391,15 @@ function meter() {
 
 // ---------------------------------------------------------------- ending
 
+// The reasons of §5 that end a delivery with the hardware still healthy
+// and still talking. What separates them from `faulted' is not politeness:
+// after one of these the station keeps the session open waiting for the
+// cable to come out, and the seconds it waits are the overstay. After a
+// `faulted' the station has already written the row and taken the
+// connector out of service, so there is nothing left for a late unplug to
+// arrive at and lingering would only delay the report.
+const SOFT_STOPS = ['driver_stopped', 'target_reached', 'claim_revoked'];
+
 function onStop(reason) {
   car.delivering = false;
   log(`! stop from the station: ${reason}`);
@@ -381,13 +415,32 @@ function onStop(reason) {
     finish(2, 'refused: this connector is reserved for another vehicle');
     return;
   }
-  // driver_stopped, claim_revoked, faulted, target_reached: delivery is
-  // over. Nobody here can pull a cable, so the emulator does what the
-  // driver would do next and reports the total.
+  if (cfg.linger !== null && SOFT_STOPS.includes(reason)) {
+    // The behaviour the overstay needs, and the only one a real site ever
+    // shows: the car is done and the driver is having a coffee. Delivery
+    // has stopped (`delivering' is already false, so the meter goes
+    // quiet); the cable does not move; the `unplugged' with the true
+    // total arrives when the driver comes back.
+    //
+    // Deliberately NOT in `timers': `clearTimers()' runs on every
+    // reconnection, and a cable coming out is a physical event on this
+    // side's own clock — a socket blip must not postpone it, still less
+    // cancel it and leave the emulator waiting for ever.
+    car.lingering = true;
+    log(`  cable stays in for ${cfg.linger}s (--linger) — this is the overstay`);
+    lingerTimer = setTimeout(() => unplug(`stopped: ${reason}, after the linger`),
+                             cfg.linger * 1000);
+    return;
+  }
+  // driver_stopped, claim_revoked, target_reached without --linger, and
+  // `faulted' always: delivery is over. Nobody here can pull a cable, so
+  // the emulator does what the driver would do next and reports the total.
   unplug(`stopped: ${reason}`);
 }
 
 function unplug(why) {
+  if (lingerTimer !== null) { clearTimeout(lingerTimer); lingerTimer = null; }
+  car.lingering = false;
   if (!car.plugged) return finish(0, why);
   car.plugged = false;
   car.delivering = false;
@@ -402,6 +455,7 @@ function unplug(why) {
 
 function finish(code, why) {
   stopping = true;
+  if (lingerTimer !== null) { clearTimeout(lingerTimer); lingerTimer = null; }
   clearTimers();
   if (ws && ws.readyState === 1) ws.close(1000, 'done');
   process.stdout.write(

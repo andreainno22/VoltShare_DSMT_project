@@ -682,9 +682,10 @@ driver(UserId) -> #{user_id => UserId}.
 
 payload_of(#{payload := P}) -> P.
 
-%% §5.2, field by field. `overstay_seconds' is declared and zero rather
-%% than missing: M4 will fill it in, and until then the page renders the
-%% shape it always will.
+%% §5.2, field by field. `overstay_seconds' is zero here because a
+%% charging connector has no overstay to report, and it is read off the
+%% snapshot rather than defaulted: a sub-map without the key — this one,
+%% and any older node's — still renders the shape the contract declares.
 the_session_frame_carries_every_field_of_the_contract_test() ->
     Frame = vs_driver_proto:session_frame(station_with(charging(#{})), driver(?USER)),
     ?assertEqual(session, maps:get(type, Frame)),
@@ -769,6 +770,48 @@ the_phase_is_complete_from_the_soc_and_never_from_the_power_test() ->
                                                 session => #{soc_pct => 100}})),
                         driver(?USER))),
     ?assertEqual(complete, maps:get(phase, Both)).
+
+%% M4 — the connector's own state wins over anything derived here, and
+%% this is the assertion that says why the clause order is what it is. A
+%% session that ended because the battery filled up goes on reporting
+%% `soc_pct: 100' for the whole overstay: with the `soc >= 100' clause
+%% read first, `overstay' would be masked by `complete' for ever and the
+%% phase §5.2 declares would be one the station could never produce. The
+%% two names are decided by the process that owns the session and the
+%% clock, and this channel reports them.
+the_phase_follows_the_connector_out_of_the_grace_test() ->
+    Complete = payload_of(vs_driver_proto:session_frame(
+                            station_with(charging(#{state => complete, power_kw => 0.0,
+                                                    session => #{soc_pct => 100}})),
+                            driver(?USER))),
+    ?assertEqual(complete, maps:get(phase, Complete)),
+    Overstay = payload_of(vs_driver_proto:session_frame(
+                            station_with(charging(#{state => overstay, power_kw => 0.0,
+                                                    session => #{soc_pct => 100}})),
+                            driver(?USER))),
+    ?assertEqual(overstay, maps:get(phase, Overstay)),
+    %% and it is not the state of charge doing it: a driver who stopped a
+    %% half-full car is overstaying just as much
+    Half = payload_of(vs_driver_proto:session_frame(
+                        station_with(charging(#{state => overstay, power_kw => 0.0,
+                                                session => #{soc_pct => 41}})),
+                        driver(?USER))),
+    ?assertEqual(overstay, maps:get(phase, Half)).
+
+%% The number is the connector's, computed where the grace and the clock
+%% live, and this channel carries it without arithmetic of its own — the
+%% same figure that will be written to `sessions.overstay_seconds', so the
+%% page and the invoice cannot disagree (ws-driver.md §5.2).
+the_overstay_seconds_come_from_the_snapshot_test() ->
+    P = payload_of(vs_driver_proto:session_frame(
+                     station_with(charging(#{state => overstay, power_kw => 0.0,
+                                             session => #{overstay_seconds => 120}})),
+                     driver(?USER))),
+    ?assertEqual(120, maps:get(overstay_seconds, P)),
+    %% still the eight fields of the contract, no ninth
+    ?assertEqual(lists:sort([connector_id, phase, power_kw, energy_kwh, soc_pct,
+                             eta_seconds, started_at, overstay_seconds]),
+                 lists:sort(maps:keys(P))).
 
 %% "It is advisory and may jump when another car arrives and the allocation
 %% is recomputed — that jump is the visible proof of P5 and should not be

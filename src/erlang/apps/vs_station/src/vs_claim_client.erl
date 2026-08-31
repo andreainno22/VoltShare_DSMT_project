@@ -801,6 +801,14 @@ req_id() ->
 %% connector is neither free nor held — somebody's car is plugged into it
 %% and the session is alive — so a lobby that showed it as available
 %% would send the next driver to an outlet that is already taken.
+%%
+%% M4 adds two more of the same kind, and they are the ones the rule was
+%% written for. `complete' and `overstay' are what a connector reports
+%% once the charge is over and the cable is still in — the definition of
+%% an outlet that is occupied and not yet usable — and an overstay lasts
+%% minutes, not the two seconds a `closing' does. Dropped into the
+%% catch-all they would take the whole point of the lobby with them: the
+%% site would look emptier exactly when it is most blocked.
 count_stats(#{connectors := Connectors}) ->
     lists:foldl(fun(C, {F, H, Ch}) ->
                         case maps:get(state, C, offline) of
@@ -808,6 +816,8 @@ count_stats(#{connectors := Connectors}) ->
                             held      -> {F, H + 1, Ch};
                             charging  -> {F, H, Ch + 1};
                             suspended -> {F, H, Ch + 1};
+                            complete  -> {F, H, Ch + 1};
+                            overstay  -> {F, H, Ch + 1};
                             closing   -> {F, H, Ch + 1};
                             _         -> {F, H, Ch}
                         end
