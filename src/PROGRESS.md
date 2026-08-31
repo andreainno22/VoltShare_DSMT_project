@@ -788,6 +788,87 @@ percorso dell'erogazione.
 
 ---
 
+## 7zc. La review di A sulla PR #5, applicata per intero — 31 agosto
+
+Arrivata con il pull di oggi (`nota-per-B-review-pr5.md`, riverificata da A sul `main` che
+contiene il nostro merge). Tutti i rilievi controllati uno per uno prima di toccare qualcosa:
+**erano tutti veri**. Risposta in `risposta-per-A-review-pr5.md`.
+
+### R2 — il difetto grave: `notify` non veniva inoltrato
+
+`ErlangBridge` smistava sul tag `notify` **da M4-B**, ma in `vs_coord_srv` non esisteva nessuna
+clausola per inoltrarlo. Un `{notify, …}` da una stazione sarebbe caduto nel `handle_cast`
+catch-all: scartato con un log, e la notifica mai arrivata in tabella.
+
+È la terza volta che questo progetto sbaglia allo stesso modo — **una forma implementata su un
+solo verso del ponte** — e questa volta l'ho fatto io in modo particolarmente istruttivo:
+nello stesso commit di M4-B ho scritto il gestore Java *e* l'inoltro di `no_show`/`show_up`, e
+ho saltato quello di `notify`. Il codice ricevente esisteva, quindi niente sembrava incompleto.
+
+Avrebbe bloccato M4-A per intero: il frame `notification` di `ws-driver.md` esiste per portare
+al browser il `session_interrupted` che il connettore emette già.
+
+### R4 — il gate su `penalty_event` perdeva strike veri
+
+Avevo messo un gate `serving` sull'inoltro dei `no_show` per impedire il doppio conteggio. A ha
+fatto notare che quel doppio conteggio **è impossibile per costruzione**: una stazione manda la
+cast a un nodo solo, quindi non esiste una seconda copia da cui difendersi. L'unico effetto del
+gate era perdere strike nella finestra in cui una stazione crede ancora al vecchio leader — e un
+no-show non lascia righe da nessuna parte, quindi il messaggio è l'unico documento che sia
+successo.
+
+Ora un follower **inoltra al leader** con lo stesso involucro `{forwarded, …}` già usato per gli
+annunci. Se non c'è un leader a cui passarlo, viene registrato: un rilievo perso deve almeno
+essere visibile.
+
+### Le altre
+
+| | |
+|---|---|
+| **R1 residuo** | un `user_suspended` che arriva a un follower era assorbito in silenzio: ora c'è un `warning`, perché significa che il back office sta indirizzando un nodo che non serve |
+| **R3** | l'INSERT della notifica in `suspend()` ora ha il suo `try`: se fallisce, il coordinatore viene informato lo stesso. Una sospensione scritta in `users` che nessun coordinatore conosce è una penalità che non si applica |
+| **R5** | `suspended_until > NOW()` confrontava l'orologio della JVM (in scrittura) con quello di MySQL (in lettura). Ora il limite è calcolato in Java e passato come parametro |
+| minore | `NotificationDao.add` troncava `text` ma non `kind`: proprio il caso «kind inventato da una stazione» che il metodo dichiara di assorbire |
+| minore | `onNoShow` su utente inesistente proseguiva fino alla violazione di foreign key, con un log che puntava alla cosa sbagliata |
+| minore | `get_suspensions` era promesso dal contratto e implementato lato Erlang, ma Java non l'ha mai chiamato: ramo morto, rimosso e sostituito da `vs_coord_srv:suspensions/0`. Il contratto ora descrive il recupero **a spinta**, che è quello che gira |
+
+### Verificato in Docker
+
+Il test che A suggeriva, fatto: un `notify` mandato **al leader** e uno mandato **a un follower**
+arrivano entrambi in tabella.
+
+```
+id | kind             | text
+ 3 | waitlist_offer   | inviata a un FOLLOWER
+ 4 | charge_complete  | inviata al LEADER
+```
+
+Prima del fix nessuna delle due sarebbe arrivata.
+
+### `eunit_check.sh`: il conteggio dei test è un'asserzione, non una speranza
+
+A ha versionato uno script che nasce da una misura importante — **tre modi diversi di rompere la
+suite stampano tutti «0 failures»**, perché il totale non è una costante ma quanto lontano eunit
+è arrivato a *enumerare* l'albero dei test.
+
+Non è teoria: al primo giro di oggi la nostra suite ha stampato `234 tests, 1 failures, 6
+cancelled`. Sessantaquattro test spariti. Senza quello script avrei potuto leggere «0 failures»
+su una suite dimezzata e considerarla verde — e in effetti **è esattamente quello che è successo
+il 28 agosto**, quando avevo riportato un giro a 274 senza sapere cosa significasse.
+
+Aggiornato `EXPECTED_TESTS` a **336** (333 di A più i 3 nuovi qui): aggiornare quel numero fa
+parte dell'aggiungere test, come dice lo script stesso.
+
+### Una cosa che resta ad A
+
+Due test in `vs_connector_tests` falliscono a intermittenza sotto carico —
+`closing_does_not_wait_for_the_database_test` (asserisce `Micros < 300000`) e
+`a_charge_point_gone_past_the_grace_closes_the_session_test` (`no_event`). Su tre giri: 2
+fallimenti, 1, 0, con il totale sempre a 336. È la stessa famiglia che A dice di aver ripulito,
+quindi qualcuno è sfuggito.
+
+---
+
 ## 7za. Le sospensioni non sopravvivevano a un riavvio — 28 agosto
 
 Nella sua nota A accennava a *"una review della PR #5: la più importante riguarda le sospensioni

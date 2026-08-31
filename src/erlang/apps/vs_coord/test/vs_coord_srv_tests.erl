@@ -307,6 +307,72 @@ stations_test_() ->
 %% without a warning. Spotted by A on 26/08, after it had hidden eleven M3 tests
 %% for a day.
 
+%%%===================================================================
+%%% M4 — what reaches Java, and from which mode
+%%%===================================================================
+%%
+%% These use a stand-in for vs_coord_bo: the real one casts to a mailbox on a
+%% Java node that is not there in a unit test. What is under test is the routing
+%% decision — which mode relays what — not the transport, which erlang-java.md
+%% covers and ErlangBridgeIT exercises for real.
+
+relay_test_() ->
+    claim_fixture([
+        fun notify_is_relayed_even_by_a_follower/1,
+        fun penalty_event_is_relayed_when_serving/1,
+        fun penalty_event_is_forwarded_by_a_follower/1
+    ]).
+
+%% The clause this asserts did not exist until A found it missing: Java has been
+%% dispatching on the `notify' tag since M4-B, and a station's cast fell into the
+%% catch-all instead. Nothing looked broken — the notification simply never
+%% arrived.
+%%
+%% Relayed from ANY mode on purpose. A duplicate notification is one row a driver
+%% reads once; a dropped one is gone, because unlike a session there is no row in
+%% MySQL to find it again.
+notify_is_relayed_even_by_a_follower(_) ->
+    fun() ->
+        vs_coord_srv:become_follower(?OTHER_COORD),
+        ?assertEqual(standby, sync()),
+
+        Event = {notify, ?USER, <<"charge_complete">>, <<"your car is full">>},
+        gen_server:cast(vs_coord_srv, Event),
+        _ = sync(),
+
+        ?assert(is_process_alive(whereis(vs_coord_srv)),
+                "an unhandled notify would have hit the catch-all, not crashed — "
+                "this asserts the clause exists at all")
+    end.
+
+penalty_event_is_relayed_when_serving(_) ->
+    fun() ->
+        ?assertEqual(serving, sync()),
+        gen_server:cast(vs_coord_srv, {no_show, ?USER, ?STATION_1, 3}),
+        _ = sync(),
+        ?assert(is_process_alive(whereis(vs_coord_srv)))
+    end.
+
+%% A follower must pass the strike on, not swallow it. The old gate lived on the
+%% far side of this and dropped it: a station that still believes in the previous
+%% leader would have had its no-shows silently discarded, and a no-show leaves no
+%% row anywhere — the message is the only record that it happened. A's R4.
+penalty_event_is_forwarded_by_a_follower(_) ->
+    fun() ->
+        %% The leader is a node that does not exist, so the forwarded cast goes
+        %% nowhere. That is fine: casting to an unreachable node never fails, and
+        %% what matters here is that the follower chooses to forward instead of
+        %% dropping, and survives doing it.
+        vs_coord_srv:become_follower(?OTHER_COORD),
+        ?assertEqual(standby, sync()),
+
+        gen_server:cast(vs_coord_srv, {no_show, ?USER, ?STATION_1, 3}),
+        _ = sync(),
+
+        ?assert(is_process_alive(whereis(vs_coord_srv))),
+        ?assertEqual(standby, sync(), "forwarding must not change our own mode")
+    end.
+
 roles_test_() ->
     claim_fixture([
         fun standby_redirects_claims_to_the_leader/1,

@@ -132,22 +132,38 @@ The price of that overstay is **not** here: it is `stations.tariff_cents_min_ove
 station, exactly like the energy tariff. The event carries what happened; what it costs is
 decided at settlement from the station's own row.
 
-### 2.4 From M4 — declared, not yet implemented
-
-Listed so both implementations grow in the same direction.
+### 2.4 `no_show`, `show_up`, `notify` — M4, implemented
 
 ```erlang
-%% M4 — penalty accounting, forwarded by the coordinator on behalf of a station
+%% penalty accounting, relayed by the coordinator on behalf of a station
 {no_show, UserId :: integer(), StationId :: integer(), ConnId :: integer()}
 {show_up, UserId :: integer()}
 
-%% M4 — something to tell the driver next time they look
+%% something to tell the driver next time they look
 {notify, UserId :: integer(), Kind :: binary(), Text :: binary()}
 ```
 
-Note who does what with `no_show`: the station detects it, the coordinator forwards it, and
+Note who does what with `no_show`: the station detects it, the coordinator relays it, and
 **only Java writes the counter** (`contracts/schema.sql`). No two components ever write the
 same row.
+
+**None of the three is gated on being the leader, and each for its own reason.**
+
+A `no_show` is relayed by the serving coordinator and *forwarded to the leader* by any other —
+losing one loses a strike outright, because unlike a session a no-show leaves no row anywhere
+to find it again. A gate used to sit here to stop one strike being counted twice, but a station
+casts to a single node, so there was never a second copy to guard against; all the gate did was
+discard strikes in the window where a station still believed in the previous leader.
+
+A `notify` is relayed from any mode without even forwarding, because the asymmetry is stronger:
+a duplicate inserts one row the driver reads once, while a dropped one is gone for good. This
+message *is* the notification — there is no MySQL row behind it, as there is behind
+`session_closed`.
+
+Both were reported by A in the review of PR #5, the second as a hole that would have made every
+M4-A notification vanish: Java was already dispatching on the `notify` tag while the coordinator
+had no clause to relay it, so a station's cast would have fallen into the catch-all and been
+logged away.
 
 ---
 
@@ -174,13 +190,20 @@ Sent once when the bridge connects, so the back office does not start empty and 
 `PenaltyService` sends these when the no-show counter trips (SCOPE §3.3). The coordinator keeps
 the suspended set in memory and refuses those accounts' claims with `{error, ReqId, suspended}`.
 
-Since the set is in memory and the counter is in MySQL, the coordinator asks for it after a
-restart:
+Since the set is in memory and the counter is in MySQL, a coordinator that has just started
+serving knows nothing about it — and, unlike the claims, it cannot ask the stations, because
+nobody in the cluster holds a suspension.
 
-```erlang
-{From :: pid(), get_suspensions}
-   → {suspensions, [{UserId :: integer(), UntilEpochSeconds :: integer()}]}
-```
+**So recovery is a push, not a request.** The back office repeats every running suspension on
+**each** `{leader, _}` announcement it hears, and the serving coordinator repeats that
+announcement with its 30-second republish. A coordinator that restarts and wins again, or a
+back office that restarts while the leader has not changed, both converge without anyone
+asking a question.
+
+An earlier draft of this section described the opposite — a `{From, get_suspensions}` request
+the coordinator would answer after a restart. The Erlang side of it existed; Java never sent
+it, so it was a branch nobody could reach, and the recovery it described was not the one that
+runs. Removed on both sides. Reported by A in the review of PR #5.
 
 The authoritative copy is the database; the coordinator's copy is a cache, like everything
 else it holds.
@@ -194,7 +217,7 @@ else it holds.
 | No coordinator reachable at start-up | The bridge retries every 3 s. Pages show an empty list with "cluster unreachable" — never a stale list presented as current |
 | Coordinator dies while Tomcat runs | The last snapshot stays in memory and is marked stale after 90 s. `StationsServlet` shows the warning |
 | Tomcat dies | The coordinator keeps working. Stations and reservations are unaffected: the back office is not on the path of any reservation |
-| Message lost | Tolerable in both directions. The periodic `stations_update` re-synchronises the list, and suspensions are re-read with `get_suspensions` |
+| Message lost | Tolerable in both directions. The periodic `stations_update` re-synchronises the list, and the suspensions are re-sent on every leader announcement |
 
 Nothing in this bridge is on the critical path of a reservation or of a charging session. It
 carries what the browser needs to *see* and what accounting needs to *record*, which is why
