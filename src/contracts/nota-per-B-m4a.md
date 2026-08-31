@@ -10,8 +10,8 @@ Nessun file condiviso è stato toccato: né `erlang-java.md`, né `claim.md`, n�
 
 | Pezzo | Commit | Nota |
 |---|---|---|
-| **Overstay** — `complete` fra `charging` e `closing`, il netto scritto all'unplug | `d9b8927` | `sessions.overstay_seconds` smette di essere sempre 0 |
-| **No-show / show-up** — la stazione racconta al coordinatore, at-most-once | `c04ad12` | `nota-per-B-m4a-noshow.md`, non chiede niente |
+| **Overstay** — `complete` fra `charging` e `closing`, il netto scritto all'unplug | il primo commit di questa PR | `sessions.overstay_seconds` smette di essere sempre 0 |
+| **No-show / show-up** — la stazione racconta al coordinatore, at-most-once | il secondo commit di questa PR | `nota-per-B-m4a-noshow.md`, non chiede niente |
 | **Notifiche** — il frame `notification` di `ws-driver.md` §5.3, live + il mittente durevole | questo | ⟵ è qui che serve R2 |
 
 ## 2. Cosa manda la stazione, da oggi
