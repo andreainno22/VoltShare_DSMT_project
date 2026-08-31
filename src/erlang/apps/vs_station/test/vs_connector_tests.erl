@@ -344,28 +344,66 @@ failed_write_still_frees_the_connector_test() ->
         ?assertEqual([], vs_db_stub:rows())
     end).
 
-%% M2 step 3 — the decision the whole database step turns on, tested
-%% against the **real** database module with no database process running
-%% at all. `insert_session/1' is a cast, so it goes nowhere and returns
-%% immediately, and the connector walks out of `closing' at the speed of
-%% its own state machine.
+%% M2 step 3 — the decision the whole database step turns on, proved by
+%% structure rather than by a stopwatch. The **real** database module is
+%% injected, with a writer registered under its name that will never look
+%% at its mailbox: `insert_session/1' finds a live process, casts the row
+%% to it and returns, so the database is — from the connector's point of
+%% view — infinitely slow. The connector must reach `free' anyway and
+%% still answer a call.
 %%
 %% This is the shape of the failure that matters: a station whose writer
-%% is restarting, or whose MySQL is gone, must still free its outlets
-%% (SCOPE §4). A synchronous `insert_session/1' would not merely be slow
-%% here — a `gen_server:call' to a name nobody has registered exits, and
-%% the connector would go down with a physical outlet in hand.
+%% is wedged, or whose MySQL has stopped answering, must still free its
+%% outlets (SCOPE §4). A synchronous write put back into `settle/1' would
+%% hang on this writer and leave the connector in `closing' with a
+%% physical outlet in hand.
+%%
+%% P11 family — what is gone is `?assert(Micros < 300000)', a stopwatch
+%% that measured the machine in both directions: it failed under load for
+%% reasons that have nothing to do with the connector, and it stayed
+%% green for a `gen_server:call' with any timeout shorter than 300 ms,
+%% which is exactly the regression it existed to catch. Nothing here is
+%% timed. `charging' posts the `unplugged' forward as a `next_event', so
+%% `closing' and `settle/1' run before the connector looks at its mailbox
+%% again, and the `snapshot' call sent after the cast is answered on the
+%% far side of the whole ending.
 closing_does_not_wait_for_the_database_test() ->
+    Writer = wedged_writer(),
+    try
+        with_connector(#{db_mod => vs_station_db}, fun(Pid) ->
+            ok = plug(Pid, ?VEHICLE),
+            vs_connector:unplugged(Pid, 12.0),
+            ?assertEqual(free, state_of(Pid)),
+            ?assert(erlang:is_process_alive(Pid)),
+            %% and the row really was handed over: it is sitting in the
+            %% mailbox of a process that will never read it, which is what
+            %% "the connector does not wait for the write" looks like from
+            %% the database's side of the cast
+            ?assertEqual({message_queue_len, 1},
+                         erlang:process_info(Writer, message_queue_len))
+        end)
+    after
+        stop_wedged_writer(Writer)
+    end.
+
+%% A writer that is up and answers nothing. `vs_station_db' can be absent
+%% in two ways — no process at all, where `insert_session/1' logs the row
+%% and drops it at the `whereis', and a process that never gets to the row
+%% — and it is the second that puts a connector at risk, because it is the
+%% one a cast cannot tell apart from a healthy database.
+wedged_writer() ->
+    %% the name belongs to the node, so no other test may already hold it
     ?assertEqual(undefined, whereis(vs_station_db)),
-    with_connector(#{db_mod => vs_station_db}, fun(Pid) ->
-        ok = plug(Pid, ?VEHICLE),
-        {Micros, _} = timer:tc(fun() ->
-                          vs_connector:unplugged(Pid, 12.0),
-                          wait_until(fun() -> state_of(Pid) =:= free end)
-                      end),
-        ?assert(Micros < 300000),
-        ?assert(erlang:is_process_alive(Pid))
-    end).
+    Pid = spawn(fun() -> receive never_sent -> ok end end),
+    true = register(vs_station_db, Pid),
+    Pid.
+
+%% Killed and waited for: the registered name has to be free again before
+%% any other test starts a real writer under it.
+stop_wedged_writer(Pid) ->
+    Ref = erlang:monitor(process, Pid),
+    exit(Pid, kill),
+    receive {'DOWN', Ref, process, Pid, _} -> ok end.
 
 %% The row carries every column `sessions' needs, built by the connector
 %% and read by nobody else on the way — vs_station_db turns exactly this
@@ -767,15 +805,50 @@ a_charge_point_gone_past_the_grace_is_not_a_no_show_test() ->
 
 %% "Charging that was in progress is closed with the energy last reported —
 %% a session that cannot be measured must not keep accruing cost."
+%%
+%% P11 family, and the mechanism is not the one the report named: this
+%% test never asserted a non-event. `{no_event, session_closed}' is how
+%% `expect_event/1' *fails*; what it waits for is the event itself, and
+%% in front of that event stood **two real timers in series** — the
+%% grace, and then D-2's settle window — which both had to expire inside
+%% one second. Under load they did not, and that is the whole of the
+%% intermittency (two failures, then one, then none, on three runs).
+%%
+%% Both are zero here, and zero is not "very short": for a relative
+%% time-out of 0 gen_statem starts no timer at all and enqueues the
+%% time-out event instead, so that it is handled before any event not yet
+%% received. The grace therefore fires the instant the `DOWN' is handled
+%% and the settle the instant `closing' is entered, with nothing
+%% scheduled in between — the same device the overstay tests use with
+%% `overstay_grace_s => 0'. That the grace has a *length*, and that a
+%% socket back inside it leaves no trace, is what the test two above
+%% asserts; this one is about the clause that runs when it expires.
+%%
+%% One edge stays asynchronous and no call can serialise it: the monitor
+%% `DOWN' of the killed socket is a signal from the charge point, and
+%% Erlang orders signals only between a pair of processes, so a call sent
+%% by the test carries no guarantee of arriving behind it. The
+%% notification the grace clause emits is what pins that edge down — an
+%% event the machine must produce, not a deadline it has to beat.
+%% Everything after it is a barrier and not a wait: `snapshot/1' is a
+%% call, so by the time it is answered the enqueued settle has already
+%% run, and the state, the row and the closing event are read from what
+%% is recorded rather than waited for.
 a_charge_point_gone_past_the_grace_closes_the_session_test() ->
-    with_connector(#{cp_grace_ms => 100}, fun(Pid) ->
+    with_connector(#{cp_grace_ms => 0, closing_settle_ms => 0}, fun(Pid) ->
         Cp = fake_cp(),
         ok = vs_connector:attach_cp(Pid, Cp),
         ok = plug(Pid, ?VEHICLE),
         vs_connector:meter(Pid, #{energy_kwh => 7.5, power_kw => 50.0}),
+        %% a call, so the reading is in before the socket dies. The
+        %% mailbox order already guarantees it — the cast was sent first
+        %% — but with a grace of zero the `DOWN' is acted on the moment it
+        %% is handled, and a test should say what it depends on.
+        ?assertEqual(charging, state_of(Pid)),
         stop_cp(Cp),
-        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        ?assertMatch({session_interrupted, ?USER}, expect_event(session_interrupted)),
         ?assertEqual(out_of_service, state_of(Pid)),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
         [Row] = vs_db_stub:rows(),
         ?assertEqual(7.5, maps:get(energy_kwh, Row))
     end).

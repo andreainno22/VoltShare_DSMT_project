@@ -200,9 +200,15 @@
                %% the charge point socket of this connector, and its monitor
                cp          = undefined :: pid() | undefined,
                cp_mon      = undefined :: reference() | undefined,
-               cp_grace_ms :: pos_integer(),
+               %% Zero is a legal length for this timer and for the one
+               %% below, and the tests pass it: for a relative time-out of
+               %% 0 gen_statem starts no timer at all and enqueues the
+               %% event instead, which is how a test gets the behaviour
+               %% with none of the wait. `overstay_grace_s' has been
+               %% non-negative for that same reason since M4.
+               cp_grace_ms :: non_neg_integer(),
                %% D-2: how long `closing' listens before it writes.
-               settle_ms   :: pos_integer(),
+               settle_ms   :: non_neg_integer(),
                %% M4: the tolerance between the end of the charge and the
                %% first billable second of overstay (ws-chargepoint.md
                %% §10). Photographed at the birth of the process and never
