@@ -428,6 +428,16 @@ function onStop(reason) {
     // cancel it and leave the emulator waiting for ever.
     car.lingering = true;
     log(`  cable stays in for ${cfg.linger}s (--linger) — this is the overstay`);
+    // One timer at a time, and this is the third place that says so —
+    // `unplug()' and `finish()' being the other two. A second soft stop
+    // during a linger is not exotic: the battery fills and arms timer A,
+    // a revoke ten seconds later comes back through this same branch.
+    // Without the clear, the assignment below would drop the reference to
+    // A while leaving it armed, and A — the earlier deadline — would fire
+    // first, unplug with the *first* reason, and cancel B on its way
+    // through `unplug()'. The linger the second stop asked for would never
+    // run. Found by B in the review of the M4-A stack.
+    if (lingerTimer !== null) { clearTimeout(lingerTimer); }
     lingerTimer = setTimeout(() => unplug(`stopped: ${reason}, after the linger`),
                              cfg.linger * 1000);
     return;

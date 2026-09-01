@@ -798,6 +798,53 @@ the_phase_follows_the_connector_out_of_the_grace_test() ->
                         driver(?USER))),
     ?assertEqual(overstay, maps:get(phase, Half)).
 
+%% B's review of the M4-A stack. `closing' is a state of the machine that
+%% keeps its session in the snapshot for the whole of `CLOSING_SETTLE_MS',
+%% and a frame really is built in that window: `complete' on a `faulted'
+%% goes there, and the `session_interrupted' it raises on the way makes
+%% the manager broadcast. `phase/2' had no clause for it, so the catch-all
+%% answered `charging' — a driver twenty minutes into an overstay watched
+%% the phase go back to "charging" for the last two seconds of it.
+%%
+%% The three cases below are the three states of charge a session can be
+%% in when it ends, and the second is the one that fixes the clause
+%% *order*: a car that ended full still reports `soc_pct: 100' while it
+%% closes, so a `closing' clause written below the `soc >= 100' one would
+%% answer `complete' here and the assertion would go red. Same masking the
+%% `overstay' test above guards against, one state further along.
+the_phase_is_closed_while_the_session_is_settling_test() ->
+    Closing = payload_of(vs_driver_proto:session_frame(
+                           station_with(charging(#{state => closing, power_kw => 0.0,
+                                                   session => #{soc_pct => 58}})),
+                           driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Closing)),
+    Full = payload_of(vs_driver_proto:session_frame(
+                        station_with(charging(#{state => closing, power_kw => 0.0,
+                                                session => #{soc_pct => 100}})),
+                        driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Full)),
+    %% The state decides it alone, over the whole range of the other
+    %% argument: a driver who stopped a half-empty car is closing just as
+    %% much as one whose battery filled.
+    Low = payload_of(vs_driver_proto:session_frame(
+                       station_with(charging(#{state => closing, power_kw => 0.0,
+                                               session => #{soc_pct => 0}})),
+                       driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Low)),
+    %% and the rest of the frame is the ordinary §5.2 payload — the phase
+    %% is the only thing this window changes. The overstay the driver has
+    %% been watching is still under it, and still the connector's own
+    %% number: the last thing the page shows about a session is not a
+    %% blank one.
+    Settling = payload_of(vs_driver_proto:session_frame(
+                            station_with(charging(#{state => closing, power_kw => 0.0,
+                                                    session => #{overstay_seconds => 420}})),
+                            driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Settling)),
+    ?assertEqual(420, maps:get(overstay_seconds, Settling)),
+    ?assertEqual(12.317, maps:get(energy_kwh, Settling)),
+    ?assertEqual(2, maps:get(connector_id, Settling)).
+
 %% The number is the connector's, computed where the grace and the clock
 %% live, and this channel carries it without arithmetic of its own — the
 %% same figure that will be written to `sessions.overstay_seconds', so the

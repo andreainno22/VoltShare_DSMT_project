@@ -789,11 +789,12 @@ a_rebuilt_claim_with_a_stale_expiry_is_asked_about_not_dropped_test() ->
 %% is reading and a notification that simply never appears.
 %%
 %% What is *not* asserted here is that the real coordinator accepts it —
-%% today it does not. `vs_coord_srv' has no `notify' clause (R2, still
-%% open, `nota-per-B-review-pr5.md' §2) and the cast lands in its
-%% catch-all. The mock is the contract's shape written down on our side,
-%% so that the day B applies the patch there is nothing left to change
-%% here.
+%% it does, and elsewhere: `vs_coord_srv' matches the 4-tuple and forwards
+%% it (R2 of the PR #5 review, PR #8), and its own suite asserts that. The
+%% mock is the contract's shape written down on our side of the wire, so
+%% that this suite goes red here — where the tuple is built — rather than
+%% at integration time, and it stays worth having now that both ends
+%% agree: it is what keeps them agreeing.
 
 %% Four elements. The two the manager passed became a user id, the binary
 %% name of the kind as §5.3 spells it, and the sentence — looked up in

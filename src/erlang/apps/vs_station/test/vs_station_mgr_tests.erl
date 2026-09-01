@@ -538,3 +538,116 @@ the_manager_does_not_filter_by_identity_test() ->
         {Notification, _Calls} = what_happens_to({charge_complete, 999}),
         ?assertEqual({driver_notification, 999, charge_complete, 1}, Notification)
     end).
+
+%%%===================================================================
+%%% M4-A — the two populations of subscribers (B's review)
+%%%===================================================================
+%%
+%% Not everything subscribed to this manager is a page. `vs_claim_client'
+%% comes in through the cast door for the lobby's stats feed, and before
+%% this fix it sat in the one `subs' map with the sockets and received
+%% every `driver_notification' the station raised — to drop them in its
+%% catch-all `handle_info'. Harmless per message, and on the wrong
+%% process: the claim client is on the critical path of every acquire,
+%% every renew tick and the P14 rebuild.
+%%
+%% The two doors were already distinct. What was missing was the manager
+%% writing down what each one meant.
+
+%% A stand-in for a driver socket: in through the **call** door, and it
+%% can be asked what it has received. It has to be another process —
+%% having both populations at once is the whole subject of the test, and
+%% this one leaves the test process free to play the claim client.
+socket_subscriber() ->
+    Test = self(),
+    Pid = spawn(fun() ->
+                        ok = vs_station_mgr:subscribe(),
+                        Test ! {subscribed, self()},
+                        socket_loop([])
+                end),
+    receive {subscribed, Pid} -> Pid
+    after 1000 -> erlang:error(socket_never_subscribed)
+    end.
+
+socket_loop(Seen) ->
+    receive
+        {what_did_you_get, From} -> From ! {got, lists:reverse(Seen)},
+                                    socket_loop(Seen);
+        Msg                      -> socket_loop([Msg | Seen])
+    end.
+
+%% **Exact, not optimistic** (P11). By the time the barrier call in the
+%% test has returned, the manager has finished handling the event before
+%% it, so every `Pid ! Msg' it was going to make has already run — and a
+%% local send lands in the target's mailbox as it happens. The round trip
+%% below therefore reads a mailbox that is already complete; there is
+%% nothing to wait for and no sleep that would make it truer.
+notifications_seen_by(Pid) ->
+    Pid ! {what_did_you_get, self()},
+    receive {got, Msgs} -> [M || M = {driver_notification, _, _, _} <- Msgs]
+    after 1000 -> erlang:error(socket_silent)
+    end.
+
+pushes_seen_by(Pid) ->
+    Pid ! {what_did_you_get, self()},
+    receive {got, Msgs} -> [M || M = {station_state, _} <- Msgs]
+    after 1000 -> erlang:error(socket_silent)
+    end.
+
+the_notifications_go_to_the_sockets_and_not_to_the_claim_client_test() ->
+    with_station(fun() ->
+        Socket = socket_subscriber(),
+        try
+            %% the claim client's door: a cast, answered with a seed push
+            gen_server:cast(vs_station_mgr, {subscribe, self()}),
+            _ = vs_station_mgr:station_state(),
+            ?assertMatch({station_state, _},
+                         receive S = {station_state, _} -> S
+                         after 1000 -> no_seed_push
+                         end),
+            flush_messages(),
+            %% one notification, raised the way a connector raises it
+            vs_station_mgr ! {connector_event, 1, {charge_complete, ?USER}},
+            _ = vs_station_mgr:station_state(),
+            %% the page gets the sentence
+            ?assertEqual([{driver_notification, ?USER, charge_complete, 1}],
+                         notifications_seen_by(Socket)),
+            %% the claim client still gets the state — the subscription is
+            %% intact and this is what it subscribed for
+            ?assertMatch({station_state, _},
+                         receive P = {station_state, _} -> P
+                         after 1000 -> no_state_push
+                         end),
+            %% and nothing else. `notification_in_mailbox/0' drains the
+            %% remaining pushes looking for one, so `none' is the whole
+            %% mailbox answering, not just the front of it.
+            ?assertEqual(none, notification_in_mailbox())
+        after
+            exit(Socket, kill)
+        end
+    end).
+
+%% The other half of the split, and the one it would be easy to break
+%% while fixing the first: the state push is for **both** populations. A
+%% claim client that stopped hearing about the station would stop feeding
+%% the lobby, silently — `station_stats' is a cast nobody answers.
+the_state_push_still_reaches_both_populations_test() ->
+    with_station(fun() ->
+        Socket = socket_subscriber(),
+        try
+            gen_server:cast(vs_station_mgr, {subscribe, self()}),
+            _ = vs_station_mgr:station_state(),
+            flush_messages(),
+            %% an event that is not news for a driver: no notification is
+            %% raised by it, so what arrives is the broadcast and only it
+            vs_station_mgr ! {connector_event, 1, {state_changed, charging}},
+            _ = vs_station_mgr:station_state(),
+            ?assertMatch([{station_state, _} | _], pushes_seen_by(Socket)),
+            ?assertMatch({station_state, _},
+                         receive P = {station_state, _} -> P
+                         after 1000 -> no_state_push
+                         end)
+        after
+            exit(Socket, kill)
+        end
+    end).

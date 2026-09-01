@@ -69,7 +69,32 @@
                 alloc    = #{} :: #{pos_integer() => float()},
                 monitors = #{} :: #{reference() =>
                                         {connector, pos_integer()} | {subscriber, pid()}},
-                subs     = #{} :: #{pid() => reference()}}).
+                %% Two populations, because two different things are sent
+                %% and only one of them is for a person to read (B's
+                %% review of the M4-A stack).
+                %%
+                %%   `sockets'  — the driver WebSockets, in through the
+                %%                **call** door `subscribe/0'. State
+                %%                pushes and driver notifications.
+                %%   `watchers' — in through the **cast** door
+                %%                `{subscribe, Pid}'. State pushes only.
+                %%                Today that is `vs_claim_client', which
+                %%                subscribes for the lobby's stats feed
+                %%                and is the one process that may not
+                %%                call in here (see lookup_pid/1).
+                %%
+                %% The split is not new plumbing: the two doors have been
+                %% distinct since M1 and their callers have never
+                %% overlapped — what was missing was the manager writing
+                %% down which door meant what. Before it, every
+                %% `driver_notification' also landed in the claim client's
+                %% mailbox, to be dropped by its catch-all `handle_info' —
+                %% on the process that sits on the critical path of every
+                %% acquire, every renew tick and the P14 rebuild.
+                %%
+                %% A pid is in at most one of the two: see subscribe_ok/2.
+                sockets  = #{} :: #{pid() => reference()},
+                watchers = #{} :: #{pid() => reference()}}).
 
 %%%===================================================================
 %%% API
@@ -118,11 +143,19 @@ connector_pid(ConnId) ->
     gen_server:call(?MODULE, {connector_pid, ConnId}).
 
 %% @doc The calling process starts receiving `{station_state, Map}' on
-%% every connector event. Meant for the driver WebSocket processes.
+%% every connector event, **and** the `{driver_notification, …}' of §5.3.
+%%
+%% This door is for the driver WebSockets and for them alone: a
+%% notification is a sentence written for a person, and this is the
+%% population that has one at the other end. A process that only wants the
+%% state comes in through the cast door instead (see handle_cast/2) and
+%% never sees a notification.
 -spec subscribe() -> ok.
 subscribe() ->
     gen_server:call(?MODULE, {subscribe, self()}).
 
+%% @doc Undoes either subscription — a process knows it subscribed, it
+%% should not also have to remember by which door.
 -spec unsubscribe() -> ok.
 unsubscribe() ->
     gen_server:call(?MODULE, {unsubscribe, self()}).
@@ -261,24 +294,18 @@ handle_call({connector_pid, ConnId}, _From, State) ->
             end,
     {reply, Reply, State};
 
-handle_call({subscribe, Pid}, _From, State = #state{monitors = Mons, subs = Subs}) ->
-    case maps:is_key(Pid, Subs) of
-        true ->
-            {reply, ok, State};
+%% The socket door: state pushes and notifications both.
+handle_call({subscribe, Pid}, _From, State = #state{monitors = Mons, sockets = Sockets}) ->
+    case subscribe_ok(Pid, State) of
         false ->
-            Ref = erlang:monitor(process, Pid),
+            {reply, ok, State};
+        {ok, Ref} ->
             {reply, ok, State#state{monitors = Mons#{Ref => {subscriber, Pid}},
-                                    subs     = Subs#{Pid => Ref}}}
+                                    sockets  = Sockets#{Pid => Ref}}}
     end;
 
-handle_call({unsubscribe, Pid}, _From, State = #state{monitors = Mons, subs = Subs}) ->
-    case maps:take(Pid, Subs) of
-        {Ref, Subs1} ->
-            erlang:demonitor(Ref, [flush]),
-            {reply, ok, State#state{monitors = maps:remove(Ref, Mons), subs = Subs1}};
-        error ->
-            {reply, ok, State}
-    end;
+handle_call({unsubscribe, Pid}, _From, State) ->
+    {reply, ok, forget_subscriber(Pid, State)};
 
 handle_call(_Other, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -288,15 +315,25 @@ handle_call(_Other, _From, State) ->
 %% call-based subscribe, the subscriber receives the current state
 %% immediately: a cast cannot combine subscribing with reading, so the
 %% first push stands in for the read.
-handle_cast({subscribe, Pid}, State = #state{monitors = Mons, subs = Subs}) ->
+%%
+%% It is also, since B's review, the door that says "state only". The
+%% claim client asked for a stats feed and got the driver notifications
+%% too, on the one process in the station that must never be made to
+%% carry work it did not ask for. Nothing about the subscription changed
+%% for it — same cast, same seed push, same pushes afterwards — only what
+%% no longer arrives.
+%%
+%% The seed push is outside the dedup on purpose and always has been: a
+%% client that subscribes again is asking to be told again, and this door
+%% has no reply to tell it with.
+handle_cast({subscribe, Pid}, State = #state{monitors = Mons, watchers = Watchers}) ->
     Pid ! {station_state, build_state(State)},
-    case maps:is_key(Pid, Subs) of
-        true ->
-            {noreply, State};
+    case subscribe_ok(Pid, State) of
         false ->
-            Ref = erlang:monitor(process, Pid),
+            {noreply, State};
+        {ok, Ref} ->
             {noreply, State#state{monitors = Mons#{Ref => {subscriber, Pid}},
-                                  subs     = Subs#{Pid => Ref}}}
+                                  watchers = Watchers#{Pid => Ref}}}
     end;
 
 handle_cast(_Msg, State) ->
@@ -347,8 +384,7 @@ handle_info(power_tick, State) ->
     _ = schedule_power_tick(State),
     {noreply, reallocate(State)};
 
-handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #state{monitors = Mons,
-                                                                  subs = Subs}) ->
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #state{monitors = Mons}) ->
     case maps:take(Ref, Mons) of
         {{connector, ConnId}, Mons1} ->
             %% Between the crash and the supervisor restart the connector
@@ -363,8 +399,16 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #state{monitors = Mon
             State1 = reallocate(State#state{monitors = Mons1}),
             broadcast(State1),
             {noreply, State1};
+        %% The monitor stays tagged `{subscriber, Pid}' and says nothing
+        %% about which population the pid belonged to — deliberately. The
+        %% removal below covers both maps and a pid is in at most one, so
+        %% the tag never has to agree with anything: a second place that
+        %% recorded the door would be a second place that could be wrong.
+        %% No `demonitor': delivering this `DOWN' has already consumed it.
         {{subscriber, Pid}, Mons1} ->
-            {noreply, State#state{monitors = Mons1, subs = maps:remove(Pid, Subs)}};
+            {noreply, State#state{monitors = Mons1,
+                                  sockets  = maps:remove(Pid, State#state.sockets),
+                                  watchers = maps:remove(Pid, State#state.watchers)}};
         error ->
             {noreply, State}
     end;
@@ -506,12 +550,66 @@ reallocate(State = #state{site_power_kw = Budget, min_charge_kw = MinKw,
                  end, Alloc),
     State#state{alloc = Alloc}.
 
-broadcast(#state{subs = Subs}) when map_size(Subs) =:= 0 ->
+%% The snapshot goes to **both** populations: it is the state of the
+%% station, and wanting only that is the whole of what the cast door
+%% means. The shortcut guards `build_state/1' rather than the sends —
+%% that is a `snapshot' call per connector, and a station with nothing
+%% watching would pay it on every connector event to build a map nobody
+%% receives.
+broadcast(#state{sockets = Sockets, watchers = Watchers})
+  when map_size(Sockets) =:= 0, map_size(Watchers) =:= 0 ->
     ok;
-broadcast(State = #state{subs = Subs}) ->
+broadcast(State = #state{sockets = Sockets, watchers = Watchers}) ->
     Msg = {station_state, build_state(State)},
+    fan_out(Msg, Sockets),
+    fan_out(Msg, Watchers),
+    ok.
+
+%% One message to one population, and the only place in this module that
+%% walks a subscriber map. It was two — `live/4' had grown its own copy of
+%% this loop and lost the empty-map head on the way — and B's point was
+%% the arithmetic of that: the day the set of subscribers stops being a
+%% bare map of pids there must be one place to change, not two. The day
+%% came in the same review.
+fan_out(_Msg, Subs) when map_size(Subs) =:= 0 ->
+    ok;
+fan_out(Msg, Subs) ->
     maps:foreach(fun(Pid, _Ref) -> Pid ! Msg end, Subs),
     ok.
+
+%% A pid becomes a subscriber once, whichever door it came through: the
+%% check spans **both** maps and not just the one about to be written.
+%% That is what makes "a pid is in at most one population" an invariant
+%% rather than a happy consequence of who calls what today — and that
+%% invariant is what lets the `DOWN' handler and `forget_subscriber/2'
+%% remove from both without having to ask which door was used.
+subscribe_ok(Pid, #state{sockets = Sockets, watchers = Watchers}) ->
+    case maps:is_key(Pid, Sockets) orelse maps:is_key(Pid, Watchers) of
+        true  -> false;
+        false -> {ok, erlang:monitor(process, Pid)}
+    end.
+
+%% Both maps, and the monitor with whichever entry is found. `maps:take'
+%% on an absent key answers `error', so the population the pid is not in
+%% costs one lookup and nothing else.
+forget_subscriber(Pid, State = #state{monitors = Mons, sockets = Sockets,
+                                      watchers = Watchers}) ->
+    {Mons1, Sockets1}  = take_subscriber(Pid, Mons,  Sockets),
+    {Mons2, Watchers1} = take_subscriber(Pid, Mons1, Watchers),
+    State#state{monitors = Mons2, sockets = Sockets1, watchers = Watchers1}.
+
+take_subscriber(Pid, Mons, Subs) ->
+    case maps:take(Pid, Subs) of
+        {Ref, Subs1} ->
+            %% `flush': a `DOWN' already on its way would otherwise arrive
+            %% after the maps have forgotten the pid and fall into the
+            %% `error' branch of the handler — harmless, but this way the
+            %% monitor and the entry die together.
+            erlang:demonitor(Ref, [flush]),
+            {maps:remove(Ref, Mons), Subs1};
+        error ->
+            {Mons, Subs}
+    end.
 
 %%%===================================================================
 %%% M4-A — the notifications of ws-driver.md §5.3
@@ -591,15 +689,23 @@ announce(ConnId, {Kind, UserId}, State) ->
 announce(_ConnId, _Event, _State) ->
     ok.
 
-%% The same message to every subscriber, filtered by nobody here: which
-%% socket may see it is a question about the token that opened it, and
-%% only that socket knows the answer (vs_driver_ws, §7.3). This process
-%% holds pids, not identities, and keeping it that way is what stops the
-%% manager from ever becoming a second place where identity is decided.
-live(ConnId, Kind, UserId, #state{subs = Subs}) ->
-    Msg = {driver_notification, UserId, Kind, ConnId},
-    maps:foreach(fun(Pid, _Ref) -> Pid ! Msg end, Subs),
-    ok.
+%% The same message to every socket, filtered by nobody here: which socket
+%% may see it is a question about the token that opened it, and only that
+%% socket knows the answer (vs_driver_ws, §7.3). This process holds pids,
+%% not identities, and keeping it that way is what stops the manager from
+%% ever becoming a second place where identity is decided.
+%%
+%% "Every socket" is now the literal truth of the map being walked, which
+%% is B's correction: the sentence above was written about `subs', and
+%% `subs' also held the claim client. The premise was false and the
+%% consequence was a notification for a driver being delivered to a
+%% process that has no driver, no token and no page — one that could only
+%% drop it. Broadening the fan-out to a population that cannot use it was
+%% never what "filtered by nobody" meant; the filtering that is refused
+%% here is by **identity**, and it is refused because a socket can do it
+%% and this process cannot.
+live(ConnId, Kind, UserId, #state{sockets = Sockets}) ->
+    fan_out({driver_notification, UserId, Kind, ConnId}, Sockets).
 
 %% The module the connectors were given, so a test that runs the manager
 %% with `vs_claim_stub' sees the durable copy in the stub's log instead of

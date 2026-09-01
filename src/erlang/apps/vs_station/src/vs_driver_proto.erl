@@ -576,9 +576,13 @@ session_payload(Connector) ->
       overstay_seconds => maps:get(overstay_seconds, Session, 0)}.
 
 %% §5.2's enum is `charging | suspended | complete | overstay | closed'.
-%% Four of the five are producible from a snapshot: `closed' is not
-%% derived at all — it is what `session_push/3' sends once the session has
-%% left the snapshot.
+%% All five are producible from a snapshot, and `closed' arrives by two
+%% roads: the clause below, for the settle window in which the session is
+%% ending but still in the snapshot, and `session_push/3', which sends one
+%% last frame when the session leaves the snapshot altogether. A page can
+%% therefore see `closed' more than once — the same terminal word twice,
+%% never a word taken back, which is why one road did not have to be
+%% closed to open the other (ws-driver.md §5.2).
 %%
 %% The order of the clauses is the contract's own precedence, and since M4
 %% the first two carry the weight. `complete' and `overstay' are states of
@@ -606,6 +610,36 @@ session_payload(Connector) ->
 %% stopped asking, and saying so is better than simulating it.
 phase(complete, _SocPct)                                    -> complete;
 phase(overstay, _SocPct)                                    -> overstay;
+%% M4-A, from B's review. `closing' is a state of the machine like the two
+%% above and belongs with them, not in the catch-all: delivery is over and
+%% the row is imminent, so `closed' is the one word that cannot be wrong
+%% for the whole of that window, whichever road led into it. Without this
+%% the catch-all answered `charging', and a driver who had been watching
+%% `overstay' for twenty minutes saw the phase go back to "charging" for
+%% the last two seconds — with `power_kw' at zero and `overstay_seconds'
+%% still climbing under it.
+%%
+%% The window is small and it is real: `vs_connector:complete/3' on a
+%% `faulted' or `unavailable' status goes to `closing', which keeps the
+%% session in the snapshot for `CLOSING_SETTLE_MS', and the
+%% `session_interrupted' raised on the way makes the manager broadcast —
+%% so a `session' frame really is built and sent in there. (No line
+%% number: this comment outlives them, which is the lesson of the three
+%% that had to be rewritten in the same review.)
+%%
+%% **Above the `soc >= 100' clause**, and that is the whole reason this
+%% clause is here and not one line lower: a car that ended its charge full
+%% reports `soc_pct: 100' for the whole closing too, and read second this
+%% would answer `complete' — the same masking the note above describes for
+%% `overstay', one state further on.
+%%
+%% **Alternative rejected**: carry `charge_ended' in the snapshot to tell
+%% closing-from-`complete' (→ `overstay') from closing-from-a-fault
+%% (→ `charging'). Machinery threaded through the connector, the snapshot
+%% and this module for a two-second window — and it would not even settle
+%% the question, since during the grace `overstay_seconds' is 0 and the
+%% two are indistinguishable anyway. A session that is ending is ending.
+phase(closing, _SocPct)                                     -> closed;
 phase(_State, SocPct) when is_number(SocPct), SocPct >= 100 -> complete;
 phase(suspended, _SocPct)                                   -> suspended;
 phase(_State, _SocPct)                                      -> charging.

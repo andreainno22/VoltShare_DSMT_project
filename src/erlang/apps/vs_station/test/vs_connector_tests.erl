@@ -1458,6 +1458,53 @@ no_grace() -> #{overstay_grace_s => 0}.
 
 session_of(Pid) -> maps:get(session, vs_connector:snapshot(Pid)).
 
+%% B's review of the M4-A stack, and the first test in this suite that
+%% hands the connector a hostile configuration instead of a plausible one.
+%% That is why nothing here caught it: every existing test passes numbers
+%% a person would mean.
+%%
+%% `vs_env:get_int/2' falls back to its default only on `badarg', so
+%% `"-1"' is a good integer and travels: `OVERSTAY_GRACE_SECONDS=-1' put
+%% `{state_timeout, -1000, overstay_started}' in the enter of `complete',
+%% gen_statem refused the negative time, and the connector **died on every
+%% soft end of charge** — the live session lost and the process restarted
+%% in `free' with the car still plugged in. `CLOSING_SETTLE_MS=-1' did the
+%% same to `closing', and had been able to since before M4. Both knobs are
+%% exposed in `docker-compose.yml' with a comment inviting you to change
+%% them, which is what makes `-1' a thing somebody types.
+%%
+%% All three durations are negative here, so one connector's life covers
+%% the whole clamp: it is born (`cp_grace_ms'), it ends a charge
+%% (`overstay_grace_s') and it settles (`settle_ms'). Before the fix this
+%% test does not fail an assertion — it takes the test process down with
+%% the connector it is linked to, which is exactly the failure a station
+%% would have seen.
+%%
+%% The injection is through `Opts', never through the environment: an env
+%% var set in a test is global to the node and outlives the test that set
+%% it (P11).
+a_negative_duration_is_clamped_where_it_is_read_test() ->
+    Hostile = #{overstay_grace_s => -1, closing_settle_ms => -1, cp_grace_ms => -1},
+    with_connector(Hostile, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        %% alive, which is the whole of the regression
+        ?assert(is_process_alive(Pid)),
+        %% and the grace that survived is 0, not -1: the derivation reads
+        %% `overstay' at once, exactly as it does with `no_grace()'
+        ?assertEqual(overstay, state_of(Pid)),
+        %% the second effect, independent of the crash: with a grace of
+        %% -1 the net was `elapsed + 1' — a second billed before it had
+        %% gone by. `max(0, …)' at the read makes the subtraction honest.
+        ?assertEqual(0, maps:get(overstay_seconds, session_of(Pid))),
+        %% and `closing' survives its own negative timer: the row comes
+        %% out, so the settle really ran
+        vs_connector:unplugged(Pid, 9.0),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(0, maps:get(overstay_seconds, Row))
+    end).
+
 the_stop_ends_the_charge_and_starts_the_overstay_test() ->
     with_connector(no_grace(), fun(Pid) ->
         ok = plug(Pid, ?VEHICLE),

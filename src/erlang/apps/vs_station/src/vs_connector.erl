@@ -341,11 +341,42 @@ init(Opts) ->
                  claim_mod  = maps:get(claim_mod, Opts, vs_claim_null),
                  db_mod     = maps:get(db_mod, Opts, vs_station_db),
                  notify_to  = maps:get(notify_to, Opts, undefined),
-                 cp_grace_ms = maps:get(cp_grace_ms, Opts, cp_grace_ms()),
-                 settle_ms   = maps:get(closing_settle_ms, Opts,
-                                        closing_settle_ms()),
-                 overstay_grace_s = maps:get(overstay_grace_s, Opts,
-                                             overstay_grace_s())},
+                 %% The `max(0, …)' is the whole of what makes the three
+                 %% `non_neg_integer()' annotations above true, and it is
+                 %% **here** rather than at the three points of use because
+                 %% here is where the value is photographed. A duration is
+                 %% read once, at the birth of the process, and every later
+                 %% reader gets the field: one clamp covers the timer, the
+                 %% arithmetic of `overstay_seconds/3' and whatever reads
+                 %% them next, and no future reader has to remember.
+                 %%
+                 %% Why it is not paranoia. `vs_env:get_int/2' falls back
+                 %% to the default only on `badarg', so `"-1"' is a
+                 %% perfectly good integer and passes: with
+                 %% `OVERSTAY_GRACE_SECONDS=-1' the enter of `complete'
+                 %% armed `{state_timeout, -1000, …}', gen_statem refused
+                 %% the negative time and killed the connector on **every**
+                 %% soft end of charge — with the car still attached and
+                 %% the live session lost. `CLOSING_SETTLE_MS=-1' does the
+                 %% same to `closing', and has been able to since before
+                 %% M4. Found by B in the review of the M4-A stack.
+                 %%
+                 %% And an env var exposed in `docker-compose.yml' with a
+                 %% comment inviting you to change it — which is what
+                 %% `OVERSTAY_GRACE_SECONDS' is, on both stations — is an
+                 %% API, whoever wrote it: `-1' read as "disabled" is the
+                 %% first thing anybody tries in a demo. An API validates
+                 %% its input where it takes it in.
+                 %%
+                 %% Around the whole `maps:get', not just the default, so
+                 %% the `Opts' door is covered too — it is the one a test
+                 %% can inject through, which is how the regression is
+                 %% written without touching the environment (P11).
+                 cp_grace_ms = max(0, maps:get(cp_grace_ms, Opts, cp_grace_ms())),
+                 settle_ms   = max(0, maps:get(closing_settle_ms, Opts,
+                                               closing_settle_ms())),
+                 overstay_grace_s = max(0, maps:get(overstay_grace_s, Opts,
+                                                    overstay_grace_s()))},
     %% Announce to whoever tracks connectors (vs_station_mgr). This runs
     %% at first boot AND at every supervisor restart, which is how the
     %% manager's registry heals after a crash without polling anyone. It

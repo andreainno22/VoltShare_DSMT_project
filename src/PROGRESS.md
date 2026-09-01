@@ -3054,6 +3054,76 @@ col gate, tutte le notifiche delle sessioni senza prenotazione sparirebbero.
 - **`erlang-java.md` §2.4**: file condiviso, si tocca in PR.
 - **Retry o code per `notify`**: deliberato, §24.1 di `scelte_di_progetto.md`.
 
+## 7zi. La review di B sullo stack M4-A: cinque rilievi, tutti veri — 1 settembre
+
+B ha rivisto i cinque commit dello stack (`review-per-A-m4a.md`, branch `b/review-m4a`).
+Riverificati aprendo il codice invece che la review: **tutti e cinque veri**, e uno grave.
+Applicati sul branch, che aggiorna la PR aperta. Risposta in
+`src/contracts/risposta-per-B-m4a-review.md`.
+
+- **B1 — GRAVE.** `OVERSTAY_GRACE_SECONDS=-1` uccideva il connettore **entrando in `complete`**:
+  `vs_env:get_int/2` torna al default solo su `badarg`, `"-1"` passa, e lo `state_timeout` nudo
+  dell'enter faceva terminare gen_statem con `bad_action_from_state_function`. A ogni stop del
+  conducente, a ogni batteria piena, a ogni revoca. Manopola **esposta nel compose** con il
+  commento che invita a cambiarla. `max(0, …)` in `init/1` su tutte e tre le durate
+  (`overstay_grace_s`, `cp_grace_ms`, `settle_ms`) — `CLOSING_SETTLE_MS=-1` faceva lo stesso a
+  `closing`, e poteva da prima di M4.
+- **B2.** `phase(closing, _)` cadeva nel catch-all e rispondeva `charging` durante il settle,
+  con la sessione ancora nello snapshot e un frame davvero spedito. Ora `closed`, **sopra** la
+  clausola `soc >= 100` (sotto, un'auto finita piena leggerebbe `complete`). Riga di
+  `ws-driver.md` §5.2 riscritta nello stesso commit: `closed` ora arriva per due strade.
+- **B3.** Le `driver_notification` arrivavano anche al claim client, che le scartava nel
+  catch-all — sul processo che sta sul percorso critico di ogni acquire e della ricostruzione
+  P14. Due mappe nel manager sulle due porte che c'erano già (`sockets` dalla call, `watchers`
+  dalla cast); un solo `fan_out/2`, che era l'altra metà del rilievo.
+- **B4.** `cp.js`: `lingerTimer` riassegnato senza `clearTimeout`, timer orfano che scatta per
+  primo e cancella quello nuovo. Clear prima della riassegnazione.
+- **B5.** Tre commenti dicevano che R2 era aperta. È chiusa dalla #8
+  (`vs_coord_srv.erl:274` su `origin/main`). Riscritti: dicono il presente, e nessuno dei tre
+  cita più un numero di riga — è così che erano marciti.
+
+### La correzione a B: 385 → 382
+
+La sua nota su `eunit_check.sh` diceva che il nostro 382 era misurato su un albero senza i suoi
+tre test, quindi 385 al merge. **Il nostro albero li contiene**: `git merge-base` fra il branch
+e `origin/main` *è* la punta di `origin/main` (`90cbf81`, il merge della #8), il file
+`vs_coord_srv_tests.erl` è identico sui due lati, e i tre test girano da qui. Il suo `c65d0cb`
+portava `EXPECTED_TESTS` da 333 a 336; 382 è misurato sopra quel commit e li include già.
+Sommarli li conterebbe due volte. È il suo stesso principio — «misurato, non sommato».
+
+### Verificato — girato davvero
+
+- Suite: **382 → 386**, tre giri consecutivi di `eunit_check.sh` verdi, `EXPECTED_TESTS` a 386
+  nello stesso commit dei test.
+- **Ciascuno dei quattro test nuovi è stato visto fallire senza il suo fix**, non solo passare
+  con. B1: `bad_action_from_state_function`, con la suite che stampa `76 tests, 0 failures, 3
+  cancelled` — esattamente il modo di guasto contro cui è ancorata la stringa di
+  `eunit_check.sh`. B2: `expected closed, got charging`; e spostando la clausola sotto quella
+  `soc >= 100`, `expected closed, got complete` — l'ordine è asserito. B3: la notifica ricompare
+  nella mailbox del claim client.
+- La catena dei chiamanti di B3 tracciata per grep su tutto l'albero prima di toccare il
+  manager: due porte, due chiamanti di produzione (`vs_driver_ws.erl:88`,
+  `vs_claim_client.erl:343`), `unsubscribe/0` chiamato solo dai test.
+
+### Non provato — e perché
+
+- **B4 non ha un test.** È l'emulatore, e nessun test eunit lo raggiunge: la prova è la lettura
+  del sorgente e la sequenza tracciata a mano. Un caso manuale (due stop morbidi in fila con
+  `--linger` lungo) richiederebbe i container su e un minuto di orologio, e non l'ho fatto.
+- **Nessuna verifica in Docker** in questo giro: le cinque correzioni sono tutte a livello di
+  processo o di emulatore, e la suite le copre. L'ultima E2E resta quella del 31/08.
+- **Il limite dichiarato di `complete`** (firmware che heartbeata per sempre col cavo dentro:
+  sessione in RAM, riga mai scritta) non è misurato e non lo sarà: non c'è codice da provare,
+  è una scelta. Scritta in `scelte_di_progetto.md` §25.5 col confine — se un giorno servirà un
+  segnale sarà l'incoerenza `cp_status available` col cavo dentro, non un orologio.
+
+### Cosa resta fuori, e perché
+
+- **Il branch `b/review-m4a`** è di B: la review la merga o la include come vuole lui.
+- **Un tetto su `complete`**: deciso di no, e il perché sta in §25.5 e nella risposta.
+- **`vs_coord/`, `backoffice/`, i contratti condivisi**: fuori perimetro. `ws-driver.md` è
+  toccato perché è nostro e perché B2 lo rendeva falso.
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha

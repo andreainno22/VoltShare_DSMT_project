@@ -160,14 +160,16 @@ handle_cast({show_up, UserId} = Msg, State) ->
 %% M4-A — the driver notification of erlang-java.md §2.4, in the arity
 %% `ErlangBridge:onNotify' reads (user id, kind, text) behind the tag.
 %%
-%% ← B: **this clause does not exist in `vs_coord_srv' yet** — it is R2
-%% of nota-per-B-review-pr5.md §2, and it is the only hop missing between
-%% a station that now really sends these and a row in `notifications'.
-%% Until it is applied the real coordinator logs the tuple below as an
-%% "unexpected cast" and drops it. The head here is shape-matched for the
-%% same reason the penalty pair is: a `notify' of the wrong arity would
-%% fall into the catch-all in silence on both sides, and this way the
-%% test goes red here instead of the message going missing at integration.
+%% `vs_coord_srv' has the matching clause and forwards to `vs_coord_bo':
+%% R2 of the PR #5 review, applied by B in PR #8. The hop from a station's
+%% cast to a row in `notifications' is whole, and this head is the mirror
+%% of the far one rather than a placeholder for it.
+%%
+%% Shape-matched, for the same reason the penalty pair is: a `notify' of
+%% the wrong arity would fall into a catch-all in silence on both sides,
+%% and this way the test goes red here instead of the message going
+%% missing at integration. That is what the mock is for now that both ends
+%% exist — the two arities cannot drift apart without a test noticing.
 handle_cast({notify, UserId, Kind, Text} = Msg, State) ->
     logger:notice("mock-coord: notification ~s for user ~p (~s)",
                   [Kind, UserId, Text]),

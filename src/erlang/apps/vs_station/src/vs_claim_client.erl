@@ -446,14 +446,16 @@ handle_cast({show_up, UserId}, State = #state{leader = Leader}) ->
 %% (`intOf', `textOf', `textOf') is decided in one place and asserted in
 %% one test.
 %%
-%% Today the far end has no clause for it. `vs_coord_srv' matches
-%% `session_closed', `no_show' and `show_up' and nothing else, so this
-%% cast lands in its catch-all at :279 and is logged as an "unexpected
-%% cast" — with the whole term, which is the useful part: B's log shows
-%% the exact tuple that is being dropped. The clause that closes the gap
-%% is R2 in `nota-per-B-review-pr5.md' §2, already written, in `vs_coord/'
-%% and therefore his. Sending anyway is deliberate: it turns an argument
-%% about a missing hop into a line in his log.
+%% The far end matches it: `vs_coord_srv' has its own `notify' clause and
+%% forwards to `vs_coord_bo', ungated — B applied it as R2 of the PR #5
+%% review. The hop is whole from this cast to the `notifications' row.
+%%
+%% It went out before that clause existed, and that was the right call
+%% then for the reason it stays right now: this side owes the event, and a
+%% station that withholds it until the far end is ready has an untested
+%% path on the day it becomes ready. Sending into a catch-all cost one log
+%% line and turned an argument about a missing hop into evidence. The
+%% history is in `nota-per-B-review-pr5.md' §2 and belongs there.
 handle_cast({notify, UserId, Kind}, State = #state{leader = Leader}) ->
     cast_leader(Leader, {notify, UserId, atom_to_binary(Kind, utf8),
                          vs_driver_proto:notification_text(Kind)}),

@@ -2587,3 +2587,143 @@ vive due minuti), `reservation_expired` perché qualcuno lo registra già e megl
 Costo della correzione, presa prima che R2 esistesse: una riga in `durable/1`, un test, e le
 carte. Presa dopo, sarebbe stata una colonna sporca in produzione e una discussione su chi
 smette di scrivere.
+
+---
+
+## 25. Una env esposta nel compose è un'API, e si valida dove si fotografa (review M4-A)
+
+La review di B sullo stack M4-A ha trovato cinque cose. Quattro erano difetti da correggere e
+basta; una è una lezione, e una seconda è la generalizzazione di una lezione che avevamo già.
+
+### 25.1 Il difetto: `OVERSTAY_GRACE_SECONDS=-1` uccideva il connettore a ogni fine carica
+
+`vs_env:get_int/2` torna al default **solo** su `badarg`. `"-1"` è un intero perfettamente
+valido, quindi passa. L'`enter` di `complete` armava `{state_timeout, Grace * 1000, …}` nudo:
+con `Grace = -1` gen_statem rifiuta il tempo negativo e il processo termina con
+`bad_action_from_state_function`. Il connettore moriva **entrando in `complete`**, cioè a ogni
+stop del conducente, a ogni batteria piena e a ogni revoca a metà sessione — perdendo la
+sessione viva e ripartendo in `free` con l'auto ancora attaccata.
+
+Lo stesso valeva per `CLOSING_SETTLE_MS`, e da prima di M4: `pos_integer()` sul campo era
+un'annotazione, non un vincolo, e nessuno la faceva rispettare. Terzo effetto indipendente:
+con grace negativa `overstay_seconds/3` calcola `elapsed + |Grace|` e fattura secondi mai
+trascorsi.
+
+### 25.2 Perché non era teorico, che è il punto
+
+`OVERSTAY_GRACE_SECONDS` non è una variabile interna: è **esposta in `docker-compose.yml`**
+(:63-70 e :105) con un commento che invita esplicitamente a cambiarla —
+`OVERSTAY_GRACE_SECONDS=10 docker compose up -d station1`, la riga con cui abbiamo misurato
+tutto l'overstay. Un `-1` letto come «disattivato» è la prima cosa che qualcuno prova in demo.
+
+La regola, e vale al di là di questo caso: **una variabile d'ambiente esposta nel compose con
+un commento che invita a toccarla è un'API**, chiunque l'abbia scritta. Un'API valida i suoi
+input. Il posto in cui validarli è quello in cui li si **fotografa** — qui `init/1`, dove la
+nota di metodo di questo sistema dice già che le durate si leggono una volta sola alla nascita
+del processo. Un `max(0, …)` lì copre in un colpo il timer, l'aritmetica del netto e qualunque
+lettore futuro; gli stessi tre `max` messi ai punti d'uso sarebbero tre posti che devono
+restare d'accordo, e il quarto lettore non se lo ricorderebbe nessuno.
+
+Corollario sul tipo: `non_neg_integer()` su `#data.overstay_grace_s` era **un'asserzione senza
+niente che la imponesse**, e le asserzioni di quel tipo si leggono come garanzie. O c'è una riga
+di codice che le rende vere, o vanno tolte.
+
+Perché nessun nostro test ci passava: tutti passano numeri che una persona intenderebbe
+davvero. La regressione è il primo test della suite che consegna al connettore una
+configurazione **ostile** — e la consegna via `Opts`, mai via ambiente, perché una env messa in
+un test è globale al nodo e sopravvive al test che l'ha impostata (P11).
+
+### 25.3 La versione per enum della lezione §21: quattro catch-all, quattro politiche
+
+§21 dice che la firma di ritorno decide quali distinzioni sono ancora possibili a valle. B ha
+notato la stessa cosa un piano più in basso, sui **valori**: lo stesso enum di stati è
+enumerato in quattro posti — `vs_power:is_live/1`, `vs_claim_client:count_stats/1`,
+`vs_driver_proto:wire_connector_state/1` e `vs_driver_proto:phase/2` — e ognuno ha un catch-all
+con una politica diversa. §22.5 aveva già fatto il giro dei primi tre quando M4 aggiunse
+`complete` e `overstay`. `phase/2` fu saltato, e il difetto è comparso lì: `closing` cadeva nel
+suo catch-all e rispondeva `charging`, così un conducente in overstay da venti minuti vedeva la
+fase tornare a "charging" per gli ultimi due secondi prima di `closed`.
+
+La lezione non è «niente catch-all»: tre di quei quattro sono giusti e servono. È che **un
+catch-all su un enum condiviso è una decisione, e va riletta ogni volta che l'enum cambia** —
+anche quando il valore nuovo non è quello che rompe. `closing` esisteva da M2; è stata
+l'aggiunta di *altri due* valori a rendere sbagliata la risposta che il catch-all dava a lui,
+perché ha spostato il significato del default da «sta caricando» a «non è nessuno dei casi che
+ho enumerato». Il modo di trovarli è quello di §22.5: cercare per struttura chi **legge**
+l'enum, non chi lo nomina.
+
+Scelta per `phase(closing, _)`: **`closed`**. L'erogazione è finita e la riga è imminente, e
+`closed` non mente mai in quella finestra qualunque sia la strada d'arrivo. Scartata
+l'alternativa di far viaggiare `charge_ended` nello snapshot per distinguere
+closing-da-`complete` (→ `overstay`) da closing-da-guasto (→ `charging`): macchinario
+attraverso tre moduli per una finestra di due secondi, e non deciderebbe nemmeno la questione,
+perché durante la grazia `overstay_seconds` è 0 e i due casi restano indistinguibili.
+
+La clausola va **sopra** quella `soc >= 100`, non solo sopra il catch-all: un'auto che ha
+finito piena riporta `soc_pct: 100` anche mentre chiude, e letta dopo risponderebbe `complete`
+— lo stesso mascheramento che §22.5 descrive per `overstay`, uno stato più in là. Un test
+asserisce l'ordine mettendo il caso a 100.
+
+Conseguenza sul contratto, ed è nostra: ws-driver §5.2 diceva che `closed` è «il frame in più
+mandato una volta, quando la sessione esce dallo snapshot». Ora `closed` arriva per due strade
+— dallo snapshot durante il settle, e dal `session_push/3` all'uscita — e la pagina può vederlo
+più di una volta. Riga riscritta nello stesso commit: è una parola terminale che non viene mai
+ritirata, quindi un client che rende l'ultimo frame ricevuto è corretto in entrambi i casi.
+
+### 25.4 Due popolazioni di subscriber, perché due cose diverse vengono spedite
+
+`vs_station_mgr` teneva una mappa `subs` sola. I socket driver entrano dalla porta **call**
+(`subscribe/0`), il claim client dalla porta **cast** (`{subscribe, self()}`, per il feed delle
+statistiche della lobby — non può fare call qui dentro, chiuderebbe un ciclo di tre gen_server).
+Le due porte erano distinte da M1; quello che mancava era che il manager scrivesse da qualche
+parte **cosa significassero**. Risultato: ogni `driver_notification` finiva anche nella mailbox
+del claim client, per essere scartata dal suo `handle_info` catch-all — su quell'unico processo
+che sta sul percorso critico di ogni acquire, di ogni tick di renew e della ricostruzione P14.
+
+Il commento sopra `live/4` diceva «quale socket possa vederla è una domanda sul token che l'ha
+aperto, e solo quel socket sa la risposta». Vero, e scritto su una premessa falsa: **non tutti i
+subscriber erano socket**. Il filtro che quel commento rifiuta è quello per *identità*, ed è
+rifiutato perché un socket sa farlo e il manager no; allargare il fan-out a una popolazione che
+non può farne niente non è mai stato ciò che «filtrato da nessuno» voleva dire.
+
+Due mappe, `sockets` e `watchers`; lo snapshot va a entrambe, le notifiche solo ai socket. Il
+monitor resta taggato `{subscriber, Pid}` **senza** dire da quale porta è entrato: la rimozione
+tocca entrambe le mappe e un pid sta in al più una, così il tag non deve mettersi d'accordo con
+niente. Un secondo posto che registrasse la porta sarebbe un secondo posto che può sbagliare.
+L'invariante «un pid sta in al più una popolazione» è imposta all'ingresso, controllando
+entrambe le mappe e non solo quella che si sta scrivendo.
+
+E il fan-out è **uno**. Era due — `live/4` si era copiata il ciclo di `broadcast/1` perdendone
+per strada la scorciatoia sulla mappa vuota — ed è l'altra metà del rilievo di B: il giorno in
+cui l'insieme dei subscriber smette di essere una mappa nuda di pid ci deve essere un posto solo
+da cambiare. Il giorno è arrivato nella stessa review. Le due scorciatoie sopravvivono entrambe
+perché sorvegliano costi diversi: quella su `broadcast/1` evita di **costruire** lo snapshot
+(una call per connettore) quando non guarda nessuno, quella su `fan_out/2` evita il ciclo.
+
+Un secondo test guarda l'altra metà, che era quella facile da rompere aggiustando la prima: lo
+snapshot deve continuare ad arrivare a **entrambe** le popolazioni. Un claim client che smette
+di sentire la stazione smette di alimentare la lobby in silenzio, perché `station_stats` è una
+cast che nessuno riscontra.
+
+### 25.5 Il limite dichiarato: `complete` non ha un tetto, e non ne vogliamo uno
+
+B lo ha sollevato come dubbio, non come difetto, e la risposta è che è la semantica voluta. Le
+uscite di `complete` sono l'`unplugged`, un `cp_status` faulted/unavailable e il timeout
+`cp_grace` — armato solo sul `DOWN` del socket colonnina. La scadenza del lease è assorbita di
+proposito («nothing to stop»). Una colonnina che continua a mandare heartbeat col cavo dentro
+non innesca quindi nessuna uscita, e la sessione resta in RAM senza riga.
+
+Non ci mettiamo un timer, e la ragione è quella di SCOPE §3.4: l'auto è fisicamente lì, l'outlet
+è occupato davvero, e liberare il connettore dopo `settle_ms` con una macchina attaccata sarebbe
+una bugia più cara del silenzio. Il sistema può «accorgersene, avvisare, e rendere costosa
+l'attesa», non teletrasportare l'auto. Lo stato `overstay` che il connettore mostra in quella
+finestra è lo **stato vero** dell'outlet, e chi aspetta un posto lo vede.
+
+Il caso emulatore-ucciso — quello che sembra il peggiore — è già coperto, e per un'altra strada:
+muore il socket, arriva il `DOWN`, scatta `cp_grace` e la riga viene scritta con l'overstay
+maturato fino all'ultima misura (`complete({timeout, cp_grace}, …)`). Resta scoperto solo il
+firmware che heartbeata per sempre col cavo dentro. Confine dichiarato, come §22.7: se un giorno
+servirà un segnale, quello giusto è l'**incoerenza** — un `cp_status available` con il cavo che
+risulta ancora dentro, che oggi assorbiamo — non un orologio. Un orologio è codice permanente
+per un fatto temporaneo; l'incoerenza è un fatto che la colonnina ci sta già raccontando e che
+stiamo scegliendo di non ascoltare.
