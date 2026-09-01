@@ -255,6 +255,84 @@ renew_batches_the_claims_every_tick_test() ->
     end).
 
 %%%===================================================================
+%%% the penalty events (M4-A, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% These three assert the FORM on the wire, not merely that something was
+%% sent, and the reason is that getting the arity wrong fails silently in
+%% production: `vs_coord_srv' matches `{no_show, _, _, _}' and
+%% `{show_up, _}' exactly, and anything else lands in its catch-all —
+%% "unexpected cast" in a log nobody reads, and a strike that is never
+%% counted. Nothing would be red anywhere. So the equality below is on
+%% the whole tuple, against a mock that only records the shapes the real
+%% coordinator accepts.
+
+%% Four elements, and the middle one is the point: the connector passed a
+%% user and a connector, and the station id was filled in by the client
+%% out of its own state. That is the only field of the tuple nobody but
+%% this process could have supplied.
+no_show_reaches_the_leader_as_the_four_tuple_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:no_show(?USER, ?CONN),
+        ok = wait_until(fun() ->
+            history_has(fun(M) -> M =:= {no_show, ?USER, 1, ?CONN} end)
+        end)
+    end).
+
+show_up_reaches_the_leader_as_the_two_tuple_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:show_up(?USER),
+        ok = wait_until(fun() ->
+            history_has(fun(M) -> M =:= {show_up, ?USER} end)
+        end)
+    end).
+
+%% At-most-once has a failure mode, and this is it: the leader is not
+%% there, the strike is lost, and that is the accepted outcome — not a
+%% crash, and not a queue that would replay it later and count it twice
+%% (vs_claim_client:no_show/2 says why).
+%%
+%% What is asserted is the *absence* of machinery. `get_route' is a call,
+%% so it cannot be answered until both casts have been handled: by the
+%% time it returns, the client has already done whatever it was going to
+%% do with them. An empty mailbox and a live process afterwards is what
+%% "nothing was buffered, nothing is being retried" looks like from
+%% outside — there is no queue to inspect because there is no queue.
+%%
+%% No sleep anywhere: the synchronisation is the call (P11).
+%%
+%% `renew_interval_ms' is pushed out of the way for the same reason the
+%% announce already is, and it is not tidiness: `client_opts/0' shortens the
+%% renew to 50 ms so the other tests can watch a batch go by, which puts a
+%% `renew_tick' in this process's mailbox twenty times a second. The queue
+%% length below would then be sampled against a timer rather than against the
+%% two casts — green on an idle machine and red on a busy one, which is
+%% exactly the shape of the flake P11 was about. With both timers at a
+%% minute there is no periodic message left, and a zero means what it says.
+penalty_events_with_an_unreachable_leader_are_dropped_test() ->
+    {ok, Client} = vs_claim_client:start_link(
+                     maps:merge(client_opts(),
+                                #{coord_nodes       => ['nonexistent@nowhere'],
+                                  renew_interval_ms => 60000})),
+    try
+        ok = vs_claim_client:no_show(?USER, ?CONN),
+        ok = vs_claim_client:show_up(?USER),
+        %% both casts have been processed by the time this returns
+        ?assertMatch({'nonexistent@nowhere', _, _},
+                     gen_server:call(vs_claim_client, get_route)),
+        ?assert(is_process_alive(Client)),
+        ?assertEqual({message_queue_len, 0},
+                     process_info(Client, message_queue_len)),
+        %% and the claim table is untouched: a penalty event is not a claim
+        %% and must not leave a trace in the reflection
+        ?assertEqual({1, []}, holds())
+    after
+        stop([Client]),
+        wait_gone([vs_claim_client]),
+        flush()
+    end.
+
+%%%===================================================================
 %%% end to end: the revocation path (claim.md §3.2, §5.4)
 %%%===================================================================
 
@@ -296,6 +374,25 @@ suspended_counts_as_charging_in_the_lobby_stats_test() ->
     %% less than the number of connectors
     ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(
                               Push([offline, suspended]))).
+
+%% M4, and the same trap one state later. `complete' and `overstay' are
+%% what a connector reports once the charge is over and the cable has not
+%% come out — the definition of an outlet that is taken and not usable —
+%% and an overstay lasts minutes where a `closing' lasts two seconds.
+%% Without their own clauses the catch-all would drop them, and the lobby
+%% would show a site as emptiest exactly when it is most blocked: the
+%% failure `suspended' taught us, in the place where it would be visible
+%% for longest.
+a_finished_charge_still_occupies_the_outlet_in_the_lobby_stats_test() ->
+    Push = fun(States) ->
+                   #{connectors => [#{connector_id => N, state => S}
+                                    || {N, S} <- lists:enumerate(States)]}
+           end,
+    ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(Push([complete]))),
+    ?assertEqual({0, 0, 1}, vs_claim_client:count_stats(Push([overstay]))),
+    %% and they add to the same total as the other occupied states
+    ?assertEqual({1, 0, 4}, vs_claim_client:count_stats(
+                              Push([free, charging, suspended, complete, overstay]))).
 
 revocation_travels_from_coordinator_to_connector_test() ->
     with_station(fun() ->
@@ -679,3 +776,81 @@ a_rebuilt_claim_with_a_stale_expiry_is_asked_about_not_dropped_test() ->
         end)
     end).
 
+
+%%%===================================================================
+%%% the durable copy of a notification (M4-A, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% Same reason as the penalty pair above: the shape on the wire is
+%% asserted where the shape is built, because getting it wrong is silent.
+%% `ErlangBridge:onNotify' reads three elements behind the tag and calls
+%% `PenaltyService.onNotify(int, String, String)'; a tuple of any other
+%% arity would be dropped by whatever it reached, with a log line nobody
+%% is reading and a notification that simply never appears.
+%%
+%% What is *not* asserted here is that the real coordinator accepts it —
+%% it does, and elsewhere: `vs_coord_srv' matches the 4-tuple and forwards
+%% it (R2 of the PR #5 review, PR #8), and its own suite asserts that. The
+%% mock is the contract's shape written down on our side of the wire, so
+%% that this suite goes red here — where the tuple is built — rather than
+%% at integration time, and it stays worth having now that both ends
+%% agree: it is what keeps them agreeing.
+
+%% Four elements. The two the manager passed became a user id, the binary
+%% name of the kind as §5.3 spells it, and the sentence — looked up in
+%% `vs_driver_proto', which is where the live frame gets it too.
+a_notification_reaches_the_leader_as_the_four_tuple_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:notify(?USER, overstay_started),
+        ok = wait_until(fun() ->
+            history_has(fun(M) ->
+                M =:= {notify, ?USER, <<"overstay_started">>,
+                       vs_driver_proto:notification_text(overstay_started)}
+            end)
+        end)
+    end).
+
+%% The page and the row say the same words, and this is where that stops
+%% being a comment. Both sides read the same table, so the assertion is
+%% that the text on the wire is byte-for-byte the text in the live frame.
+the_durable_copy_carries_the_same_sentence_as_the_live_one_test() ->
+    with_client(fun() ->
+        ok = vs_claim_client:notify(?USER, charge_complete),
+        ok = wait_until(fun() -> history_has(fun is_notify/1) end),
+        [{notify, ?USER, Kind, Text}] =
+            [M || M <- vs_mock_coord:history(), is_notify(M)],
+        #{payload := Payload} = vs_driver_proto:notification_frame(charge_complete, 3),
+        ?assertEqual(maps:get(kind, Payload), Kind),
+        ?assertEqual(maps:get(text, Payload), Text)
+    end).
+
+is_notify(M) -> is_tuple(M) andalso element(1, M) =:= notify.
+
+%% At-most-once, and its accepted failure mode: no leader, no row, no
+%% crash — and above all no queue to replay it from later. The assertion
+%% is the absence of machinery, exactly as for the penalty pair: the call
+%% below cannot be answered until the cast before it has been handled, so
+%% an empty mailbox afterwards means nothing was buffered.
+%%
+%% A notification is the one of the three where a duplicate would be
+%% harmless and it *still* has no retry: what would be protected is a
+%% convenience, and the live copy has already reached whoever was
+%% actually watching.
+a_notification_with_an_unreachable_leader_is_dropped_test() ->
+    {ok, Client} = vs_claim_client:start_link(
+                     maps:merge(client_opts(),
+                                #{coord_nodes       => ['nonexistent@nowhere'],
+                                  renew_interval_ms => 60000})),
+    try
+        ok = vs_claim_client:notify(?USER, session_interrupted),
+        ?assertMatch({'nonexistent@nowhere', _, _},
+                     gen_server:call(vs_claim_client, get_route)),
+        ?assert(is_process_alive(Client)),
+        ?assertEqual({message_queue_len, 0},
+                     process_info(Client, message_queue_len)),
+        ?assertEqual({1, []}, holds())
+    after
+        stop([Client]),
+        wait_gone([vs_claim_client]),
+        flush()
+    end.

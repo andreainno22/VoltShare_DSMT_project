@@ -649,9 +649,18 @@ authorise(Payload, VehicleId, UserId, MaxKw, Session = #{connector_id := ConnId}
             %% diverged, and the station logs it loudly". No command — the
             %% next `status' reconciles, and stopping a car that may be
             %% charging perfectly well would turn our bug into its problem.
-            logger:error("charge point channel: plugged on connector ~p, which is "
-                         "already charging or closing - physical and logical state "
-                         "have diverged", [ConnId]),
+            %%
+            %% This is also the ordinary landing place of the §6.2
+            %% re-announcement: a charge point whose socket blipped under a
+            %% live session boots, re-sends its `plugged', and the connector
+            %% — which never left `charging' (or, since M4, `complete') —
+            %% refuses it here. Nothing is lost by that: the `attach_cp' of
+            %% the boot has already cancelled the connector's grace timer,
+            %% and the session, its energy and its overstay clock were never
+            %% touched. The line is a divergence report, not a failure.
+            logger:error("charge point channel: plugged on connector ~p, which "
+                         "already has a session (charging, complete or closing) - "
+                         "physical and logical state have diverged", [ConnId]),
             {[], Session};
         {error, Other} ->
             logger:error("charge point channel: connector ~p refused plugged (~p)",

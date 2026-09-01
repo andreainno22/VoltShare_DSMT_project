@@ -43,6 +43,7 @@
 
 -export([new/1, handle_text/2, state_frame/2, wire_state/3,
          session_frame/2, session_push/3,
+         notification_frame/2, notification_text/1,
          coordinator_reachable/1]).
 
 -type frame()      :: map().
@@ -487,7 +488,12 @@ wire_connector(C, UserId) ->
 %% `offline' is the manager's word for "no process answers for this
 %% connector"; the enum of §5.1 does not have it. `out_of_service' is
 %% what it means to a driver: it exists, it cannot be used. The other
-%% four names are identical on both sides and pass through.
+%% four names of the machine are identical on both sides and pass
+%% through, and so — through the catch-all — do the three the connector
+%% *derives* rather than lives in: `suspended' since M2 step 2,
+%% `complete' and `overstay' since M4. There is one translation to make
+%% here and it is `offline'; a whitelist would only be a second place to
+%% forget a name in.
 wire_connector_state(offline)  -> out_of_service;
 wire_connector_state(free)     -> free;
 wire_connector_state(held)     -> held;
@@ -560,16 +566,31 @@ session_payload(Connector) ->
       eta_seconds      => eta_seconds(maps:get(battery_kwh, Session, 0),
                                       SocPct, PowerKw),
       started_at       => maps:get(started_at, Session, 0),
-      %% M4. §5.2 declares the field, so it travels as a zero rather than
-      %% as a missing key — the same reason `waitlist' is a constant in
-      %% §5.1 — and the semantics (net of the grace period) are already
-      %% agreed with B.
-      overstay_seconds => 0}.
+      %% M4. Read, not computed: the connector owns the grace and the
+      %% clock and puts the live net into its own snapshot, so this
+      %% channel reports a number rather than deriving a second one that
+      %% could disagree with the one written to `sessions'. The default
+      %% keeps §5.2's shape for a snapshot that has no such key — a
+      %% hand-built map in a test, a session sub-map from an older node —
+      %% the same reason `waitlist' is a declared constant in §5.1.
+      overstay_seconds => maps:get(overstay_seconds, Session, 0)}.
 
 %% §5.2's enum is `charging | suspended | complete | overstay | closed'.
-%% Three of the five are producible from a snapshot: `closed' is not
-%% derived at all — it is what `session_push/3' sends once the session has
-%% left the snapshot — and `overstay' waits for M4.
+%% All five are producible from a snapshot, and `closed' arrives by two
+%% roads: the clause below, for the settle window in which the session is
+%% ending but still in the snapshot, and `session_push/3', which sends one
+%% last frame when the session leaves the snapshot altogether. A page can
+%% therefore see `closed' more than once — the same terminal word twice,
+%% never a word taken back, which is why one road did not have to be
+%% closed to open the other (ws-driver.md §5.2).
+%%
+%% The order of the clauses is the contract's own precedence, and since M4
+%% the first two carry the weight. `complete' and `overstay' are states of
+%% the connector, decided by the state machine that owns the session and
+%% the clock, and they must win over anything derived here: a session that
+%% reached `complete' through a full battery reports `soc_pct: 100' for
+%% the whole overstay, so a `soc >= 100' clause read first would say
+%% `complete' for ever and `overstay' would never be producible at all.
 %%
 %% `suspended' is read off the connector's reported state, where M2 step 2
 %% already derives it from a limit of zero. It is deliberately **not**
@@ -577,12 +598,48 @@ session_payload(Connector) ->
 %% power is ambiguous between a starved allocation and a deep taper, and
 %% the two mean opposite things to whoever is waiting for the car.
 %%
-%% `complete' wins over `suspended' on purpose. A full battery is finished
-%% whatever the allocator did with the last few kilowatts, and telling a
-%% driver that his full car is "paused" would be a worse answer than none.
-%% If `soc_pct' never reaches 100 the phase stays `charging': the station
-%% does not know that a car has stopped asking, and saying so is better
-%% than simulating it.
+%% The `soc >= 100' clause stays, below the two states, and still earns
+%% its place: it covers the window between the `meter' that fills the
+%% battery and the transition that acts on it, and the case the station
+%% cannot act on at all — a car that reports 100 % while the connector is
+%% `suspended' by the allocator. `complete' wins over `suspended' there on
+%% purpose: a full battery is finished whatever the allocator did with the
+%% last few kilowatts, and telling a driver that his full car is "paused"
+%% would be a worse answer than none. If `soc_pct' never reaches 100 the
+%% phase stays `charging': the station does not know that a car has
+%% stopped asking, and saying so is better than simulating it.
+phase(complete, _SocPct)                                    -> complete;
+phase(overstay, _SocPct)                                    -> overstay;
+%% M4-A, from B's review. `closing' is a state of the machine like the two
+%% above and belongs with them, not in the catch-all: delivery is over and
+%% the row is imminent, so `closed' is the one word that cannot be wrong
+%% for the whole of that window, whichever road led into it. Without this
+%% the catch-all answered `charging', and a driver who had been watching
+%% `overstay' for twenty minutes saw the phase go back to "charging" for
+%% the last two seconds — with `power_kw' at zero and `overstay_seconds'
+%% still climbing under it.
+%%
+%% The window is small and it is real: `vs_connector:complete/3' on a
+%% `faulted' or `unavailable' status goes to `closing', which keeps the
+%% session in the snapshot for `CLOSING_SETTLE_MS', and the
+%% `session_interrupted' raised on the way makes the manager broadcast —
+%% so a `session' frame really is built and sent in there. (No line
+%% number: this comment outlives them, which is the lesson of the three
+%% that had to be rewritten in the same review.)
+%%
+%% **Above the `soc >= 100' clause**, and that is the whole reason this
+%% clause is here and not one line lower: a car that ended its charge full
+%% reports `soc_pct: 100' for the whole closing too, and read second this
+%% would answer `complete' — the same masking the note above describes for
+%% `overstay', one state further on.
+%%
+%% **Alternative rejected**: carry `charge_ended' in the snapshot to tell
+%% closing-from-`complete' (→ `overstay') from closing-from-a-fault
+%% (→ `charging'). Machinery threaded through the connector, the snapshot
+%% and this module for a two-second window — and it would not even settle
+%% the question, since during the grace `overstay_seconds' is 0 and the
+%% two are indistinguishable anyway. A session that is ending is ending.
+phase(closing, _SocPct)                                     -> closed;
 phase(_State, SocPct) when is_number(SocPct), SocPct >= 100 -> complete;
 phase(suspended, _SocPct)                                   -> suspended;
 phase(_State, _SocPct)                                      -> charging.
@@ -645,6 +702,92 @@ session_push(StateMap, Session, Last) ->
 %% ended instead of freezing on the last live reading.
 closed_frame(Frame = #{payload := Payload}) ->
     Frame#{payload := Payload#{phase := closed}}.
+
+%%%===================================================================
+%%% §5.3 — the notification
+%%%===================================================================
+
+%% @doc The frame of §5.3 for one kind, on one connector.
+%%
+%% A function of two values and nothing else: no session, no snapshot, no
+%% identity. Deliberately — *whether* this frame goes out to a given
+%% socket is a question about who joined it, and that question is answered
+%% by `vs_driver_ws' against the identity bound by the token (§7.3). A
+%% builder that took a session would invite the filter to be written here,
+%% where the only user id available is the one the caller passed in.
+%%
+%% `offer_expires_at' of the §5.3 example is absent, and its absence is
+%% exact rather than an omission: that field belongs to `waitlist_offer',
+%% the one kind of the seven this station cannot produce (the waitlist is
+%% not implemented — `join_waitlist' is answered as an unknown action
+%% below, and §5.1 declares the queue a constant). The other six say all
+%% they have to say with the three fields here.
+-spec notification_frame(atom(), pos_integer()) -> frame().
+notification_frame(Kind, ConnId) ->
+    #{type       => notification,
+      request_id => null,                       %% §5: server-initiated
+      payload    => #{kind         => atom_to_binary(Kind, utf8),
+                      text         => notification_text(Kind),
+                      connector_id => ConnId}}.
+
+%% @doc kind → the sentence a driver reads. One table, exported, and used
+%% by both copies of the notification.
+%%
+%% The live frame above and the durable row that `vs_claim_client:notify/2'
+%% sends to the coordinator take their text from **this** function, so the
+%% page and `notifications.jsp' say the same words about the same event.
+%% The alternative — a second table on the durable side — diverges at the
+%% second edit, and the divergence is invisible until somebody reads both
+%% screens at once.
+%%
+%% The sentences name no connector, and that is what makes one table
+%% possible: the live frame carries `connector_id' as its own field, and
+%% the durable copy has no connector to carry — `notifications' has a
+%% `kind' and a `text' and nothing else (schema.sql). A sentence with a
+%% number in it could only be built on one of the two sides.
+%%
+%% All six fit `notifications.text' (VARCHAR(255)) with room to spare, and
+%% every kind fits `notifications.kind' (VARCHAR(40)); the longest of each
+%% is checked in the tests, because a truncated sentence is the kind of
+%% defect that appears only in production and only in the database.
+-spec notification_text(atom()) -> binary().
+notification_text(reservation_expiring) ->
+    <<"Your reservation expires in less than two minutes.">>;
+notification_text(reservation_expired) ->
+    <<"Your reservation expired and the connector was released.">>;
+%% Both sites of this kind in one sentence: the coordinator can revoke a
+%% claim that is still a reservation and one that is already a charge
+%% (claim.md §5.4), and the driver is told the same thing either way —
+%% with the second half true only when there was something to stop.
+notification_text(claim_revoked) ->
+    <<"Your reservation was revoked to settle a conflict; "
+      "a charge in progress has been stopped.">>;
+notification_text(charge_complete) ->
+    <<"Your battery is full and the charge has stopped. "
+      "Please free the connector.">>;
+notification_text(overstay_started) ->
+    <<"The grace period is over: the time the car stays plugged in "
+      "is now billed.">>;
+%% `held' and the three states with a session all raise this kind, and all
+%% five sites end with the connector out of service, so the sentence says
+%% what is true on every one of them rather than what is true on most.
+notification_text(session_interrupted) ->
+    <<"The charge point failed: your reservation or session there "
+      "has ended.">>;
+%% Deliberately last, and loud — the same shape as `refusal/2' above and
+%% for the same reason. Reaching this clause means the manager decided
+%% something was news (`vs_station_mgr:durable/1') that this table has no
+%% words for: the two lists have drifted apart, which is a defect and not
+%% a driver's problem. `waitlist_offer' would land here too, and should:
+%% it is a kind of §5.3 that nothing can emit, so its arrival would mean
+%% a waitlist got implemented without anyone revisiting this table.
+%%
+%% A sentence rather than a crash because both callers are in the delivery
+%% path of somebody else's event: a `function_clause' here would take down
+%% the driver's socket, or the claim client, over a notification.
+notification_text(Other) ->
+    logger:warning("driver channel: no text for notification kind ~p", [Other]),
+    <<"Something has changed about your reservation at this station.">>.
 
 %%%===================================================================
 %%% collaborators

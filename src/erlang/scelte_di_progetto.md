@@ -2205,3 +2205,525 @@ connettori uno per uno. La stessa frase stava nella colonna «Meaning shown» di
 §4.1 ed è stata cambiata **nello stesso commit**: un test la confronta alla lettera, e un testo
 che il contratto cita e il codice non pronuncia è un contratto che ha smesso di descrivere il
 codice.
+
+## 22. L'overstay è tempo che passa, non un settimo stato (M4-A)
+
+`sessions.overstay_seconds` è stato zero cablato dalla prima riga scritta fino a M4, e il
+motivo non era una formula mancante: era che il sistema **confondeva due fatti** che il dominio
+tiene separati — la ricarica è finita, e il cavo è fuori. `stop_session` in `charging` andava
+dritto in `closing`, `settle/1` scriveva la riga nello stesso respiro, e tra la fine della
+ricarica e la scrittura non passava mai tempo che qualcuno potesse misurare. Il campo non era
+"da implementare": era **strutturalmente** sempre zero, e nessun test poteva accorgersene
+perché tutti asserivano quel comportamento.
+
+### 22.1 Uno stato nuovo, e uno derivato
+
+`complete` è uno stato vero della macchina: ci si entra dalle tre fini *morbide* — lo stop del
+driver, la batteria piena, il claim revocato — cioè tutte quelle in cui l'hardware parla
+ancora, e ci si resta finché non arriva l'`unplugged`. `overstay` **non** è un settimo stato:
+è `complete` con `now >= charge_ended_at + grazia`, derivato in `reported_state/2` esattamente
+come `suspended` è `charging` a limite zero.
+
+L'argomento è lo stesso di allora, e vale la pena scriverlo di nuovo perché la tentazione è
+identica: uno stato vero entrerebbe e uscirebbe su un valore che **scorre da solo**, firerebbe
+`enter` e `exit` per un millisecondo che passa e obbligherebbe a un `{state_timeout, Grazia, …}`
+per svegliarsi. Uno derivato non può oscillare, perché non c'è niente che oscilli — c'è un
+confronto, fatto quando qualcuno guarda. La pagina si aggiorna sul suo `STATE_TICK_MS` di 5 s,
+che per un fenomeno da minuti è più che sufficiente; misurato nella prova manuale del 30/08, la
+fase è passata a `overstay` 3 s dopo la scadenza della tolleranza.
+
+Il timer servirà, e non è un ripensamento: la notifica `overstay_started` di ws-driver §5.3 ha
+bisogno di un istante e non di un'occhiata. Quando R2 si aprirà, si aggiunge un
+`{state_timeout, Grazia, overstay}` in `complete(enter, …)` e non cambia nient'altro — lo stato
+c'è già, il campo c'è già, la derivazione resta la fonte per lo snapshot.
+
+### 22.2 Il `>=` non è pignoleria
+
+`reported_state/2` confronta con `>=` e non con `>`. Con la grazia a zero — che è come i test
+ottengono un overstay deterministico senza aspettarne uno — lo **stesso** millisecondo in cui
+la ricarica finisce deve già leggersi `overstay`, o l'asserzione dipende da quanto è veloce la
+macchina. È la lezione di P11 applicata a un operatore di confronto: un test a cronometro non
+si riconosce solo dagli `sleep`.
+
+### 22.3 Perché la riga si scrive all'unplug, e non due volte
+
+L'alternativa era scrivere la riga alla fine della ricarica e **aggiornarla** all'unplug. Costa
+due scritture per sessione, obbliga a ripensare l'idempotenza di `session_closed` (oggi:
+at-least-once su un INSERT idempotente) e fa leggere a B una riga che cambia sotto di lui. Il
+costo di non farlo è tenere la sessione in RAM qualche minuto in più, che era già vero per
+tutta la durata della ricarica.
+
+`ended_at` resta l'istante in cui **l'occupazione** finisce, cioè adesso l'unplug e non più lo
+stop. Verificato lato B prima di toccare il codice: nessuno ricalcola l'overstay dai due
+timestamp — `BillingService` e `SessionView.getOverstayMinutes()` leggono solo la colonna. La
+sola conseguenza visibile è che la durata mostrata in `history.jsp`
+(`Duration.between(startedAt, endedAt)`) adesso comprende anche l'overstay, il che è esatto:
+descrive per quanto l'outlet è stato occupato.
+
+### 22.4 Le due cose che si azzerano entrando in `complete`
+
+`power_kw` e `limit_kw` vanno a zero sull'`enter`, e nessuna delle due è cosmetica.
+
+`power_kw` viaggia nel frame §5.2 e in `complete` i `meter` vengono assorbiti: senza azzerarlo,
+la pagina del driver mostrerebbe «150 kW» per tutta la durata dell'overstay. Prima di M4 il
+difetto non era visibile perché `closing` durava due secondi.
+
+`limit_kw` è più insidioso: una colonnina che si riavvia durante l'overstay lo rilegge dal boot
+ack (`vs_cp_proto:limit_kw/2`) e `cp.js` lo riapplica. Con 150 kW nell'ack, un blip di socket
+farebbe **ripartire l'erogazione** su un tetto che la stazione aveva annullato un minuto prima.
+Zero è la parola che §5 usa già per «la sessione resta aperta e non tira niente».
+
+### 22.5 Chi legge l'enum degli stati, e uno che il piano non aveva
+
+Aggiungere due valori a `state` significa cercare per struttura chi lo legge, non chi lo
+nomina. `vs_power:is_live/1` ammette solo `charging|suspended` e quindi esclude `complete` da
+solo — la potenza torna nel pool senza toccare l'allocatore. `vs_driver_proto:wire_connector_state/1`
+ha un catch-all e li lascia passare. `vs_claim_client:count_stats/1` **no**: sarebbe finito nel
+suo catch-all e un connettore occupato da un'auto ferma sarebbe sparito dai tre numeri della
+lobby — né libero, né tenuto, né in carica. È esattamente il difetto che la clausola
+`suspended` era stata scritta per evitare, nel posto in cui sarebbe durato minuti invece di
+due secondi. Le due clausole ci sono e un test le copre.
+
+### 22.6 Il riaggancio §6 durante l'overstay: nessuna clausola è la clausola giusta
+
+`complete` non ha una clausola `plugged`, e non è una dimenticanza. Tracciato prima di
+scrivere: un `plugged` di ri-annuncio su un connettore in `charging` **non** ha mai avuto una
+clausola nemmeno lì — `handle_common` risponde `invalid_state`, `vs_cp_proto` lo logga come
+divergenza (§7.6) e non manda nessun comando. Ciò che fa funzionare il riaggancio di P4/P10 è
+un altro pezzo: l'`attach_cp` del `boot`, che in `handle_common` cancella il timer di grazia in
+**qualunque** stato. `complete` eredita quel trattamento gratis, e una clausola propria potrebbe
+solo fare peggio — rimetterebbe a zero un orologio su un'auto che non si è mossa.
+
+### 22.7 Il limite noto: una stazione che riparte durante l'overstay
+
+Se la stazione riparte mentre un connettore è in `complete`, la colonnina si riattacca e la
+sessione viene **riadottata in `charging`** (§6.2), non in `complete`: il processo connettore
+nasce in `free` e la porta d'ingresso è quella del walk-in. `charge_ended_at` è andato con il
+processo, quindi l'overstay già maturato è perso.
+
+Il piano di M4 diceva «il prossimo `meter` a soc 100 lo rimanda in `complete` e l'orologio
+riparte». Vale **solo** per l'overstay nato da una batteria piena, e solo se la colonnina
+continua a mandare `meter` dopo lo stop — il nostro emulatore, misurato, tace
+(`cp.js:343-344`, `delivering=false`). Per l'overstay nato da uno stop del driver o da una
+revoca il soc non arriverà mai a 100: il connettore resta `charging` fino all'`unplugged` e la
+riga esce con `overstay_seconds = 0`. In entrambi i casi lo scarto è a favore del driver, ed è
+questo il verso in cui deve stare.
+
+Non lo correggiamo, per la stessa ragione per cui §6 non ricostruisce la prenotazione: la
+colonnina può dire per quanto ha **erogato**, non per quanto il cavo è rimasto dentro dopo che
+l'erogazione è finita. Sarebbe un campo nuovo nel contratto per un caso raro, e chiederebbe
+all'hardware una risposta che l'hardware non ha.
+
+---
+
+## 23. Due garanzie diverse per due nature diverse: la penalità è at-most-once, deliberatamente (M4-A)
+
+La stazione osservava il no-show da M1 (`vs_connector.erl:455`, con accanto il commento
+«Reported, never written») e non lo diceva a nessuno: quel `notify` va al manager e da lì alle
+pagine aperte, non esce dalla stazione. `show_up` non lo mandava proprio nessuno, in tutto
+`src/`. Il lato ricevente era completo fino in fondo dal M4-B di B — `vs_coord_srv.erl:247-252`
+→ `vs_coord_bo:penalty_event/1` → `ErlangBridge.java:155-156` → `PenaltyService` → la colonna.
+Mancava l'anello nostro, e quindi il contatore restava a zero mentre ogni scadenza veniva
+osservata.
+
+M4-A lo chiude con due chiamate sole: `vs_claim_client:no_show/2` e `:show_up/1`, chiamate dal
+connettore, che castano al leader con `cast_leader/2`.
+
+### 23.1 Perché non riusiamo la garanzia di `session_closed`
+
+`session_closed` (§13.2) è **at-least-once su una scrittura idempotente**: l'evento sveglia uno
+sweep che rilegge una riga già committata in MySQL, quindi un duplicato costa uno sweep
+anticipato e una perdita costa un intervallo di ritardo. Nessuno *conta* quel messaggio.
+
+La penalità ha la forma opposta. Atterra su
+`UPDATE users SET no_show_count = no_show_count + 1` (`UserDao.java:139`) e **non esiste nessuna
+riga da rileggere**: quel messaggio *è* la registrazione che la prenotazione è stata mancata.
+I due modi di sbagliare quindi non si somigliano affatto:
+
+| | conseguenza |
+|---|---|
+| uno **perso** | uno strike mai contato: la sospensione arriva una prenotazione mancata più tardi |
+| uno **duplicato** | un account sospeso per un giorno dopo **una** sola prenotazione mancata, e in database non resta niente che spieghi perché |
+
+Fra un biglietto strappato e una punizione ingiusta la scelta non è in bilico. Quindi
+**at-most-once**: `cast_leader` e basta, nessuna coda, nessun retry, nessun buffer da svuotare
+quando un leader ritorna. Non è una robustezza che manca, è una robustezza che sarebbe un
+difetto — la stessa `#state{}` che tenesse la coda sarebbe la cosa che conta due volte lo
+strike al primo failover.
+
+All'orale la frase è: *la garanzia giusta non è la più forte, è quella che corrisponde alla
+natura della scrittura a valle — idempotente contro contatore.*
+
+### 23.2 Anche B ha scelto lo stesso verso, e questo è ciò che rende la scelta sicura
+
+`vs_coord_bo.erl:144-155` inoltra un `penalty_event` **solo** mentre quel coordinatore è quello
+che serve, e altrimenti lo scarta con un log. Il commento accanto dice perché: «relaying it from
+two coordinators at once would count one no-show twice — Java's counter has no way to tell the
+duplicates apart».
+
+Va letto per quello che è: **nessuno dei due lati deduplica; tutti e due evitano di duplicare.**
+Il gate di B protegge l'unico salto che poteva moltiplicare un evento (coordinatore → Java, con
+più coordinatori in gioco durante un handover); non protegge affatto una stazione che mandasse
+lo stesso `no_show` due volte, perché niente in Java distingue il secondo dal primo. È
+esattamente per questo che l'at-most-once deve valere anche dal nostro lato: siamo l'unico
+punto in cui quel duplicato si può ancora non creare.
+
+### 23.3 Un solo punto di partenza per ciascuno dei due eventi
+
+- **`no_show`** parte **solo** da `held(state_timeout, lease_expired, …)`. Le altre tre uscite
+  di `held` non sono no-show e non devono diventare strike: un `cancel` è il conducente che
+  mantiene la parola in anticipo; un `revoke` è il sistema che chiude la finestra (l'ha deciso
+  il coordinatore, non il driver — e succede anche per un failover o per un oldest-wins andato
+  storto, `claim.md` §5.5); una colonnina che smette di rispondere è un guasto nostro, e la
+  ragione del rilascio lo dice già (`cancelled`, non `expired`). SCOPE §3.3 penalizza una
+  prenotazione che **scade**, e quel timer è l'unica cosa nel sistema che la misura.
+- **`show_up`** parte **solo** dalla clausola `plugged` accettata di `held`. Non dal walk-in di
+  `free/3` (nessuna promessa da onorare) e non dall'adozione §6 (hardware che ritrova il cavo,
+  non un conducente che arriva). Il walk-in in particolare **deve** restare muto: SCOPE §3.3
+  lascia deliberatamente caricare senza prenotare a un account sospeso, e se il walk-in
+  azzerasse il contatore la sospensione verrebbe annullata proprio da ciò che continua a
+  concedere.
+
+Che i punti di partenza siano due si verifica con un `grep`; che restino due lo tengono i test,
+e i negativi valgono quanto i positivi — sono loro a rendere «un solo punto di partenza»
+un'affermazione sul comportamento invece che sul punto in cui una riga si trova oggi. Coperte:
+la scadenza e il `plugged` accettato (che devono segnalare); il `plugged` rifiutato, il `revoke`,
+la colonnina persa oltre la grazia, il `cancel` e il walk-in (che devono tacere) — il walk-in è
+una clausola di `free/3`, non un'uscita di `held`, ed è nell'elenco perché è quello che un
+lettore si aspetta di trovare fra le due.
+
+Resta senza asserzione propria una sola uscita di `held`: il `cp_status` `faulted`/`unavailable`.
+È la gemella della grazia scaduta — stessa `release(cancelled)`, stesso `session_interrupted`,
+stesso `out_of_service` — e non è coperta perché il valore marginale di un settimo test sulla
+stessa famiglia è basso, non perché sia stata dimenticata.
+
+### 23.4 La tupla si costruisce in un posto solo, e un test ne asserisce la forma
+
+Il connettore sa un utente e un connettore; la tupla di `erlang-java.md` §2.4 vuole la stazione
+in mezzo. L'elemento in più lo aggiunge il claim client (`{no_show, UserId, StationId, ConnId}`),
+perché è l'unico processo che sa di quale stazione si tratta.
+
+**Perché un test sulla forma e non solo sull'invio**: `vs_coord_srv` matcha quelle arità
+esattamente, e qualunque altra cade nel suo catch-all — un `logger:warning` in un log che
+nessuno legge, e lo strike semplicemente non contato. Non diventerebbe rosso da nessuna parte.
+Per questo `vs_mock_coord` ha ora le due clausole con la forma esatta (non un match sul solo
+tag): una `no_show` con un elemento di troppo cade nel *suo* catch-all senza essere registrata,
+come cadrebbe in quello del coordinatore vero, e il test va rosso qui invece che in silenzio in
+integrazione. Verificato mutando l'arità di proposito: 1 test rosso su 28.
+
+### 23.5 `vs_claim_null` ha dovuto crescere, `session_closed` no
+
+`vs_claim_null` non ha `session_closed/1` e continua a non averlo: il suo unico chiamante
+(`vs_station_db.erl:509`) avvolge la chiamata in un `try/catch` e tratta il fallimento come una
+sveglia best-effort persa — la riga è già in MySQL e lo sweep la trova comunque.
+
+I due nuovi non hanno quella rete. `vs_connector` li chiama dritti da `held/3`, perché non c'è
+niente su cui ripiegare, e un `undef` ucciderebbe il connettore nell'istante esatto in cui una
+prenotazione scade: una stazione con `CLAIM_MOD=vs_claim_null` perderebbe una presa a ogni
+no-show. Quindi lo stand-in deve rispondere — e lo fa rumorosamente sul `no_show`, come già fa
+sul grant, perché senza coordinatore la penalità di SCOPE §3.3 semplicemente non si applica e
+questo è un buco che va detto, non nascosto.
+
+La regola generale, che vale oltre questo caso: **una rete try/catch attorno a una chiamata
+iniettata è una decisione sul contratto del modulo iniettato**, non un dettaglio del chiamante.
+Dov'è, il modulo può omettere la funzione; dove non c'è, non può.
+
+### 23.6 Il difetto che l'E2E ha corretto nel piano
+
+Il piano si aspettava `no_show_count = 2` in MySQL dopo due scadenze. È falso, e lo è per una
+scelta di B che è giusta: `UserDao.suspendUntil` (riga 178-185) scrive
+`SET suspended_until = ?, no_show_count = 0` — «resets the streak: the penalty has been served
+on it». Al secondo strike il contatore torna a **0** e la prova che i due strike ci sono stati
+è `suspended_until`, più le due righe in `notifications`. Misurato: `no_show_count = 0`,
+`suspended_until = 2026-09-01 08:41:15`, terzo `reserve` rifiutato `SUSPENDED`.
+
+## 24. Il trittico delle garanzie si chiude, e il fan-out sta nel manager (M4-A)
+
+Ultimo pezzo di M4-A: il frame `notification` di `ws-driver.md` §5.3, che esisteva dal M1 e
+che **nessuno aveva mai emesso**. Tre buchi in fila, misurati prima di toccare il codice: il
+connettore osservava quasi tutte le notizie ma le diceva solo al manager; il manager, su ogni
+`connector_event`, faceva `reallocate` + `broadcast` di **solo stato** (`{station_state, …}`),
+buttando via l'evento che *era* la notizia; e `vs_driver_ws` non aveva una clausola per una
+notifica, né `vs_driver_proto` un builder per il frame.
+
+### 24.1 Tre nature, tre garanzie — e la terza non è una svista
+
+Con `notify` il trittico si chiude. Tutti e tre i messaggi verso il coordinatore sono una
+`cast_leader/2` e sembrano la stessa cosa; non lo sono, e la differenza sta in **cosa costa
+perderne uno e cosa costa duplicarne uno**:
+
+| Messaggio | Garanzia | Duplicato | Perdita | Perché |
+|---|---|---|---|---|
+| `session_closed` | at-**least**-once | uno sweep anticipato | un intervallo di ritardo | la riga è già in MySQL: il messaggio è una sveglia, non il dato |
+| `no_show` | at-**most**-once | una sospensione ingiusta | uno strike non contato | va su un contatore senza riga a cui appoggiarsi |
+| `notify` | at-**most**-once | **innocuo** | una comodità | una seconda riga che il driver legge una volta e archivia |
+
+Le prime due sono già §23. La terza è at-most-once **per la ragione opposta** alla seconda:
+non perché il duplicato faccia danno — non ne fa, e lo dice la patch di R2 di B — ma perché
+non c'è niente da proteggere. Chi aveva la pagina aperta ha già ricevuto la copia live; la
+riga che non arriva è la copia per chi non stava guardando. Una coda, un retry, un buffer da
+drenare al ritorno di un leader: macchinari che esisterebbero per difendere una cosa per cui
+nessuno viene addebitato. Quindi `cast_leader/2` e basta — la stessa riga, il terzo argomento
+diverso per giustificarla.
+
+**La regola che ne esce**, e che vale oltre questo caso: *at-most-once non è «la versione
+pigra di at-least-once». È una scelta che si giustifica guardando l'asimmetria fra le due
+modalità di guasto, e l'asimmetria può puntare da entrambe le parti.*
+
+### 24.2 Il fan-out sta nel manager, non nel connettore
+
+I sei kind-notizia hanno **due** sink: la pagina aperta e il coordinatore. E sono tutti già in
+volo come `connector_event`, emessi da sei clausole sparse su tre stati.
+
+Metterli nel manager costa **zero chiamate nuove in quei sei siti** e lascia un posto solo che
+sa cosa è notizia e cosa è durevole (`vs_station_mgr:durable/1`). L'alternativa — ogni clausola
+che chiama `claim_mod:notify/2` per conto suo — spargerebbe la stessa lista su sei siti di tre
+stati, dove il kind successivo va aggiunto sei volte o (peggio) cinque.
+
+Il principio «i connettori non fanno chiamate remote» è rispettato in entrambi i casi: il salto
+remoto lo fa comunque solo `cast_leader/2`, dentro il claim client. Quello che si sceglie qui è
+soltanto **dove sta la lista**.
+
+Perché allora il `no_show` parte dal connettore? Perché lì il fatto ha **un solo sink** ed è
+contabile: §2.4 dice «the station detects it», e il connettore è chi lo rileva. Le due scelte
+non si contraddicono, rispondono a due domande diverse — quanti sink ha il fatto, e chi lo sa
+per primo.
+
+### 24.3 I due timer non sono lo stesso timer, e la differenza costa una clausola
+
+Le due notifiche nuove che nascono da un timer usano **due tipi diversi di timeout**, e la
+scelta è misurata sui doc di OTP (`stdlib-8.0.3/doc/html/gen_statem.md`), non ricordata:
+
+* `overstay_started` è uno **`state_timeout`**. La doc: *«A state change cancels this timer, if
+  it is running»*. Quindi muore uscendo da `complete`: chi stacca il cavo dentro la grazia non
+  produce niente, e non c'è nessuna cancellazione da scrivere né da dimenticare.
+* `reservation_expiring` è un **timeout generico con nome** (`{{timeout, expiring}, …}`). La sua
+  sezione della doc dice cosa succede riarmandolo (*«Setting a timer with the same Name while it
+  is running will restart it»*) e **non dice nulla** sul cambio di stato: non si cancella. Deve
+  essere di questo tipo perché in `held` c'è già lo `state_timeout` del lease, e ce n'è uno solo.
+
+La seconda scelta ha un prezzo, e non è ipotetico. Il timer sopravvive a `held` e scatta dovunque
+il connettore si trovi allora. Senza una clausola in `handle_common` è un **`function_clause`**:
+`handle_common` matcha `{call,…}`, `cast`, `{timeout, cp_grace}` e `info`, e nient'altro.
+Verificato guardando, non ragionando — `sys:get_status/1` pubblica i timer vivi:
+
+```
+lease 900, in `held'    : {2, [{state_timeout,lease_expired}, {{timeout,expiring},expiring}]}
+dopo il plugged, in `charging': {1, [{{timeout,expiring},expiring}]}   ← lo state_timeout è sparito
+lease 120, in `held'    : {1, [{state_timeout,lease_expired}]}         ← e questo non è mai armato
+```
+
+Due strade lo fanno scattare fuori posto, ed è la seconda a rendere il crash *ordinario*:
+
+1. il driver arriva negli ultimi due minuti del lease → `charging` col timer ancora armato;
+2. **qualunque sessione breve**: prenoto, carico, stacco, il connettore torna `free` — e il timer
+   è ancora lì, undici minuti dopo, in uno stato che non sa cosa farsene.
+
+Non è una difesa «per prudenza»: è la conseguenza diretta della prima scelta, e i due test che la
+inchiodano guardano il timer invece di aspettarlo.
+
+**Arma-o-cancella, mai arma-o-lascia-stare.** Nel ramo `none`, `held(enter, …)` emette
+`{{timeout, expiring}, cancel}` invece di non fare nulla. Oggi non può servire — in `held` si
+entra da un solo posto e sempre con `now + lease_ms`, quindi dentro un processo o armano tutte le
+entrate o nessuna — e sta lì per una ragione più piccola e più duratura: rende lo stato del timer
+dopo `held(enter, …)` una funzione di *questa* prenotazione, invece di un fatto da ridimostrare
+ogni volta guardando il resto del modulo. Cancellare un timer che non c'è è un no-op documentato.
+
+### 24.4 Una tabella di frasi sola, e perché non sta nel claim client
+
+La frase che il driver legge sta in `vs_driver_proto:notification_text/1`, esportata, e la
+leggono **entrambe** le copie: il frame live e la tupla durevole. Un secondo posto con le stesse
+frasi diverge alla seconda modifica, e diverge in silenzio — la pagina aperta e
+`notifications.jsp` direbbero due cose sullo stesso evento e nessun test se ne accorgerebbe.
+
+Il corollario è che **le frasi non nominano il connettore**: il frame porta `connector_id` come
+campo suo, e la copia durevole non ha nessun connettore da nominare (`notifications` ha `kind` e
+`text`, schema.sql). Una frase con dentro un numero sarebbe costruibile su un lato solo dei due.
+
+`waitlist_offer` non ha una clausola nella tabella, di proposito: è il settimo kind di §5.3 e
+l'unico che nessun percorso può emettere. Cade nel catch-all rumoroso — modellato su `refusal/2`
+— così il giorno che qualcuno implementa la waitlist senza ripassare di qui, lo dice.
+
+### 24.5 Il perimetro finisce sul confine, e il mittente serve proprio a quello
+
+La clausola che riceve `{notify, …}` nel coordinatore (R2 di `nota-per-B-review-pr5.md` §2) è
+in `vs_coord/`, che è di B. Non l'abbiamo scritta, e mandiamo i cast lo stesso.
+
+Non è una posa: `vs_coord_srv.erl:279-281` logga il termine intero
+(`logger:warning("coordinator: unexpected cast ~p")`), quindi da oggi nel log del leader si
+**vede** la 4-tupla che muore. È l'argomento più efficace della nota per B — un buco visibile nei
+suoi log invece che un buco descritto a parole — e il giorno che applica la patch non c'è più
+niente da cambiare da questa parte.
+
+### 24.6 «Un duplicato è innocuo» non è la domanda giusta: la domanda è chi lo scrive già
+
+`reservation_expired` doveva essere durevole. Non lo è, e la ragione è arrivata dall'E2E invece
+che dal piano — vale la pena scriverla perché è una regola, non un caso.
+
+Nell'E2E della copia durevole la riga in `notifications` **non doveva comparire**: R2 è aperto,
+il nostro cast muore nel catch-all. Una riga è comparsa lo stesso, ed è stato il testo a
+identificarla: «Your reservation expired without the vehicle arriving. 1 of 2 …», cioè
+`PenaltyService.onNoShow:82-86`. Non la nostra — la nostra frase in tabella non c'era, e non
+c'era nessuna riga `overstay_started`, che è la prova più pulita perché per quel kind non esiste
+nessun altro produttore.
+
+Quindi R2 non era stato scavalcato. Ma la scoperta era più utile del sospetto: **la stessa
+scadenza del lease produce due messaggi verso B** — il `no_show` (che fa scrivere quella riga,
+col conteggio degli strike) e, dopo R2, il nostro `notify`. Applicata la patch, un no-show
+avrebbe scritto due righe sullo stesso fatto, e la nostra sarebbe stata la più povera delle due.
+
+L'argomento con cui `notify` era stato reso at-most-once — «un duplicato è innocuo» (§24.1) —
+è vero e **non c'entra**. Riguarda due copie *dello stesso messaggio*, non due messaggi diversi
+sullo stesso evento scritti da due produttori. La domanda che non ci eravamo posti non è «quanto
+costa un duplicato?» ma **«chi scrive già questo fatto?»**, e va posta guardando *tutti* i
+messaggi che un evento genera, non quello che si sta aggiungendo.
+
+Regola, di portata più larga del caso: **una copia durevole è per un fatto che non registra
+nessun altro.** Applicata alla tabella, lascia quattro kind durevoli — `claim_revoked`,
+`charge_complete`, `overstay_started`, `session_interrupted` — e due live-only per due ragioni
+diverse: `reservation_expiring` perché nessuno lo registra *e nessuno dovrebbe* (un avviso che
+vive due minuti), `reservation_expired` perché qualcuno lo registra già e meglio.
+
+Costo della correzione, presa prima che R2 esistesse: una riga in `durable/1`, un test, e le
+carte. Presa dopo, sarebbe stata una colonna sporca in produzione e una discussione su chi
+smette di scrivere.
+
+---
+
+## 25. Una env esposta nel compose è un'API, e si valida dove si fotografa (review M4-A)
+
+La review di B sullo stack M4-A ha trovato cinque cose. Quattro erano difetti da correggere e
+basta; una è una lezione, e una seconda è la generalizzazione di una lezione che avevamo già.
+
+### 25.1 Il difetto: `OVERSTAY_GRACE_SECONDS=-1` uccideva il connettore a ogni fine carica
+
+`vs_env:get_int/2` torna al default **solo** su `badarg`. `"-1"` è un intero perfettamente
+valido, quindi passa. L'`enter` di `complete` armava `{state_timeout, Grace * 1000, …}` nudo:
+con `Grace = -1` gen_statem rifiuta il tempo negativo e il processo termina con
+`bad_action_from_state_function`. Il connettore moriva **entrando in `complete`**, cioè a ogni
+stop del conducente, a ogni batteria piena e a ogni revoca a metà sessione — perdendo la
+sessione viva e ripartendo in `free` con l'auto ancora attaccata.
+
+Lo stesso valeva per `CLOSING_SETTLE_MS`, e da prima di M4: `pos_integer()` sul campo era
+un'annotazione, non un vincolo, e nessuno la faceva rispettare. Terzo effetto indipendente:
+con grace negativa `overstay_seconds/3` calcola `elapsed + |Grace|` e fattura secondi mai
+trascorsi.
+
+### 25.2 Perché non era teorico, che è il punto
+
+`OVERSTAY_GRACE_SECONDS` non è una variabile interna: è **esposta in `docker-compose.yml`**
+(:63-70 e :105) con un commento che invita esplicitamente a cambiarla —
+`OVERSTAY_GRACE_SECONDS=10 docker compose up -d station1`, la riga con cui abbiamo misurato
+tutto l'overstay. Un `-1` letto come «disattivato» è la prima cosa che qualcuno prova in demo.
+
+La regola, e vale al di là di questo caso: **una variabile d'ambiente esposta nel compose con
+un commento che invita a toccarla è un'API**, chiunque l'abbia scritta. Un'API valida i suoi
+input. Il posto in cui validarli è quello in cui li si **fotografa** — qui `init/1`, dove la
+nota di metodo di questo sistema dice già che le durate si leggono una volta sola alla nascita
+del processo. Un `max(0, …)` lì copre in un colpo il timer, l'aritmetica del netto e qualunque
+lettore futuro; gli stessi tre `max` messi ai punti d'uso sarebbero tre posti che devono
+restare d'accordo, e il quarto lettore non se lo ricorderebbe nessuno.
+
+Corollario sul tipo: `non_neg_integer()` su `#data.overstay_grace_s` era **un'asserzione senza
+niente che la imponesse**, e le asserzioni di quel tipo si leggono come garanzie. O c'è una riga
+di codice che le rende vere, o vanno tolte.
+
+Perché nessun nostro test ci passava: tutti passano numeri che una persona intenderebbe
+davvero. La regressione è il primo test della suite che consegna al connettore una
+configurazione **ostile** — e la consegna via `Opts`, mai via ambiente, perché una env messa in
+un test è globale al nodo e sopravvive al test che l'ha impostata (P11).
+
+### 25.3 La versione per enum della lezione §21: quattro catch-all, quattro politiche
+
+§21 dice che la firma di ritorno decide quali distinzioni sono ancora possibili a valle. B ha
+notato la stessa cosa un piano più in basso, sui **valori**: lo stesso enum di stati è
+enumerato in quattro posti — `vs_power:is_live/1`, `vs_claim_client:count_stats/1`,
+`vs_driver_proto:wire_connector_state/1` e `vs_driver_proto:phase/2` — e ognuno ha un catch-all
+con una politica diversa. §22.5 aveva già fatto il giro dei primi tre quando M4 aggiunse
+`complete` e `overstay`. `phase/2` fu saltato, e il difetto è comparso lì: `closing` cadeva nel
+suo catch-all e rispondeva `charging`, così un conducente in overstay da venti minuti vedeva la
+fase tornare a "charging" per gli ultimi due secondi prima di `closed`.
+
+La lezione non è «niente catch-all»: tre di quei quattro sono giusti e servono. È che **un
+catch-all su un enum condiviso è una decisione, e va riletta ogni volta che l'enum cambia** —
+anche quando il valore nuovo non è quello che rompe. `closing` esisteva da M2; è stata
+l'aggiunta di *altri due* valori a rendere sbagliata la risposta che il catch-all dava a lui,
+perché ha spostato il significato del default da «sta caricando» a «non è nessuno dei casi che
+ho enumerato». Il modo di trovarli è quello di §22.5: cercare per struttura chi **legge**
+l'enum, non chi lo nomina.
+
+Scelta per `phase(closing, _)`: **`closed`**. L'erogazione è finita e la riga è imminente, e
+`closed` non mente mai in quella finestra qualunque sia la strada d'arrivo. Scartata
+l'alternativa di far viaggiare `charge_ended` nello snapshot per distinguere
+closing-da-`complete` (→ `overstay`) da closing-da-guasto (→ `charging`): macchinario
+attraverso tre moduli per una finestra di due secondi, e non deciderebbe nemmeno la questione,
+perché durante la grazia `overstay_seconds` è 0 e i due casi restano indistinguibili.
+
+La clausola va **sopra** quella `soc >= 100`, non solo sopra il catch-all: un'auto che ha
+finito piena riporta `soc_pct: 100` anche mentre chiude, e letta dopo risponderebbe `complete`
+— lo stesso mascheramento che §22.5 descrive per `overstay`, uno stato più in là. Un test
+asserisce l'ordine mettendo il caso a 100.
+
+Conseguenza sul contratto, ed è nostra: ws-driver §5.2 diceva che `closed` è «il frame in più
+mandato una volta, quando la sessione esce dallo snapshot». Ora `closed` arriva per due strade
+— dallo snapshot durante il settle, e dal `session_push/3` all'uscita — e la pagina può vederlo
+più di una volta. Riga riscritta nello stesso commit: è una parola terminale che non viene mai
+ritirata, quindi un client che rende l'ultimo frame ricevuto è corretto in entrambi i casi.
+
+### 25.4 Due popolazioni di subscriber, perché due cose diverse vengono spedite
+
+`vs_station_mgr` teneva una mappa `subs` sola. I socket driver entrano dalla porta **call**
+(`subscribe/0`), il claim client dalla porta **cast** (`{subscribe, self()}`, per il feed delle
+statistiche della lobby — non può fare call qui dentro, chiuderebbe un ciclo di tre gen_server).
+Le due porte erano distinte da M1; quello che mancava era che il manager scrivesse da qualche
+parte **cosa significassero**. Risultato: ogni `driver_notification` finiva anche nella mailbox
+del claim client, per essere scartata dal suo `handle_info` catch-all — su quell'unico processo
+che sta sul percorso critico di ogni acquire, di ogni tick di renew e della ricostruzione P14.
+
+Il commento sopra `live/4` diceva «quale socket possa vederla è una domanda sul token che l'ha
+aperto, e solo quel socket sa la risposta». Vero, e scritto su una premessa falsa: **non tutti i
+subscriber erano socket**. Il filtro che quel commento rifiuta è quello per *identità*, ed è
+rifiutato perché un socket sa farlo e il manager no; allargare il fan-out a una popolazione che
+non può farne niente non è mai stato ciò che «filtrato da nessuno» voleva dire.
+
+Due mappe, `sockets` e `watchers`; lo snapshot va a entrambe, le notifiche solo ai socket. Il
+monitor resta taggato `{subscriber, Pid}` **senza** dire da quale porta è entrato: la rimozione
+tocca entrambe le mappe e un pid sta in al più una, così il tag non deve mettersi d'accordo con
+niente. Un secondo posto che registrasse la porta sarebbe un secondo posto che può sbagliare.
+L'invariante «un pid sta in al più una popolazione» è imposta all'ingresso, controllando
+entrambe le mappe e non solo quella che si sta scrivendo.
+
+E il fan-out è **uno**. Era due — `live/4` si era copiata il ciclo di `broadcast/1` perdendone
+per strada la scorciatoia sulla mappa vuota — ed è l'altra metà del rilievo di B: il giorno in
+cui l'insieme dei subscriber smette di essere una mappa nuda di pid ci deve essere un posto solo
+da cambiare. Il giorno è arrivato nella stessa review. Le due scorciatoie sopravvivono entrambe
+perché sorvegliano costi diversi: quella su `broadcast/1` evita di **costruire** lo snapshot
+(una call per connettore) quando non guarda nessuno, quella su `fan_out/2` evita il ciclo.
+
+Un secondo test guarda l'altra metà, che era quella facile da rompere aggiustando la prima: lo
+snapshot deve continuare ad arrivare a **entrambe** le popolazioni. Un claim client che smette
+di sentire la stazione smette di alimentare la lobby in silenzio, perché `station_stats` è una
+cast che nessuno riscontra.
+
+### 25.5 Il limite dichiarato: `complete` non ha un tetto, e non ne vogliamo uno
+
+B lo ha sollevato come dubbio, non come difetto, e la risposta è che è la semantica voluta. Le
+uscite di `complete` sono l'`unplugged`, un `cp_status` faulted/unavailable e il timeout
+`cp_grace` — armato solo sul `DOWN` del socket colonnina. La scadenza del lease è assorbita di
+proposito («nothing to stop»). Una colonnina che continua a mandare heartbeat col cavo dentro
+non innesca quindi nessuna uscita, e la sessione resta in RAM senza riga.
+
+Non ci mettiamo un timer, e la ragione è quella di SCOPE §3.4: l'auto è fisicamente lì, l'outlet
+è occupato davvero, e liberare il connettore dopo `settle_ms` con una macchina attaccata sarebbe
+una bugia più cara del silenzio. Il sistema può «accorgersene, avvisare, e rendere costosa
+l'attesa», non teletrasportare l'auto. Lo stato `overstay` che il connettore mostra in quella
+finestra è lo **stato vero** dell'outlet, e chi aspetta un posto lo vede.
+
+Il caso emulatore-ucciso — quello che sembra il peggiore — è già coperto, e per un'altra strada:
+muore il socket, arriva il `DOWN`, scatta `cp_grace` e la riga viene scritta con l'overstay
+maturato fino all'ultima misura (`complete({timeout, cp_grace}, …)`). Resta scoperto solo il
+firmware che heartbeata per sempre col cavo dentro. Confine dichiarato, come §22.7: se un giorno
+servirà un segnale, quello giusto è l'**incoerenza** — un `cp_status available` con il cavo che
+risulta ancora dentro, che oggi assorbiamo — non un orologio. Un orologio è codice permanente
+per un fatto temporaneo; l'incoerenza è un fatto che la colonnina ci sta già raccontando e che
+stiamo scegliendo di non ascoltare.

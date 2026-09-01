@@ -682,9 +682,10 @@ driver(UserId) -> #{user_id => UserId}.
 
 payload_of(#{payload := P}) -> P.
 
-%% §5.2, field by field. `overstay_seconds' is declared and zero rather
-%% than missing: M4 will fill it in, and until then the page renders the
-%% shape it always will.
+%% §5.2, field by field. `overstay_seconds' is zero here because a
+%% charging connector has no overstay to report, and it is read off the
+%% snapshot rather than defaulted: a sub-map without the key — this one,
+%% and any older node's — still renders the shape the contract declares.
 the_session_frame_carries_every_field_of_the_contract_test() ->
     Frame = vs_driver_proto:session_frame(station_with(charging(#{})), driver(?USER)),
     ?assertEqual(session, maps:get(type, Frame)),
@@ -769,6 +770,95 @@ the_phase_is_complete_from_the_soc_and_never_from_the_power_test() ->
                                                 session => #{soc_pct => 100}})),
                         driver(?USER))),
     ?assertEqual(complete, maps:get(phase, Both)).
+
+%% M4 — the connector's own state wins over anything derived here, and
+%% this is the assertion that says why the clause order is what it is. A
+%% session that ended because the battery filled up goes on reporting
+%% `soc_pct: 100' for the whole overstay: with the `soc >= 100' clause
+%% read first, `overstay' would be masked by `complete' for ever and the
+%% phase §5.2 declares would be one the station could never produce. The
+%% two names are decided by the process that owns the session and the
+%% clock, and this channel reports them.
+the_phase_follows_the_connector_out_of_the_grace_test() ->
+    Complete = payload_of(vs_driver_proto:session_frame(
+                            station_with(charging(#{state => complete, power_kw => 0.0,
+                                                    session => #{soc_pct => 100}})),
+                            driver(?USER))),
+    ?assertEqual(complete, maps:get(phase, Complete)),
+    Overstay = payload_of(vs_driver_proto:session_frame(
+                            station_with(charging(#{state => overstay, power_kw => 0.0,
+                                                    session => #{soc_pct => 100}})),
+                            driver(?USER))),
+    ?assertEqual(overstay, maps:get(phase, Overstay)),
+    %% and it is not the state of charge doing it: a driver who stopped a
+    %% half-full car is overstaying just as much
+    Half = payload_of(vs_driver_proto:session_frame(
+                        station_with(charging(#{state => overstay, power_kw => 0.0,
+                                                session => #{soc_pct => 41}})),
+                        driver(?USER))),
+    ?assertEqual(overstay, maps:get(phase, Half)).
+
+%% B's review of the M4-A stack. `closing' is a state of the machine that
+%% keeps its session in the snapshot for the whole of `CLOSING_SETTLE_MS',
+%% and a frame really is built in that window: `complete' on a `faulted'
+%% goes there, and the `session_interrupted' it raises on the way makes
+%% the manager broadcast. `phase/2' had no clause for it, so the catch-all
+%% answered `charging' — a driver twenty minutes into an overstay watched
+%% the phase go back to "charging" for the last two seconds of it.
+%%
+%% The three cases below are the three states of charge a session can be
+%% in when it ends, and the second is the one that fixes the clause
+%% *order*: a car that ended full still reports `soc_pct: 100' while it
+%% closes, so a `closing' clause written below the `soc >= 100' one would
+%% answer `complete' here and the assertion would go red. Same masking the
+%% `overstay' test above guards against, one state further along.
+the_phase_is_closed_while_the_session_is_settling_test() ->
+    Closing = payload_of(vs_driver_proto:session_frame(
+                           station_with(charging(#{state => closing, power_kw => 0.0,
+                                                   session => #{soc_pct => 58}})),
+                           driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Closing)),
+    Full = payload_of(vs_driver_proto:session_frame(
+                        station_with(charging(#{state => closing, power_kw => 0.0,
+                                                session => #{soc_pct => 100}})),
+                        driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Full)),
+    %% The state decides it alone, over the whole range of the other
+    %% argument: a driver who stopped a half-empty car is closing just as
+    %% much as one whose battery filled.
+    Low = payload_of(vs_driver_proto:session_frame(
+                       station_with(charging(#{state => closing, power_kw => 0.0,
+                                               session => #{soc_pct => 0}})),
+                       driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Low)),
+    %% and the rest of the frame is the ordinary §5.2 payload — the phase
+    %% is the only thing this window changes. The overstay the driver has
+    %% been watching is still under it, and still the connector's own
+    %% number: the last thing the page shows about a session is not a
+    %% blank one.
+    Settling = payload_of(vs_driver_proto:session_frame(
+                            station_with(charging(#{state => closing, power_kw => 0.0,
+                                                    session => #{overstay_seconds => 420}})),
+                            driver(?USER))),
+    ?assertEqual(closed, maps:get(phase, Settling)),
+    ?assertEqual(420, maps:get(overstay_seconds, Settling)),
+    ?assertEqual(12.317, maps:get(energy_kwh, Settling)),
+    ?assertEqual(2, maps:get(connector_id, Settling)).
+
+%% The number is the connector's, computed where the grace and the clock
+%% live, and this channel carries it without arithmetic of its own — the
+%% same figure that will be written to `sessions.overstay_seconds', so the
+%% page and the invoice cannot disagree (ws-driver.md §5.2).
+the_overstay_seconds_come_from_the_snapshot_test() ->
+    P = payload_of(vs_driver_proto:session_frame(
+                     station_with(charging(#{state => overstay, power_kw => 0.0,
+                                             session => #{overstay_seconds => 120}})),
+                     driver(?USER))),
+    ?assertEqual(120, maps:get(overstay_seconds, P)),
+    %% still the eight fields of the contract, no ninth
+    ?assertEqual(lists:sort([connector_id, phase, power_kw, energy_kwh, soc_pct,
+                             eta_seconds, started_at, overstay_seconds]),
+                 lists:sort(maps:keys(P))).
 
 %% "It is advisory and may jump when another car arrives and the allocation
 %% is recomputed — that jump is the visible proof of P5 and should not be
@@ -865,3 +955,126 @@ the_battery_size_does_not_leak_into_the_state_frame_test() ->
                  lists:sort(maps:keys(Mine))),
     %% and it is still the same session, seen from §5.1
     ?assertEqual({false, true}, {maps:get(held_by_me, Mine), maps:get(mine, Mine)}).
+
+%%%===================================================================
+%%% §5.3 — the notification, and who is allowed to see it
+%%%===================================================================
+%%
+%% The frame is built here and pushed by `vs_driver_ws'. Both halves are
+%% tested in this module because the split is the same one the module doc
+%% describes: the shape is a decision and belongs to the protocol, while
+%% the transport contributes exactly one thing — the identity filter —
+%% and that one thing is the whole of §7.3 on this frame.
+
+the_notification_frame_has_the_shape_of_5_3_test() ->
+    Frame = vs_driver_proto:notification_frame(overstay_started, 3),
+    ?assertEqual(notification, maps:get(type, Frame)),
+    %% server-initiated: there is no request to answer
+    ?assertEqual(null, maps:get(request_id, Frame)),
+    Payload = maps:get(payload, Frame),
+    ?assertEqual(lists:sort([kind, text, connector_id]),
+                 lists:sort(maps:keys(Payload))),
+    ?assertEqual(<<"overstay_started">>, maps:get(kind, Payload)),
+    ?assertEqual(3, maps:get(connector_id, Payload)),
+    ?assertEqual(vs_driver_proto:notification_text(overstay_started),
+                 maps:get(text, Payload)).
+
+%% The six kinds this station can produce, each with a sentence of its
+%% own, and each sentence short enough for the row it will become.
+%% `notifications.kind' is VARCHAR(40) and `notifications.text' is
+%% VARCHAR(255) (schema.sql): a text that did not fit would be truncated
+%% by MySQL and the defect would be visible only in the database, only in
+%% production, and only to whoever went looking.
+every_producible_kind_has_a_sentence_that_fits_the_column_test() ->
+    lists:foreach(
+      fun(Kind) ->
+          Text = vs_driver_proto:notification_text(Kind),
+          ?assert(is_binary(Text)),
+          ?assert(byte_size(Text) > 0),
+          ?assert(byte_size(Text) =< 255),
+          ?assert(byte_size(atom_to_binary(Kind, utf8)) =< 40),
+          %% and no two kinds share a sentence: a page that said the same
+          %% thing for a full battery and for a revoked claim would be a
+          %% page that said nothing
+          ?assertEqual(1, length([K || K <- kinds(),
+                                       vs_driver_proto:notification_text(K) =:= Text]))
+      end, kinds()).
+
+kinds() ->
+    [reservation_expiring, reservation_expired, claim_revoked,
+     charge_complete, overstay_started, session_interrupted].
+
+%% `waitlist_offer' is the seventh kind of §5.3 and the one nothing can
+%% emit: the waitlist is not implemented and §5.1 declares the queue a
+%% constant. It has no row in the table on purpose, so the day somebody
+%% builds a waitlist without revisiting the table, the fallback says so
+%% out loud instead of shipping a blank notification.
+an_unknown_kind_is_answered_loudly_and_not_with_a_crash_test() ->
+    Text = vs_driver_proto:notification_text(waitlist_offer),
+    ?assert(is_binary(Text)),
+    ?assert(byte_size(Text) =< 255).
+
+%%%-------------------------------------------------------------------
+%%% the push, and the filter on it
+%%%-------------------------------------------------------------------
+%%
+%% Driven through `vs_driver_ws:websocket_info/2' directly, on a state map
+%% built by hand — the same way `vs_cp_proto_tests' drives the charge
+%% point's pushes. A cowboy handler cannot be reached from EUnit without a
+%% listener and a WebSocket client; a callback can, and it is the callback
+%% that breaks if the clause is written below the catch-all.
+
+ws_state(Session) ->
+    #{session => Session, last_state => error, last_session => undefined}.
+
+%% The socket of the driver the news is about. One text frame out, and it
+%% is the §5.3 frame encoded.
+a_notification_reaches_the_socket_of_its_own_driver_test() ->
+    {[{text, Bin}], _State} =
+        vs_driver_ws:websocket_info({driver_notification, ?USER, charge_complete, 2},
+                                    ws_state(joined_session())),
+    Decoded = jsx:decode(Bin),
+    ?assertEqual(<<"notification">>, maps:get(<<"type">>, Decoded)),
+    ?assertEqual(null, maps:get(<<"request_id">>, Decoded)),
+    ?assertEqual(#{<<"kind">>         => <<"charge_complete">>,
+                   <<"text">>         => vs_driver_proto:notification_text(charge_complete),
+                   <<"connector_id">> => 2},
+                 maps:get(<<"payload">>, Decoded)).
+
+%% §7.3, and the only thing the transport contributes to this frame. The
+%% manager broadcasts one notification to every subscriber, so on a
+%% station with a dozen open pages this is the normal outcome for eleven
+%% of them: the socket of a driver the news is not about sends nothing.
+%%
+%% Note what the identity is compared against: the user id bound by the
+%% token at `join'. There is no payload in this path at all — nothing a
+%% client could send would put it on somebody else's notification list.
+another_drivers_notification_is_not_delivered_test() ->
+    %% One session, bound once: two calls to `joined_session/0' produce
+    %% two sessions that differ in the timestamp of their at-most-once
+    %% cache entry, and the assertion here is that the state comes back
+    %% *unchanged*.
+    State = ws_state(joined_session()),
+    ?assertEqual({[], State},
+                 vs_driver_ws:websocket_info({driver_notification, 999,
+                                              charge_complete, 2}, State)).
+
+%% A socket that never joined has no identity to compare with, and gets
+%% nothing — not even a notification that happens to name `undefined'.
+a_socket_that_never_joined_receives_nothing_test() ->
+    Fresh = ws_state(session()),
+    ?assertEqual({[], Fresh},
+                 vs_driver_ws:websocket_info({driver_notification, ?USER, charge_complete, 2},
+                                             Fresh)),
+    ?assertEqual({[], Fresh},
+                 vs_driver_ws:websocket_info({driver_notification, undefined,
+                                              charge_complete, 2}, Fresh)).
+
+%% The clause has to sit ABOVE the catch-all of `websocket_info/2', or a
+%% notification becomes a debug line and the page never hears about it.
+%% Testing the callback rather than reading the source is what makes that
+%% an assertion instead of a hope — the same reason the charge point's
+%% pushes are tested this way (vs_cp_proto_tests).
+an_unrelated_message_still_falls_through_to_the_catch_all_test() ->
+    State = ws_state(joined_session()),
+    ?assertEqual({[], State}, vs_driver_ws:websocket_info(something_else, State)).

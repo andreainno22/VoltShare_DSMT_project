@@ -115,9 +115,17 @@ Frees the connector immediately and releases the claim. Cancelling a reservation
   "payload": { "connector_id": 3 } }
 ```
 
-Stops charging on a connector the caller owns. The session then closes on its own: the station tells the charge point to stop, writes the session row, releases the claim and returns the power to the pool. `INVALID_STATE` if the connector is not `charging`, `NOT_YOURS` if the session belongs to another account.
+Stops charging on a connector the caller owns. The ack says the station accepted the command and nothing more. `INVALID_STATE` if the connector is not `charging`, `NOT_YOURS` if the session belongs to another account.
 
-Stopping does **not** end the overstay clock: the cable is still in the car. The grace period starts when charging ends, however it ended (§5.2).
+What follows the ack happens in two moments, not one, because ending a charge and ending an occupation are two different events:
+
+| | when | why there |
+|---|---|---|
+| the charge point is told to stop | at once | it is the only thing that can actually stop the current |
+| the connector goes to `complete` and its share of the power returns to the pool | at once | the car is not drawing any more, and holding an allocation for it would starve the cars that are |
+| the `sessions` row is written and the claim released | when the cable comes out (`unplugged`) | the row is the record of the whole occupation, and the occupation is still going on |
+
+Stopping does **not** end the overstay clock: the cable is still in the car. The grace period starts when charging ends, however it ended (§5.2) — and that is why the row cannot be written at the stop. A row written before the cable came out would have to carry an `overstay_seconds` for a period that had not happened yet; the only honest place for it is the unplug, which is also where the final energy total arrives (ws-chargepoint.md §4.4).
 
 ### 4.4 `join_waitlist` / `leave_waitlist`
 
@@ -173,7 +181,11 @@ Sent on join, on every change, and on a `STATE_TICK_MS` heartbeat. It is a **com
 }
 ```
 
-Connector `state` is one of `free`, `held`, `charging`, `closing`, `suspended`, `out_of_service`. `suspended` means an active session whose share fell below `MIN_CHARGE_KW` — the session is alive but drawing nothing, which is the honest way to show a starved allocation. `out_of_service` means the charge point is faulted or has not reported in (ws-chargepoint.md §6).
+Connector `state` is one of `free`, `held`, `charging`, `suspended`, `complete`, `overstay`, `closing`, `out_of_service`. `suspended` means an active session whose share fell below `MIN_CHARGE_KW` — the session is alive but drawing nothing, which is the honest way to show a starved allocation. `complete` means the charge has ended and the cable is still in; `overstay` is the same thing once `OVERSTAY_GRACE_SECONDS` have passed (ws-chargepoint.md §10) and the meter is running. `out_of_service` means the charge point is faulted or has not reported in (ws-chargepoint.md §6).
+
+`complete` and `overstay` appear **here**, on the station snapshot everybody sees, and not only in the session frame of §5.2 that goes to the owner. That is deliberate: this list is what a driver looking for an outlet reads, and "occupied by a car that finished twenty minutes ago" is a different fact from "occupied by a car that is charging" — it tells him whether waiting is worth it, and it is the only way the site's own pressure is visible to the person feeling it. It costs nothing: `suspended` already reaches this list by exactly the same route, one `state` derived by the connector and rendered by two pages.
+
+Neither is reservable and neither offers an action: a `reserve` on them is `ALREADY_HELD` (the outlet is physically taken) and a `stop_session` is `INVALID_STATE` (there is nothing left to stop).
 
 Why the whole snapshot rather than a delta: a client that applies deltas has state of its own, and a client with state of its own can drift from the server after one missed frame — the failure P6 exists to prevent. The payload is a handful of connectors; sending all of it costs nothing and removes an entire class of bug. `held_by_me` and `mine` are computed **server-side** from the token, so the page never has to reason about identity.
 
@@ -205,7 +217,11 @@ Sent every `SESSION_TICK_MS` to the owner of a running session, on every meter r
 }
 ```
 
-`phase` is `charging` \| `suspended` \| `complete` \| `overstay` \| `closed`. `eta_seconds` is an estimate derived from the current allocation and the vehicle's charging curve; it is advisory and may jump when another car arrives and the allocation is recomputed — that jump is the visible proof of P5 and should not be smoothed away.
+`phase` is `charging` \| `suspended` \| `complete` \| `overstay` \| `closed`. All five are the connector's own state as §5.1 reports it, read and not re-derived. `closed` covers the whole end of a session and reaches the page by two roads: while the connector is settling the session is still in the snapshot and the phase already reads `closed`, and one last frame is sent when the session leaves the snapshot, carrying the values it had. A page may therefore see `closed` more than once; it is a terminal word, never taken back, and a client that renders the last frame it received is correct either way. `eta_seconds` is an estimate derived from the current allocation and the vehicle's charging curve; it is advisory and may jump when another car arrives and the allocation is recomputed — that jump is the visible proof of P5 and should not be smoothed away.
+
+`overstay_seconds` is the **billable** figure: seconds past the end of the charge with `OVERSTAY_GRACE_SECONDS` already subtracted, so it is `0` for the whole of the grace and starts counting from the first second that will be charged for. Exactly the same number, computed by the same station in the same way, ends up in `sessions.overstay_seconds` when the row is written (erlang-java.md) — one name, one meaning, on both channels. The alternative, raw seconds on the page and net seconds in the database, would give a driver a counter that starts the moment his charge ends and an invoice that disagrees with it. What tells him the grace is running is the `phase`: it turns from `complete` to `overstay` at the moment the money starts.
+
+The field is live: it is computed when the frame is built, not when the session ends, so a page left open watches it grow. `power_kw` is `0` from `complete` onwards — the delivery is over — and `eta_seconds` is `null` for the same reason.
 
 Money never appears here. Cost is computed by the back office after the session row is written (schema.sql, ownership rules): the station knows energy and time, not tariffs applied to an account.
 
@@ -228,7 +244,31 @@ Money never appears here. Cost is computed by the back office after the session 
 
 Kinds: `reservation_expiring`, `reservation_expired`, `claim_revoked`, `waitlist_offer`, `charge_complete`, `overstay_started`, `session_interrupted`.
 
+`offer_expires_at` belongs to `waitlist_offer` alone. The other six carry exactly `kind`, `text` and `connector_id`.
+
 This frame is the **live** copy, delivered to a driver who happens to be connected. The durable copy is a different path: the station reports the event to the coordinator, which forwards it to the back office, which writes the `notifications` row (erlang-java.md). The station never writes that table — one writer per table, as the schema requires. A driver with the page closed sees it later in `notifications.jsp`; that limitation is stated in DESIGN-NOTES §7 rather than hidden.
+
+**What the station emits today, and from what.** Six of the seven kinds; `waitlist_offer` is **not producible** — the waitlist does not exist (`join_waitlist` and `leave_waitlist` are answered as unknown actions, §4.4, and §5.1 declares the queue a constant), so no code path can raise it.
+
+| Kind | Raised by | Durable copy |
+|---|---|---|
+| `reservation_expiring` | a timer at T−2min of the lease, armed only when the lease is longer than two minutes | **no** |
+| `reservation_expired` | the lease running out with nobody plugged in | **no** — the back office already writes one, see below |
+| `claim_revoked` | the coordinator revoking the claim, whether the connector is holding or charging (claim.md §5.4) | yes |
+| `charge_complete` | **the battery reaching 100 %, and only that** | yes |
+| `overstay_started` | the grace after the end of the charge running out (`OVERSTAY_GRACE_SECONDS`, §10 of ws-chargepoint.md) | yes |
+| `session_interrupted` | the charge point faulting or going silent past its grace | yes |
+
+Two of those rows are decisions and not descriptions, so they are written here rather than left to be read out of the code:
+
+* **`charge_complete` means a full battery and nothing else.** A driver who presses stop ended the charge himself and does not need to be told it ended; a revoked claim is announced by `claim_revoked`, which says something he could not have known. The kind is therefore raised on exactly one event — `target_reached` — and a page that shows it can say "your car is charged" without qualification.
+* **Two kinds have no durable copy, for two different reasons**, and the pair is the whole rule: *a durable copy exists for a fact nobody else records.*
+  * `reservation_expiring` is a warning with a two-minute life. Read the next day in `notifications.jsp` it is either wrong — the driver arrived — or redundant, because the `reservation_expired` two minutes later says how it ended.
+  * `reservation_expired` **already has a row, and a better one**. The lease timer that raises it also reports the no-show, and the back office writes a `RESERVATION_EXPIRED` notification on that path carrying the strike count ("1 of 2 — reaching 2 suspends reservations for 1 day(s)"). A second, plainer sentence about the same fact would not be redundancy but a second producer for one event, which is the defect. The station therefore sends the live frame and nothing else.
+
+  The remaining four are worth a row precisely because they are still true when they are read and nobody else records them.
+
+The sentence in `text` is one per kind and **names no connector**: `connector_id` is a field of its own here, and the durable copy has no connector to name (`notifications` has a `kind` and a `text`, schema.sql). One table of sentences, in `vs_driver_proto`, serves both copies — so what a driver reads on the open page and what he reads in `notifications.jsp` are the same words about the same event.
 
 `claim_revoked` deserves its own mention: it is not an error the client caused, it is the coordinator having resolved a conflict against this reservation (claim.md §3.2). The page says the reservation was cancelled and why, and the connector returns to `free` in the same breath.
 

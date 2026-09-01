@@ -139,7 +139,12 @@ holder_can_cancel_test() ->
         ?assertEqual(ok, vs_connector:cancel(Pid, ?USER)),
         ?assertEqual(free, state_of(Pid)),
         ?assertMatch([{release, _, cancelled}],
-                     [C || C = {release, _, _} <- vs_claim_stub:calls()])
+                     [C || C = {release, _, _} <- vs_claim_stub:calls()]),
+        %% M4-A — and it is not a no-show. A driver who cancels is keeping
+        %% their word ahead of time and giving the outlet back early, which
+        %% is the behaviour the penalty exists to encourage: charging a
+        %% strike for it would punish exactly the right thing to do.
+        ?assertEqual([], [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
     end).
 
 others_cannot_cancel_test() ->
@@ -168,6 +173,33 @@ no_show_is_reported_not_written_test() ->
         ?assertEqual([], vs_db_stub:rows())
     end).
 
+%% M4-A — and the other half: it is reported *outwards* too, which until
+%% this milestone it was not. The `notify' above never left the station.
+%%
+%% The assertion is on the whole list, not on a match: the count is the
+%% property. `no_show' is at-most-once by design (vs_claim_client:no_show/2)
+%% because it lands on `no_show_count = no_show_count + 1', so a second
+%% call is not a harmless repeat — it is a day's suspension for a driver
+%% who missed one reservation. One entry, or this test is red.
+%%
+%% `state_of/1' before the assertion is the synchronisation, not decoration:
+%% it is a gen_statem call, so it cannot be answered until the
+%% `lease_expired' callback has run to its end — which is where the
+%% claim_mod call is. Without it the read would race a line of the callback
+%% that had not happened yet. No sleep, and none needed (P11).
+lease_expiry_reports_one_no_show_to_the_coordinator_test() ->
+    with_connector(#{lease_seconds => 0}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertMatch({no_show, ?USER}, expect_event(no_show)),
+        ?assertEqual(free, state_of(Pid)),
+        %% the connector id is the third field of erlang-java.md §2.4 and
+        %% the fixture's connector is 3 — a hard-coded 3 rather than a `_'
+        %% because the whole point of carrying it is that it identifies
+        %% which outlet was wasted
+        ?assertEqual([{no_show, ?USER, 3}],
+                     [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
+    end).
+
 %%%===================================================================
 %%% authorisation at the cable
 %%%===================================================================
@@ -179,12 +211,34 @@ right_vehicle_starts_charging_test() ->
         ?assertEqual(charging, state_of(Pid))
     end).
 
+%% M4-A — the reservation was honoured, so the streak resets (SCOPE §3.3).
+%% `plugged/2' is a call, so its return is the synchronisation: the
+%% callback has finished by the time the stub is read.
+honoured_reservation_reports_the_show_up_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertEqual(ok, plug(Pid, ?VEHICLE)),
+        ?assertEqual([{show_up, ?USER}],
+                     [C || C = {show_up, _} <- vs_claim_stub:calls()])
+    end).
+
 wrong_vehicle_is_refused_and_reservation_survives_test() ->
     with_connector(fun(Pid) ->
         {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
         ?assertEqual({error, not_your_reservation}, plug(Pid, ?OTHER_VEHICLE)),
         ?assertEqual(held, state_of(Pid)),
         ?assertEqual(?USER, maps:get(held_by, vs_connector:snapshot(Pid)))
+    end).
+
+%% M4-A — somebody else's car at the cable is not the holder turning up.
+%% The reservation survives (asserted above), so the promise is still
+%% outstanding and clearing the streak now would forgive a no-show that
+%% may still happen.
+wrong_vehicle_reports_no_show_up_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertEqual({error, not_your_reservation}, plug(Pid, ?OTHER_VEHICLE)),
+        ?assertEqual([], [C || C = {show_up, _} <- vs_claim_stub:calls()])
     end).
 
 %% Walk-in on a free connector needs no claim at all — which is also what
@@ -194,6 +248,22 @@ walk_in_needs_no_claim_test() ->
         ?assertEqual(ok, plug(Pid, ?VEHICLE)),
         ?assertEqual(charging, state_of(Pid)),
         ?assertEqual([], [C || C = {acquire, _, _, _, _} <- vs_claim_stub:calls()])
+    end).
+
+%% M4-A — and it clears no streak either, for the same reason it needs no
+%% claim: nothing was ever promised, so there is nothing to honour. It is
+%% the `free/3' clause of `plugged', not the `held/3' one, and only the
+%% latter reports a show-up.
+%%
+%% This is the assertion that keeps the rule of SCOPE §3.3 coherent: a
+%% suspended driver may still walk in and charge, and if walking in
+%% cleared the counter the suspension would be undone by the very thing it
+%% deliberately still allows.
+walk_in_reports_no_show_up_test() ->
+    with_connector(fun(Pid) ->
+        ?assertEqual(ok, plug(Pid, ?VEHICLE)),
+        ?assertEqual(charging, state_of(Pid)),
+        ?assertEqual([], [C || C = {show_up, _} <- vs_claim_stub:calls()])
     end).
 
 %%%===================================================================
@@ -230,12 +300,24 @@ energy_never_goes_backwards_test() ->
         ?assertEqual(12.3, maps:get(energy_kwh, Session))
     end).
 
+%% M4 changed where the row is written on this path, and the test says so
+%% in the middle. The stop ends the CHARGE; the row is the record of the
+%% whole occupation, so it waits for the cable. What used to be asserted
+%% here — row written and connector free immediately after the stop — was
+%% the defect written down as an expectation: it left no interval for an
+%% overstay to happen in, which is exactly why `overstay_seconds' could
+%% only ever be zero.
 owner_stops_session_and_row_is_written_test() ->
     with_connector(fun(Pid) ->
         {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
         ok = plug(Pid, ?VEHICLE),
         vs_connector:meter(Pid, #{energy_kwh => 41.2, power_kw => 50.0}),
         ?assertEqual(ok, vs_connector:stop_session(Pid, ?USER)),
+        %% Nothing written, and this is not a race: `complete' has no
+        %% timer of its own, so the connector will sit here until the
+        %% hardware says the cable is out and no scheduler decides it.
+        ?assertEqual([], vs_db_stub:rows()),
+        vs_connector:unplugged(Pid, 41.2),
         ?assertMatch({session_closed, _}, expect_event(session_closed)),
         ?assertEqual(free, state_of(Pid)),
         [Row] = vs_db_stub:rows(),
@@ -262,28 +344,66 @@ failed_write_still_frees_the_connector_test() ->
         ?assertEqual([], vs_db_stub:rows())
     end).
 
-%% M2 step 3 — the decision the whole database step turns on, tested
-%% against the **real** database module with no database process running
-%% at all. `insert_session/1' is a cast, so it goes nowhere and returns
-%% immediately, and the connector walks out of `closing' at the speed of
-%% its own state machine.
+%% M2 step 3 — the decision the whole database step turns on, proved by
+%% structure rather than by a stopwatch. The **real** database module is
+%% injected, with a writer registered under its name that will never look
+%% at its mailbox: `insert_session/1' finds a live process, casts the row
+%% to it and returns, so the database is — from the connector's point of
+%% view — infinitely slow. The connector must reach `free' anyway and
+%% still answer a call.
 %%
 %% This is the shape of the failure that matters: a station whose writer
-%% is restarting, or whose MySQL is gone, must still free its outlets
-%% (SCOPE §4). A synchronous `insert_session/1' would not merely be slow
-%% here — a `gen_server:call' to a name nobody has registered exits, and
-%% the connector would go down with a physical outlet in hand.
+%% is wedged, or whose MySQL has stopped answering, must still free its
+%% outlets (SCOPE §4). A synchronous write put back into `settle/1' would
+%% hang on this writer and leave the connector in `closing' with a
+%% physical outlet in hand.
+%%
+%% P11 family — what is gone is `?assert(Micros < 300000)', a stopwatch
+%% that measured the machine in both directions: it failed under load for
+%% reasons that have nothing to do with the connector, and it stayed
+%% green for a `gen_server:call' with any timeout shorter than 300 ms,
+%% which is exactly the regression it existed to catch. Nothing here is
+%% timed. `charging' posts the `unplugged' forward as a `next_event', so
+%% `closing' and `settle/1' run before the connector looks at its mailbox
+%% again, and the `snapshot' call sent after the cast is answered on the
+%% far side of the whole ending.
 closing_does_not_wait_for_the_database_test() ->
+    Writer = wedged_writer(),
+    try
+        with_connector(#{db_mod => vs_station_db}, fun(Pid) ->
+            ok = plug(Pid, ?VEHICLE),
+            vs_connector:unplugged(Pid, 12.0),
+            ?assertEqual(free, state_of(Pid)),
+            ?assert(erlang:is_process_alive(Pid)),
+            %% and the row really was handed over: it is sitting in the
+            %% mailbox of a process that will never read it, which is what
+            %% "the connector does not wait for the write" looks like from
+            %% the database's side of the cast
+            ?assertEqual({message_queue_len, 1},
+                         erlang:process_info(Writer, message_queue_len))
+        end)
+    after
+        stop_wedged_writer(Writer)
+    end.
+
+%% A writer that is up and answers nothing. `vs_station_db' can be absent
+%% in two ways — no process at all, where `insert_session/1' logs the row
+%% and drops it at the `whereis', and a process that never gets to the row
+%% — and it is the second that puts a connector at risk, because it is the
+%% one a cast cannot tell apart from a healthy database.
+wedged_writer() ->
+    %% the name belongs to the node, so no other test may already hold it
     ?assertEqual(undefined, whereis(vs_station_db)),
-    with_connector(#{db_mod => vs_station_db}, fun(Pid) ->
-        ok = plug(Pid, ?VEHICLE),
-        {Micros, _} = timer:tc(fun() ->
-                          vs_connector:unplugged(Pid, 12.0),
-                          wait_until(fun() -> state_of(Pid) =:= free end)
-                      end),
-        ?assert(Micros < 300000),
-        ?assert(erlang:is_process_alive(Pid))
-    end).
+    Pid = spawn(fun() -> receive never_sent -> ok end end),
+    true = register(vs_station_db, Pid),
+    Pid.
+
+%% Killed and waited for: the registered name has to be free again before
+%% any other test starts a real writer under it.
+stop_wedged_writer(Pid) ->
+    Ref = erlang:monitor(process, Pid),
+    exit(Pid, kill),
+    receive {'DOWN', Ref, process, Pid, _} -> ok end.
 
 %% The row carries every column `sessions' needs, built by the connector
 %% and read by nobody else on the way — vs_station_db turns exactly this
@@ -302,7 +422,11 @@ the_written_row_carries_what_the_table_needs_test() ->
         ?assertEqual(?USER, maps:get(user_id, Row)),
         ?assertEqual(3, maps:get(connector_id, Row)),   %% the fixture's outlet
         ?assertEqual(7.5, maps:get(energy_kwh, Row)),
-        %% overstay is M4; 0 is a declared value, not a missing one
+        %% M4 — zero here means "this session never reached `complete'",
+        %% not "not implemented": the cable came out of a charging
+        %% connector, so there was never a moment when the charge was over
+        %% and the outlet still taken. `charge_ended_at' is `undefined'
+        %% and `overstay_seconds/3' answers 0 for it by its first clause.
         ?assertEqual(0, maps:get(overstay_seconds, Row)),
         ?assert(is_integer(maps:get(station_id, Row))),
         ?assert(maps:get(ended_at, Row) >= maps:get(started_at, Row))
@@ -346,6 +470,24 @@ revocation_frees_a_held_connector_test() ->
         ?assertEqual(free, state_of(Pid))
     end).
 
+%% M4-A — a revocation frees the connector, and that is where it ends. It
+%% is NOT a no-show: the coordinator closed the window, the driver never
+%% got the chance to miss it. Penalising it would punish a driver for a
+%% failover or for oldest-wins going against them (claim.md §5.5).
+%%
+%% One of the three endings of `held' that must stay silent, and the one
+%% worth nailing down: it is the only one where somebody deliberately took
+%% the reservation away, so it is the one where a strike would look
+%% plausible in the code and be wrong in the world.
+revocation_in_held_is_not_a_no_show_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        vs_connector:revoke(Pid, claim_id_of(Pid)),
+        ?assertMatch({claim_revoked, ?USER}, expect_event(claim_revoked)),
+        ?assertEqual(free, state_of(Pid)),
+        ?assertEqual([], [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
+    end).
+
 %% A revocation for a claim this connector never held is ignored: a stale
 %% message from a previous leader must not free somebody else's connector.
 stale_revocation_is_ignored_test() ->
@@ -356,14 +498,27 @@ stale_revocation_is_ignored_test() ->
         ?assertEqual(held, state_of(Pid))
     end).
 
+%% M4 — a revocation is the third soft ending, so it stops the charge and
+%% leaves the connector in `complete' rather than closing it outright. The
+%% driver is told the instant the coordinator decides; the row waits for
+%% the cable, exactly as it does for a driver's own stop. A car left
+%% plugged in after its reservation was revoked is an overstay like any
+%% other, and it used to be the one ending that could not be one.
+%% The grace is named rather than inherited from the environment: the
+%% assertion below is about the state the revocation leaves behind, and
+%% reading `complete' instead of `overstay' must not depend on an
+%% OVERSTAY_GRACE_SECONDS that happens to be set in the shell.
 revocation_stops_a_running_session_test() ->
-    with_connector(fun(Pid) ->
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
         {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
         ClaimId = claim_id_of(Pid),
         ok = plug(Pid, ?VEHICLE),
         vs_connector:meter(Pid, #{energy_kwh => 5.0}),
         vs_connector:revoke(Pid, ClaimId),
         ?assertMatch({claim_revoked, ?USER}, expect_event(claim_revoked)),
+        ?assertEqual(complete, state_of(Pid)),
+        ?assertEqual([], vs_db_stub:rows()),
+        vs_connector:unplugged(Pid, 5.0),
         ?assertMatch({session_closed, _}, expect_event(session_closed)),
         ?assertEqual(free, state_of(Pid)),
         %% the energy already delivered is still billed
@@ -628,17 +783,72 @@ a_charge_point_gone_past_the_grace_releases_the_reservation_test() ->
                      [C || C = {release, _, _} <- vs_claim_stub:calls()])
     end).
 
+%% M4-A — and it is not a no-show. The driver may well have been on their
+%% way; what failed is our hardware, and the release reason says so
+%% (`cancelled', not `expired'). Charging a strike for an outlet that
+%% stopped answering would bill the operator's fault to the customer.
+%%
+%% The last of the three silent endings of `held'. Together with the
+%% revocation above and the `cancel' — which never reaches this code at
+%% all — they are what makes the single call site of `no_show' a claim
+%% about behaviour rather than about where a line happens to sit.
+a_charge_point_gone_past_the_grace_is_not_a_no_show_test() ->
+    with_connector(#{cp_grace_ms => 100}, fun(Pid) ->
+        Cp = fake_cp(),
+        ok = vs_connector:attach_cp(Pid, Cp),
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        stop_cp(Cp),
+        ?assertMatch({session_interrupted, ?USER}, expect_event(session_interrupted)),
+        ?assertEqual(out_of_service, state_of(Pid)),
+        ?assertEqual([], [C || C = {no_show, _, _} <- vs_claim_stub:calls()])
+    end).
+
 %% "Charging that was in progress is closed with the energy last reported —
 %% a session that cannot be measured must not keep accruing cost."
+%%
+%% P11 family, and the mechanism is not the one the report named: this
+%% test never asserted a non-event. `{no_event, session_closed}' is how
+%% `expect_event/1' *fails*; what it waits for is the event itself, and
+%% in front of that event stood **two real timers in series** — the
+%% grace, and then D-2's settle window — which both had to expire inside
+%% one second. Under load they did not, and that is the whole of the
+%% intermittency (two failures, then one, then none, on three runs).
+%%
+%% Both are zero here, and zero is not "very short": for a relative
+%% time-out of 0 gen_statem starts no timer at all and enqueues the
+%% time-out event instead, so that it is handled before any event not yet
+%% received. The grace therefore fires the instant the `DOWN' is handled
+%% and the settle the instant `closing' is entered, with nothing
+%% scheduled in between — the same device the overstay tests use with
+%% `overstay_grace_s => 0'. That the grace has a *length*, and that a
+%% socket back inside it leaves no trace, is what the test two above
+%% asserts; this one is about the clause that runs when it expires.
+%%
+%% One edge stays asynchronous and no call can serialise it: the monitor
+%% `DOWN' of the killed socket is a signal from the charge point, and
+%% Erlang orders signals only between a pair of processes, so a call sent
+%% by the test carries no guarantee of arriving behind it. The
+%% notification the grace clause emits is what pins that edge down — an
+%% event the machine must produce, not a deadline it has to beat.
+%% Everything after it is a barrier and not a wait: `snapshot/1' is a
+%% call, so by the time it is answered the enqueued settle has already
+%% run, and the state, the row and the closing event are read from what
+%% is recorded rather than waited for.
 a_charge_point_gone_past_the_grace_closes_the_session_test() ->
-    with_connector(#{cp_grace_ms => 100}, fun(Pid) ->
+    with_connector(#{cp_grace_ms => 0, closing_settle_ms => 0}, fun(Pid) ->
         Cp = fake_cp(),
         ok = vs_connector:attach_cp(Pid, Cp),
         ok = plug(Pid, ?VEHICLE),
         vs_connector:meter(Pid, #{energy_kwh => 7.5, power_kw => 50.0}),
+        %% a call, so the reading is in before the socket dies. The
+        %% mailbox order already guarantees it — the cast was sent first
+        %% — but with a grace of zero the `DOWN' is acted on the moment it
+        %% is handled, and a test should say what it depends on.
+        ?assertEqual(charging, state_of(Pid)),
         stop_cp(Cp),
-        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        ?assertMatch({session_interrupted, ?USER}, expect_event(session_interrupted)),
         ?assertEqual(out_of_service, state_of(Pid)),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
         [Row] = vs_db_stub:rows(),
         ?assertEqual(7.5, maps:get(energy_kwh, Row))
     end).
@@ -923,11 +1133,19 @@ a_revocation_bills_the_total_the_hardware_reports_test() ->
 %% A reading that arrives inside the window is energy that was really
 %% delivered, and the monotone `max' of §4.3 applies here as it does in
 %% `charging'.
+%%
+%% M4 moved which ending gets here. The two tests below used to open with
+%% a driver's stop, which since M4 goes to `complete' and waits for the
+%% cable with no deadline at all — the wait IS the overstay. What still
+%% arrives in `closing' with a window to expire is the fault of §4.1: the
+%% hardware may get one last word in, and if it does not, nothing else is
+%% coming. That is the path these two now exercise, and it is the only one
+%% D-2 was ever really about.
 a_meter_inside_the_window_still_counts_test() ->
     with_connector(#{closing_settle_ms => 400}, fun(Pid) ->
         ok = plug(Pid, ?VEHICLE),
         vs_connector:meter(Pid, #{energy_kwh => 5.0, power_kw => 150.0}),
-        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:cp_status(Pid, faulted),
         vs_connector:meter(Pid, #{energy_kwh => 5.4, power_kw => 30.0}),
         ?assertMatch({session_closed, _}, expect_event(session_closed)),
         [Row] = vs_db_stub:rows(),
@@ -941,10 +1159,11 @@ a_silent_charge_point_settles_at_the_deadline_test() ->
     with_connector(#{closing_settle_ms => 120}, fun(Pid) ->
         ok = plug(Pid, ?VEHICLE),
         vs_connector:meter(Pid, #{energy_kwh => 8.0, power_kw => 50.0}),
-        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:cp_status(Pid, faulted),
         ?assertEqual([], vs_db_stub:rows()),      %% not yet
         ?assertMatch({session_closed, _}, expect_event(session_closed)),
-        ?assertEqual(free, state_of(Pid)),
+        %% §4.1 sends the connector out of service, not back to `free'
+        ?assertEqual(out_of_service, state_of(Pid)),
         [Row] = vs_db_stub:rows(),
         ?assertEqual(8.0, maps:get(energy_kwh, Row))
     end).
@@ -1190,4 +1409,503 @@ a_walk_in_has_no_claim_to_present_test() ->
         ?assertEqual([], [C || C = {acquire, _, _, _, _} <- vs_claim_stub:calls()]),
         vs_connector:claims_rebuild(Pid, self()),
         ok = no_claim_presented(Pid)
+    end).
+
+%%%===================================================================
+%%% M4 — the overstay
+%%%===================================================================
+
+%%%-------------------------------------------------------------------
+%%% the arithmetic, on timestamps nobody had to wait for
+%%%-------------------------------------------------------------------
+
+%% The four numbers agreed with B in `risposta-per-B-M2.md' §2, on the
+%% pure function so that seven minutes of overstay cost a microsecond of
+%% test. P11's rule, and the reason the function is exported at all:
+%% `vs_time' is the real clock and cannot be injected, so the only
+%% alternative would be a test that sleeps for the answer.
+the_overstay_is_the_billable_net_of_the_grace_test() ->
+    T = 1755790000000,
+    Grace = 300,
+    %% seven minutes with the cable in: two of them are billable
+    ?assertEqual(120, vs_connector:overstay_seconds(T, T + 420000, Grace)),
+    %% four minutes: inside the tolerance, nothing to bill
+    ?assertEqual(0,   vs_connector:overstay_seconds(T, T + 240000, Grace)),
+    %% the boundary second is free — the grace is a tolerance, not a trap
+    ?assertEqual(0,   vs_connector:overstay_seconds(T, T + 300000, Grace)),
+    %% and B's own example: six minutes → 60
+    ?assertEqual(60,  vs_connector:overstay_seconds(T, T + 360000, Grace)).
+
+%% Every ending that never passed through `complete' — a cable pulled out
+%% of a charging connector, a fault, a charge point past its grace. There
+%% is no interval to measure and the answer is not "zero by accident" but
+%% zero by the first clause of the function.
+a_session_that_never_completed_has_no_overstay_test() ->
+    ?assertEqual(0, vs_connector:overstay_seconds(undefined, 1755790000000, 300)),
+    %% and the grace it would have had makes no difference to that
+    ?assertEqual(0, vs_connector:overstay_seconds(undefined, 1755790000000, 0)).
+
+%%%-------------------------------------------------------------------
+%%% the state machine, with the grace set to zero so that the derivation
+%%% is deterministic instead of timed
+%%%-------------------------------------------------------------------
+
+%% A grace of zero is not a shortcut, it is the only way to assert the
+%% derivation without waiting five minutes for it: `reported_state/2'
+%% compares with `>=' precisely so that the millisecond the charge ends
+%% already reads `overstay' when the tolerance is zero.
+no_grace() -> #{overstay_grace_s => 0}.
+
+session_of(Pid) -> maps:get(session, vs_connector:snapshot(Pid)).
+
+%% B's review of the M4-A stack, and the first test in this suite that
+%% hands the connector a hostile configuration instead of a plausible one.
+%% That is why nothing here caught it: every existing test passes numbers
+%% a person would mean.
+%%
+%% `vs_env:get_int/2' falls back to its default only on `badarg', so
+%% `"-1"' is a good integer and travels: `OVERSTAY_GRACE_SECONDS=-1' put
+%% `{state_timeout, -1000, overstay_started}' in the enter of `complete',
+%% gen_statem refused the negative time, and the connector **died on every
+%% soft end of charge** — the live session lost and the process restarted
+%% in `free' with the car still plugged in. `CLOSING_SETTLE_MS=-1' did the
+%% same to `closing', and had been able to since before M4. Both knobs are
+%% exposed in `docker-compose.yml' with a comment inviting you to change
+%% them, which is what makes `-1' a thing somebody types.
+%%
+%% All three durations are negative here, so one connector's life covers
+%% the whole clamp: it is born (`cp_grace_ms'), it ends a charge
+%% (`overstay_grace_s') and it settles (`settle_ms'). Before the fix this
+%% test does not fail an assertion — it takes the test process down with
+%% the connector it is linked to, which is exactly the failure a station
+%% would have seen.
+%%
+%% The injection is through `Opts', never through the environment: an env
+%% var set in a test is global to the node and outlives the test that set
+%% it (P11).
+a_negative_duration_is_clamped_where_it_is_read_test() ->
+    Hostile = #{overstay_grace_s => -1, closing_settle_ms => -1, cp_grace_ms => -1},
+    with_connector(Hostile, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        %% alive, which is the whole of the regression
+        ?assert(is_process_alive(Pid)),
+        %% and the grace that survived is 0, not -1: the derivation reads
+        %% `overstay' at once, exactly as it does with `no_grace()'
+        ?assertEqual(overstay, state_of(Pid)),
+        %% the second effect, independent of the crash: with a grace of
+        %% -1 the net was `elapsed + 1' — a second billed before it had
+        %% gone by. `max(0, …)' at the read makes the subtraction honest.
+        ?assertEqual(0, maps:get(overstay_seconds, session_of(Pid))),
+        %% and `closing' survives its own negative timer: the row comes
+        %% out, so the settle really ran
+        vs_connector:unplugged(Pid, 9.0),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(0, maps:get(overstay_seconds, Row))
+    end).
+
+the_stop_ends_the_charge_and_starts_the_overstay_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(ok, vs_connector:stop_session(Pid, ?USER)),
+        ?assertEqual(overstay, state_of(Pid)),
+        %% the meter of the overstay has started but has counted nothing:
+        %% the net is seconds, and no second has gone by
+        ?assertEqual(0, maps:get(overstay_seconds, session_of(Pid))),
+        %% the session is still open — the row is the record of an
+        %% occupation that has not finished
+        ?assertEqual([], vs_db_stub:rows())
+    end).
+
+the_unplug_ends_the_occupation_and_writes_the_net_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ok = plug(Pid, ?VEHICLE),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:unplugged(Pid, 9.0),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        ?assertEqual(free, state_of(Pid)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(9.0, maps:get(energy_kwh, Row)),
+        %% stopped and unplugged inside the same millisecond: the column is
+        %% written, and what it says is that there was nothing to charge for
+        ?assertEqual(0, maps:get(overstay_seconds, Row)),
+        %% the claim goes back here and not a moment earlier
+        ?assertMatch([{release, _, completed}],
+                     [C || C = {release, _, _} <- vs_claim_stub:calls()])
+    end).
+
+%% Inside the tolerance the connector is `complete', not `overstay': the
+%% cable is in, the clock is running, and nobody is being charged yet.
+%% This is the same code path as the test above with one number changed,
+%% which is the point — the two names are one comparison apart.
+inside_the_grace_the_charge_is_complete_and_not_an_overstay_test() ->
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        ?assertEqual(complete, state_of(Pid)),
+        ?assertEqual(0, maps:get(overstay_seconds, session_of(Pid)))
+    end).
+
+%% `target_reached' was in ws-chargepoint.md §5 from M2 and had no sender:
+%% the station never noticed that a battery was full. The equipment reports
+%% the state of charge and the station draws the conclusion, because §7.1
+%% gives the equipment no say in when a session ends.
+a_full_battery_stops_the_charge_by_itself_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        Cp = fake_cp(),
+        ok = vs_connector:attach_cp(Pid, Cp),
+        ok = plug(Pid, ?VEHICLE),
+        ?assertMatch(#{command := set_limit}, expect_cmd(Cp)),
+        vs_connector:meter(Pid, #{energy_kwh => 45.0, power_kw => 3.0, soc_pct => 100}),
+        ?assertEqual(#{command => stop, reason => target_reached}, expect_cmd(Cp)),
+        ?assertEqual(overstay, state_of(Pid)),
+        %% the reading that ended the charge is applied, not dropped with it
+        ?assertEqual(45.0, maps:get(energy_kwh, session_of(Pid))),
+        ?assertEqual(100, maps:get(soc_pct, session_of(Pid)))
+    end).
+
+%% P14, in the state where a session now spends minutes instead of
+%% milliseconds. A `complete' that stayed silent on the rebuild would
+%% reopen the regression that was just closed, in the new place: the claim
+%% exists, this process owns it, and a client that restarted has nowhere
+%% else to look.
+a_complete_connector_presents_its_claim_on_rebuild_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = vs_claim_stub:last_claim_id(),
+        ok = plug(Pid, ?VEHICLE),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        ?assertEqual(overstay, state_of(Pid)),
+        vs_connector:claims_rebuild(Pid, self()),
+        {claim_present, Owner, Cid, Vehicle, User, ConnId, GrantedAt, ExpiresAt} =
+            claim_presented(Pid),
+        ?assertEqual(Pid, Owner),
+        ?assertEqual(ClaimId, Cid),
+        ?assertEqual(?VEHICLE, Vehicle),
+        ?assertEqual(?USER, User),
+        ?assertEqual(3, ConnId),
+        ?assert(is_integer(GrantedAt)),
+        ?assert(ExpiresAt > vs_time:now_ms())
+    end).
+
+%% The overstay that outlives the lease. There is no charge left to stop
+%% and no reservation left to hand back — `settle/1' will release at the
+%% unplug — so the only right answer is to absorb it and go on measuring.
+a_revocation_after_the_charge_has_nothing_left_to_stop_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = claim_id_of(Pid),
+        ok = plug(Pid, ?VEHICLE),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:revoke(Pid, ClaimId),
+        ?assertEqual(overstay, state_of(Pid)),
+        ?assertEqual([], vs_db_stub:rows()),
+        %% and the release still happens exactly once, at the settle
+        ?assertEqual([], [C || C = {release, _, _} <- vs_claim_stub:calls()]),
+        vs_connector:unplugged(Pid, 3.0),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        ?assertMatch([{release, _, completed}],
+                     [C || C = {release, _, _} <- vs_claim_stub:calls()])
+    end).
+
+%% Physically occupied is physically occupied: there is a car on the cable
+%% and the next driver must be sent to another outlet, not told to wait for
+%% this one. Same refusal `charging' raises, for the same reason.
+a_complete_connector_cannot_be_reserved_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        ?assertEqual({error, already_held},
+                     vs_connector:reserve(Pid, ?OTHER_USER, ?OTHER_VEHICLE)),
+        %% and the coordinator was never troubled about it
+        ?assertEqual([], [C || C = {acquire, _, _, _, _} <- vs_claim_stub:calls()])
+    end).
+
+%% The charge is over, so energy stops growing on a reading: the true
+%% total arrives with the `unplugged' and goes through `final_energy/2'.
+%% And the power the driver's page is shown is zero from the transition
+%% onwards — a frozen "150 kW" over a car that finished ten minutes ago
+%% would be a lie the two-second `closing' of M2 never had time to tell.
+a_meter_after_the_charge_changes_nothing_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 6.0, power_kw => 150.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:meter(Pid, #{energy_kwh => 99.0, power_kw => 150.0}),
+        ?assertEqual(6.0, maps:get(energy_kwh, session_of(Pid))),
+        ?assertEqual(0.0, maps:get(power_kw, vs_connector:snapshot(Pid)))
+    end).
+
+%% §4.1 in the new state: the hardware is authoritative, so the row is
+%% written with what was measured and the connector goes out of service.
+%% No `unplugged' is ever coming from equipment that has faulted, and an
+%% overstay nobody can measure is not one worth waiting for.
+a_fault_during_the_overstay_writes_the_row_test() ->
+    with_connector(no_grace(), fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 7.5, power_kw => 50.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:cp_status(Pid, faulted),
+        ?assertMatch({session_closed, _}, expect_event(session_closed)),
+        ?assertEqual(out_of_service, state_of(Pid)),
+        [Row] = vs_db_stub:rows(),
+        ?assertEqual(7.5, maps:get(energy_kwh, Row)),
+        %% the row still carries the column, and with a real value: the
+        %% overstay accrued up to the moment measurement stopped
+        ?assert(is_integer(maps:get(overstay_seconds, Row)))
+    end).
+
+%% §6.2 during an overstay. A charge point whose socket blipped boots
+%% again and re-announces the cable; the connector answers exactly as
+%% `charging' does — `invalid_state', logged by `vs_cp_proto' and dropped
+%% — and nothing about the session moves. The clock in particular does
+%% not restart: a car that never moved must not earn back its grace by
+%% the station losing a socket.
+a_replug_during_the_overstay_does_not_reset_the_clock_test() ->
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 4.0, power_kw => 50.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        Before = session_of(Pid),
+        %% the re-announcement of a live cable, refused the way `charging'
+        %% refuses it
+        ?assertEqual({error, invalid_state}, plug(Pid, ?VEHICLE)),
+        ?assertEqual(complete, state_of(Pid)),
+        After = session_of(Pid),
+        %% same session, same energy, same start — nothing was adopted
+        ?assertEqual(maps:get(started_at, Before), maps:get(started_at, After)),
+        ?assertEqual(4.0, maps:get(energy_kwh, After)),
+        %% and the attach of the boot still cancels the grace timer from
+        %% anywhere, which is what makes the blip cost nothing at all
+        Cp = fake_cp(),
+        ?assertEqual(ok, vs_connector:attach_cp(Pid, Cp)),
+        ?assertEqual(complete, state_of(Pid))
+    end).
+
+%%%===================================================================
+%%% M4-A — the notifications of ws-driver.md §5.3
+%%%===================================================================
+%%
+%% Three of the six kinds are born here; the other three
+%% (`reservation_expired', `claim_revoked', `session_interrupted') were
+%% already being emitted and are covered by the tests above. What the
+%% manager then does with any of them is vs_station_mgr_tests.
+
+%% Collects the tags of every event up to and including `Until'.
+%%
+%% `expect_event/1' cannot answer a question about ABSENCE: it drops
+%% everything it scans past on the way to the tag it wants, so a
+%% notification that should not have been emitted is eaten in silence by
+%% the very call that was supposed to notice it. Every "and nothing else
+%% was said" assertion below therefore reads the whole run instead.
+events_until(Until) -> events_until(Until, []).
+
+events_until(Until, Acc) ->
+    receive
+        {connector_event, _ConnId, Event} when element(1, Event) =:= Until ->
+            lists:reverse([Until | Acc]);
+        {connector_event, _ConnId, Event} ->
+            events_until(Until, [element(1, Event) | Acc])
+    after 1000 ->
+        erlang:error({no_event, Until, lists:reverse(Acc)})
+    end.
+
+count(Tag, Tags) -> length([T || T <- Tags, T =:= Tag]).
+
+%% gen_statem publishes its live timers in `sys:get_status/1'. That is
+%% what makes the two tests below possible at all under P11: an
+%% `expiring' timer cannot fire in less than two minutes by construction
+%% (its delay is `Remaining - 120000', and it exists only while
+%% `Remaining' is larger), so the only honest way to ask "was it armed?"
+%% is to look, rather than to wait.
+%%
+%% Read defensively — the shape of the status is OTP's, not ours.
+timers_of(Pid) ->
+    {_Count, Timers} = status_field(Pid, "Time-outs"),
+    lists:sort([Type || {Type, _Content} <- Timers]).
+
+%% The state machine's OWN state, as against the one `snapshot/1' reports.
+%% The two differ on purpose in `complete' (see `reported_state/2'), and
+%% the difference is the whole design of the overstay: `overstay' is
+%% derived from a clock, not entered.
+fsm_state_of(Pid) ->
+    {FsmState, _Data} = status_field(Pid, "State"),
+    FsmState.
+
+status_field(Pid, Key) ->
+    {status, _Pid, _Mod, Items} = sys:get_status(Pid),
+    case find_kv(Key, Items) of
+        not_found -> erlang:error({not_in_status, Key});
+        Found     -> Found
+    end.
+
+find_kv(Key, [{data, KVs} | Rest]) ->
+    case lists:keyfind(Key, 1, KVs) of
+        {_Key, Value} -> Value;
+        false         -> find_kv(Key, Rest)
+    end;
+find_kv(Key, [Item | Rest]) when is_list(Item) ->
+    case find_kv(Key, Item) of
+        not_found -> find_kv(Key, Rest);
+        Found     -> Found
+    end;
+find_kv(Key, [_Other | Rest]) -> find_kv(Key, Rest);
+find_kv(_Key, [])             -> not_found.
+
+%%%-------------------------------------------------------------------
+%%% reservation_expiring — the arithmetic and the arming
+%%%-------------------------------------------------------------------
+
+%% The three numbers of PIANO_NOTIFY §8. The boundary is the interesting
+%% one: at exactly two minutes left the notice would be born already due,
+%% so there is none.
+expiring_delay_counts_back_two_minutes_test() ->
+    ?assertEqual(780000, vs_connector:expiring_delay(900000)),
+    ?assertEqual(none,   vs_connector:expiring_delay(90000)),
+    ?assertEqual(none,   vs_connector:expiring_delay(120000)).
+
+%% A quarter-hour lease is warned about; a two-minute one is not, and the
+%% difference is visible from outside without waiting for either.
+expiring_is_armed_only_for_a_lease_worth_warning_about_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        %% sorted, and an atom sorts before a tuple
+        ?assertEqual([state_timeout, {timeout, expiring}], timers_of(Pid))
+    end),
+    with_connector(#{lease_seconds => 120}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertEqual([state_timeout], timers_of(Pid))
+    end).
+
+%% **Why `handle_common' needs a clause for `{timeout, expiring}'**, shown
+%% rather than argued. The lease timer is a `state_timeout' and is gone
+%% the moment the state changes; the `expiring' one is a *named generic*
+%% timeout and is still running in `charging', a state whose callback has
+%% no clause for it — so when it fires it reaches `handle_common', and
+%% without the clause there that is a `function_clause' and a dead
+%% connector under a car that is charging.
+%%
+%% It takes an ordinary driver arriving with two minutes to spare. What
+%% cannot be asserted here is the firing itself: the delay is
+%% `Remaining - 120000' with `Remaining' coming from a lease measured in
+%% whole seconds, so the smallest one obtainable is 1000 ms — twenty
+%% times the sleep P11 allows. The mechanism is what this pins down.
+the_expiring_timer_outlives_the_state_that_armed_it_test() ->
+    with_connector(fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ?assertEqual([state_timeout, {timeout, expiring}], timers_of(Pid)),
+        ok = plug(Pid, ?VEHICLE),
+        ?assertEqual(charging, state_of(Pid)),
+        %% the lease timer died with `held'; the other one did not
+        ?assertEqual([{timeout, expiring}], timers_of(Pid))
+    end).
+
+%%%-------------------------------------------------------------------
+%%% charge_complete — only from a full battery, and only once
+%%%-------------------------------------------------------------------
+
+a_full_battery_notifies_the_driver_once_test() ->
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 40.0, power_kw => 90.0, soc_pct => 99}),
+        vs_connector:meter(Pid, #{energy_kwh => 41.0, power_kw => 20.0, soc_pct => 100}),
+        ?assertEqual(complete, state_of(Pid)),
+        %% a second full reading, now absorbed by `complete'. It must not
+        %% produce a second notification: the frame is a notice, and a
+        %% notice repeated on every meter tick is a page nobody can read.
+        vs_connector:meter(Pid, #{energy_kwh => 41.2, soc_pct => 100}),
+        vs_connector:unplugged(Pid, 41.2),
+        Tags = events_until(session_closed),
+        ?assertEqual(1, count(charge_complete, Tags))
+    end).
+
+%% The product decision of §5.3, as a test. A driver who pressed stop
+%% knows the charge is over — he ended it — and a revoked claim already
+%% says why on its own kind. `charge_complete' means one thing only: the
+%% battery filled up.
+only_a_full_battery_says_charge_complete_test() ->
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 10.0, power_kw => 50.0, soc_pct => 60}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:unplugged(Pid, 10.0),
+        ?assertEqual(0, count(charge_complete, events_until(session_closed)))
+    end),
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ClaimId = claim_id_of(Pid),
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 5.0, power_kw => 50.0, soc_pct => 40}),
+        vs_connector:revoke(Pid, ClaimId),
+        vs_connector:unplugged(Pid, 5.0),
+        Tags = events_until(session_closed),
+        ?assertEqual(0, count(charge_complete, Tags)),
+        %% and the kind that path DOES produce is there
+        ?assertEqual(1, count(claim_revoked, Tags))
+    end).
+
+%%%-------------------------------------------------------------------
+%%% overstay_started — the timer that only speaks
+%%%-------------------------------------------------------------------
+
+%% Grace 0, so the timeout is not scheduled at all but enqueued ahead of
+%% any external event still to arrive (gen_statem, `state_timeout': "if
+%% Time is relative and 0 ... the time-out event is enqueued"). The test
+%% is therefore deterministic and not a race won on a fast machine.
+the_grace_running_out_notifies_the_driver_test() ->
+    with_connector(#{overstay_grace_s => 0}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 12.0, power_kw => 50.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        ?assertMatch({overstay_started, ?USER}, expect_event(overstay_started)),
+        %% The timer said something; it did not move the machine. The
+        %% state machine is still in `complete' — there is no `overstay'
+        %% state to be in — while `snapshot/1' reports `overstay' because
+        %% `reported_state/2' derives it from the clock and the grace,
+        %% which have been past due since the charge ended. The two
+        %% answers below are the separation this pair was designed for,
+        %% and they would collapse into one the day somebody turned the
+        %% notification into a transition.
+        ?assertEqual(complete, fsm_state_of(Pid)),
+        ?assertEqual(overstay, state_of(Pid))
+    end).
+
+a_grace_still_running_says_nothing_test() ->
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 12.0, power_kw => 50.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        ?assertEqual(complete, state_of(Pid)),
+        vs_connector:unplugged(Pid, 12.0),
+        ?assertEqual(0, count(overstay_started, events_until(session_closed)))
+    end).
+
+%% The reason the timer is a `state_timeout' and not a generic one: a
+%% driver who takes the cable out inside the grace leaves the state, the
+%% timer dies with it, and nobody has to remember to cancel anything.
+unplugging_inside_the_grace_cancels_the_notice_test() ->
+    with_connector(#{overstay_grace_s => 3600}, fun(Pid) ->
+        {ok, _} = vs_connector:reserve(Pid, ?USER, ?VEHICLE),
+        ok = plug(Pid, ?VEHICLE),
+        vs_connector:meter(Pid, #{energy_kwh => 7.0, power_kw => 50.0}),
+        ok = vs_connector:stop_session(Pid, ?USER),
+        vs_connector:unplugged(Pid, 7.0),
+        Tags = events_until(session_closed),
+        ?assertEqual(0, count(overstay_started, Tags)),
+        ?assertEqual(free, state_of(Pid)),
+        %% The overstay timer is gone with its state and left nothing
+        %% behind. The `expiring' one is still here — in `free', on a
+        %% connector nobody has reserved — and that is the second and
+        %% more ordinary half of why `handle_common' must absorb it: not
+        %% only the driver who arrives in the last two minutes, but every
+        %% short session at all. It fires eleven minutes from now into
+        %% whatever state this connector is then in, and with no clause
+        %% for it that firing is a crash.
+        ?assertEqual([{timeout, expiring}], timers_of(Pid))
     end).

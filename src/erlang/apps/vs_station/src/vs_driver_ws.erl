@@ -152,6 +152,33 @@ websocket_info(join_timeout, State = #{session := Session}) ->
         false -> {[{close, 4401, <<>>}], State}
     end;
 
+%% M4-A — the notification of §5.3, at last with a sender. The manager
+%% broadcasts one of these to every subscriber on a connector event that
+%% is *news*; each socket decides for itself whether the news is its own.
+%%
+%% **The filter is the head of the clause**, and it is the identity rule
+%% of §7.3 written as a pattern: `UserId' appears twice, so the message is
+%% delivered only when the user it names is the user the token bound at
+%% `join'. Nothing here reads a payload, and there is nothing a client
+%% could send that would change which notifications it receives — which
+%% is the property that matters, because this frame is the only one on
+%% this channel that talks about one driver rather than about the station.
+%%
+%% `authenticated := true' is not redundant with it: a socket that never
+%% joined has `user_id => undefined', and `undefined' is a term like any
+%% other. One day something upstream will pass an unset user through, and
+%% on that day this must not become a broadcast to every open page.
+websocket_info({driver_notification, UserId, Kind, ConnId},
+               State = #{session := #{authenticated := true,
+                                      user_id       := UserId}}) ->
+    {text_frames([vs_driver_proto:notification_frame(Kind, ConnId)]), State};
+
+%% Somebody else's news, or nobody's yet. Silence, and no log: on a
+%% station with a dozen open pages this is the *normal* outcome for
+%% eleven of them.
+websocket_info({driver_notification, _Other, _Kind, _ConnId}, State) ->
+    {[], State};
+
 %% §3: 1001 when the station is shutting down, so the page knows to come
 %% back with backoff instead of showing an error. Sent by
 %% vs_station_app:stop/1 before the listener goes.

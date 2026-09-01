@@ -77,6 +77,10 @@
 -export([coordinator_reachable/0]).
 %% from vs_station_db, after the row is in MySQL
 -export([session_closed/1]).
+%% from the connector, when a reservation is missed or honoured (M4)
+-export([no_show/2, show_up/1]).
+%% from the station manager, for the durable copy of a driver notification
+-export([notify/2]).
 %% lifecycle
 -export([start_link/0, start_link/1]).
 %% pure, and exported so the lobby's three numbers can be tested on a map
@@ -201,6 +205,97 @@ session_closed(Event) ->
     gen_server:cast(?MODULE, {session_closed, Event}).
 
 %%%===================================================================
+%%% the penalty events (M4, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% Two casts with no queue behind them, and the missing queue is the
+%% decision — not a corner that was cut.
+%%
+%% `session_closed/1' above is **at-least-once**: it wakes a sweep that
+%% re-reads a row already committed to MySQL, so a duplicate costs one
+%% early sweep and a loss costs one interval of delay. Nothing about it is
+%% counted.
+%%
+%% A no-show is the opposite shape. It lands on
+%% `UPDATE users SET no_show_count = no_show_count + 1' (UserDao) and
+%% there is no row anywhere that could be re-read to repair it: this
+%% message IS the record that the reservation was missed. So the two
+%% failure modes are not symmetrical —
+%%
+%%   * one lost: a strike never counted. A suspension arrives one missed
+%%     reservation later than it should. The rule exists to stop a habit,
+%%     and a habit keeps producing events.
+%%   * one duplicated: an account suspended for a day after missing ONE
+%%     reservation, with nothing in the database to show why.
+%%
+%% — and between a torn ticket and an unjust punishment the choice is not
+%% close. Hence **at-most-once**: `cast_leader/2` and nothing else, no
+%% retry, no buffer to drain when a leader comes back.
+%%
+%% B's half reads the same way round and is what makes this safe rather
+%% than merely cheap: `vs_coord_bo:handle_cast({penalty_event, …})' only
+%% forwards while that coordinator is the serving one, and drops it
+%% otherwise, "because relaying it from two coordinators at once would
+%% count one no-show twice — Java's counter has no way to tell the
+%% duplicates apart". Neither side deduplicates; both sides avoid
+%% duplicating.
+
+%% @doc A reservation expired with nobody arriving. Called by
+%% `vs_connector' from the lease timer of `held', and from nowhere else.
+%%
+%% The connector passes the two things it knows; the station id is added
+%% here because this is where it lives.
+-spec no_show(pos_integer(), pos_integer()) -> ok.
+no_show(UserId, ConnId) ->
+    gen_server:cast(?MODULE, {no_show, UserId, ConnId}).
+
+%% @doc The driver turned up and the streak resets — "consecutive" is the
+%% whole of SCOPE §3.3. Called by `vs_connector' from the `plugged' it
+%% accepts on a reservation, and from nowhere else: a walk-in never
+%% promised to come.
+-spec show_up(pos_integer()) -> ok.
+show_up(UserId) ->
+    gen_server:cast(?MODULE, {show_up, UserId}).
+
+%%%===================================================================
+%%% the durable copy of a notification (M4-A, erlang-java.md §2.4)
+%%%===================================================================
+%%
+%% Third garanzia, third nature — and the trittico is worth stating in
+%% one place because all three look like "a cast to the leader" and none
+%% of them mean the same thing:
+%%
+%%   * `session_closed' is **at-least-once**. It wakes a sweep over a row
+%%     already committed to MySQL. A duplicate costs one early sweep; a
+%%     loss costs one interval of delay. Idempotent by construction.
+%%   * `no_show' is **at-most-once**. It lands on a counter with no row
+%%     behind it, so a duplicate is an unjust suspension and a loss is a
+%%     strike uncounted. The asymmetry decides: see above.
+%%   * `notify' is **at-most-once too, for the opposite reason**. The
+%%     duplicate here is harmless — B's own patch for R2 says so: a
+%%     second row in `notifications' is a line the driver reads once and
+%%     dismisses, and nothing counts it. What a loss costs is a
+%%     convenience: the page that was open already showed the live copy,
+%%     and the row that never arrived was the copy for a driver who was
+%%     not looking. Neither outcome is worth a queue, a retry timer, or a
+%%     buffer to drain when a leader comes back — machinery that would
+%%     exist to protect something nobody is billed for.
+%%
+%% So: `cast_leader/2' and nothing else. Same one line, three different
+%% arguments for it.
+
+%% @doc The durable half of a driver notification. Called by
+%% `vs_station_mgr' on the four kinds of ws-driver.md §5.3 that are worth
+%% a row **and have no other producer**, and from nowhere else.
+%%
+%% The text is not a parameter. It comes from `vs_driver_proto', which is
+%% where the live frame gets it too, so `notifications.jsp' and the open
+%% page cannot end up saying two different things about one event.
+-spec notify(pos_integer(), atom()) -> ok.
+notify(UserId, Kind) ->
+    gen_server:cast(?MODULE, {notify, UserId, Kind}).
+
+%%%===================================================================
 %%% lifecycle
 %%%===================================================================
 
@@ -322,6 +417,48 @@ handle_cast({leader_hint, Node}, State) ->
 %% nobody is reading and a receipt that never arrives.
 handle_cast({session_closed, Event}, State = #state{leader = Leader}) ->
     cast_leader(Leader, {session_closed, Event}),
+    {noreply, State};
+
+%% M4 — and note that the message which LEAVES is not the message that
+%% arrived. The connector knows a user and one of its own connectors; the
+%% tuple of erlang-java.md §2.4 wants the station between them, and
+%% `vs_coord_srv' matches that arity exactly. Three elements in, four out,
+%% and the extra one comes from this process because this process is the
+%% one that knows which station it is.
+%%
+%% Getting that wrong is silent in both directions: a three-element
+%% `no_show' on the wire falls into the coordinator's catch-all, which
+%% logs "unexpected cast" into a log nobody is reading, and the strike is
+%% simply never counted. Same trap as `session_closed' above, same fix —
+%% build the tuple in one place and assert its shape in a test.
+handle_cast({no_show, UserId, ConnId},
+            State = #state{leader = Leader, station_id = StationId}) ->
+    cast_leader(Leader, {no_show, UserId, StationId, ConnId}),
+    {noreply, State};
+
+handle_cast({show_up, UserId}, State = #state{leader = Leader}) ->
+    cast_leader(Leader, {show_up, UserId}),
+    {noreply, State};
+
+%% M4-A — the 4-tuple of erlang-java.md §2.4, built here and only here.
+%% Two elements in, four out: the kind becomes the binary name of §5.3 and
+%% the sentence is looked up, so the shape `ErlangBridge:onNotify' reads
+%% (`intOf', `textOf', `textOf') is decided in one place and asserted in
+%% one test.
+%%
+%% The far end matches it: `vs_coord_srv' has its own `notify' clause and
+%% forwards to `vs_coord_bo', ungated — B applied it as R2 of the PR #5
+%% review. The hop is whole from this cast to the `notifications' row.
+%%
+%% It went out before that clause existed, and that was the right call
+%% then for the reason it stays right now: this side owes the event, and a
+%% station that withholds it until the far end is ready has an untested
+%% path on the day it becomes ready. Sending into a catch-all cost one log
+%% line and turned an argument about a missing hop into evidence. The
+%% history is in `nota-per-B-review-pr5.md' §2 and belongs there.
+handle_cast({notify, UserId, Kind}, State = #state{leader = Leader}) ->
+    cast_leader(Leader, {notify, UserId, atom_to_binary(Kind, utf8),
+                         vs_driver_proto:notification_text(Kind)}),
     {noreply, State};
 
 %% P14 — a connector answering the `{claims_rebuild, …}' this process
@@ -801,6 +938,14 @@ req_id() ->
 %% connector is neither free nor held — somebody's car is plugged into it
 %% and the session is alive — so a lobby that showed it as available
 %% would send the next driver to an outlet that is already taken.
+%%
+%% M4 adds two more of the same kind, and they are the ones the rule was
+%% written for. `complete' and `overstay' are what a connector reports
+%% once the charge is over and the cable is still in — the definition of
+%% an outlet that is occupied and not yet usable — and an overstay lasts
+%% minutes, not the two seconds a `closing' does. Dropped into the
+%% catch-all they would take the whole point of the lobby with them: the
+%% site would look emptier exactly when it is most blocked.
 count_stats(#{connectors := Connectors}) ->
     lists:foldl(fun(C, {F, H, Ch}) ->
                         case maps:get(state, C, offline) of
@@ -808,6 +953,8 @@ count_stats(#{connectors := Connectors}) ->
                             held      -> {F, H + 1, Ch};
                             charging  -> {F, H, Ch + 1};
                             suspended -> {F, H, Ch + 1};
+                            complete  -> {F, H, Ch + 1};
+                            overstay  -> {F, H, Ch + 1};
                             closing   -> {F, H, Ch + 1};
                             _         -> {F, H, Ch}
                         end
