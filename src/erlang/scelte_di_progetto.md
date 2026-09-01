@@ -2727,3 +2727,95 @@ servirà un segnale, quello giusto è l'**incoerenza** — un `cp_status availab
 risulta ancora dentro, che oggi assorbiamo — non un orologio. Un orologio è codice permanente
 per un fatto temporaneo; l'incoerenza è un fatto che la colonnina ci sta già raccontando e che
 stiamo scegliendo di non ascoltare.
+
+## 26. Chi si accorge di un guasto: il timeout applicativo, non il tick della distribuzione (misurato, M3-A coda)
+
+Misurato il 1 settembre partizionando davvero il leader
+(`docker network disconnect voltshare_voltshare coord3`, cioè senza FIN: il nodo resta acceso
+e cieco). Sta qui e non solo in `PROGRESS` perché è la risposta a una domanda che all'orale
+arriva quasi certamente — *«e se un nodo non muore ma smette di rispondere, quanto ci mettete
+ad accorgervene?»* — e perché la risposta contraddice l'intuizione che tutti hanno, compresi
+noi mentre scrivevamo il piano.
+
+### 26.1 Tre orologi, e quello che sembra il più importante è il più lento
+
+Quando il leader viene isolato, tre meccanismi possono accorgersene. Misurati, sulla stessa
+corsa:
+
+| meccanismo | dove | quando è scattato |
+|---|---|---|
+| heartbeat dei coordinatori | `vs_coord_membership`, 1000 ms × 3 | **2,29 s** (elezione compresa) |
+| `who_do_you_hold` del leader nuovo | `vs_coord_rebuild` → `vs_claim_client` | **2,29 s**, dentro la stessa risposta |
+| timeout della `call` di renew | `vs_claim_client:call_one/3`, 2000 ms | **mai**: non ne ha avuto bisogno |
+| tick della distribuzione Erlang | `net_ticktime`, default **60 s** | **64,6 s** (e 72,5 s in un'altra corsa) |
+
+**Il tick arriva ventotto volte più tardi di tutto il resto, e quando arriva non scopre niente
+che non fosse già stato deciso.** Non è il rilevatore del sistema: è la pulizia che smonta una
+connessione TCP che nessuno usa più. Lo stesso rapporto si vede in piccolo sul `vs_ping` di M0,
+che ha un timeout esplicito: isolando `station2`, la prima `ping … failed: **timeout**` arriva
+**3,4 s** dopo lo scollegamento, mentre la stessa riga diventa `failed: **nodedown**` solo
+**72,5 s** dopo, quando il tick ha finalmente smontato la connessione. Due parole diverse per
+lo stesso guasto, a settanta secondi di distanza.
+
+**La lezione generale, che vale oltre questo progetto:** in un sistema distribuito il tempo di
+rilevamento è quello del *controllo applicativo più stretto che qualcuno esegue davvero*, non
+quello del meccanismo di trasporto sottostante. Il trasporto ha timeout generosi perché deve
+sopravvivere a una rete lenta senza dichiarare morto chi è solo occupato; l'applicazione sa che
+cosa sta aspettando e può permettersi di essere impaziente. È il motivo per cui
+`COORD_HEARTBEAT_MS × MISSES = 3 s` esiste accanto a `monitor_nodes`, ed è scritto nel commento
+di `vs_coord_membership` da prima che qualcuno lo misurasse:
+
+> *`monitor_nodes' fires the instant a TCP connection breaks, which is what a crash looks like
+> — but a partition breaks nothing.*
+
+`monitor_nodes` resta sottoscritto ed è utile: quando il guasto **è** un crash (`docker stop`,
+SIGTERM, socket chiuso) la `nodedown` è istantanea e arriva prima dei tre battiti. Le due
+strade coprono i due guasti diversi, e questo è il punto: **non sono ridondanti, sono
+complementari.** Un crash lo scopre il trasporto; una partizione la scopre l'applicazione.
+
+### 26.2 La finestra dei renew nel vuoto è zero, e non per fortuna
+
+Il piano si aspettava che la stazione pagasse «fra il republish (≤30 s) e il tick (60 s)» di
+renew caduti nel vuoto. **Misurata: zero.** Nel log di `station1`, durante una partizione del
+leader lunga cento secondi con due claim vivi e una ricarica in corso, non compare **una sola**
+riga `claim client: renew failed on every coordinator`.
+
+Il motivo non è la fortuna della fase, ed è una proprietà che vale la pena riconoscere perché
+non è stata progettata come tale: **il canale con cui il leader nuovo si presenta è anche
+quello con cui la stazione impara di lui.** `handle_info({who_do_you_hold, From, CoordNode}, …)`
+risponde con i claim **e** ritorna `State#state{leader = CoordNode}` — un aggiornamento di
+instradamento gratuito, dentro una risposta che il client doveva dare comunque. Il commento nel
+codice lo chiama *«a freshly elected leader introducing itself — free routing update»*, e la
+misura dice quanto vale: **la stazione non si accorge mai della partizione, perché quando
+potrebbe accorgersene sa già a chi parlare.**
+
+Corollario che è la vera ragione per cui questo sta qui: **`coordinator_reachable` non è mai
+diventato `false`.** Quel flag si scrive in un posto solo, `handle_info({renew_result, error},
+…)`, e quel clause non è stato raggiunto. Trenta frame `state` sul canale driver durante la
+partizione, tutti con `"coordinator_reachable": true` e la griglia immobile. **La partizione
+del leader è invisibile dalla pagina** — che è il comportamento che vogliamo, e ora è misurato
+invece che sperato.
+
+### 26.3 Il rovescio: la finestra che *non* si chiude da sola
+
+La stessa proprietà, letta al contrario, è P18. La stazione impara il leader nuovo dentro il
+`who_do_you_hold`; ma se quel `who_do_you_hold` **non parte** — perché
+`vs_coord_rebuild:station_nodes/0` è `nodes()` e al rientro da una partizione le connessioni
+dist non si sono ancora ristabilite — allora l'unica strada che resta è l'adozione dal ciclo di
+renew, che costa **fino a dieci secondi**. In quei secondi il leader serve con una tabella
+vuota, e misurando si è visto che **concede a un veicolo già impegnato altrove** (13,65 s di
+doppia prenotazione, poi «oldest wins» ripara).
+
+Quindi la coppia di numeri da tenere a mente non è «2 s di heartbeat contro 60 s di tick», ma:
+
+```
+rilevamento del guasto     ~2,3 s     (veloce, e va bene così)
+riconvergenza dello stato  fino a 10 s (il periodo di renew, ed e' il numero che scotta)
+```
+
+`COORD_REBUILD_TIMEOUT_MS = 2000` è tarato sul primo e usato per difendersi dal secondo. Il
+difetto è scritto in `PROBLEMI_TROVATI.md` (P18) con le due direzioni possibili e **non è
+stato corretto**: allungare l'attesa a un periodo di renew costa dieci secondi a ogni rientro,
+rifiutare finché non si sa costa qualche `retry_later`. È un compromesso
+disponibilità/correttezza e va deciso, non aggiustato di corsa.
+

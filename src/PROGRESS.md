@@ -3124,6 +3124,203 @@ Sommarli li conterebbe due volte. È il suo stesso principio — «misurato, non
 - **`vs_coord/`, `backoffice/`, i contratti condivisi**: fuori perimetro. `ws-driver.md` è
   toccato perché è nostro e perché B2 lo rendeva falso.
 
+## 7zj. La coda di M3-A misurata: la partizione vera, la strada lenta, la scadenza naturale — 1 settembre
+
+Le quattro misure che `REPORT_M3A_VERIFICA.md` §7 dichiarava non prodotte. Pair di
+**verifica**: nessun file sotto `src/` toccato tranne questo e `scelte_di_progetto.md`, un
+difetto grave trovato e **non corretto** (P18). Report intero in `REPORT_M3A_CODA.md`.
+
+### La precondizione che era falsa, e che ha cambiato l'inizio
+
+Le immagini **non** erano alla punta. `beam_lib:md5` letto **dai nodi vivi**
+(`rpc:call(N, code, which, [M])`) contro un albero host compilato di fresco: `vs_connector` e
+`vs_station_mgr` diversi — cioè esattamente i due moduli che `8162926` tocca, la review di B
+applicata tre ore prima. I container giravano il `vs_connector` **precedente** alla correzione
+B1. Ricostruito e riverificato su tutti e cinque i nodi prima di misurare qualsiasi cosa. La
+data dell'immagine non serve a niente: `docker compose build` può essere tutto cache e il
+timestamp non si muove.
+
+### La premessa del piano che era falsa, e che valeva un ordine di grandezza
+
+Il piano diceva «il claim client continua a **castare** i renew» e chiedeva `net_ticktime`
+perché «i cast non hanno timeout». **Il renew non è un cast**: `handle_info(renew_tick, …)`
+spawna un worker che fa `call_round/4` → `call_one/3` = `gen_server:call({vs_coord_srv, Node},
+Msg, T)` con `T = CLAIM_CALL_TIMEOUT_MS = 2000`. I cast sono altri sei messaggi (`release`,
+`no_show`, `show_up`, `notify`, `station_stats`, `station_up`), e lì il piano ha ragione: verso
+un nodo partizionato spariscono senza errore.
+
+`net_ticktime` **in uso: 60 s**, letto sui nodi vivi (nessun `-kernel net_ticktime` nel
+`start-node.sh` né nel compose: è il default OTP). Misurato due volte: **72,5 s** e **64,6 s**
+per la nodedown, dentro la forchetta documentata `[T, T+T/4] = [60, 75]`.
+
+### ① M1 — la partizione del leader, vista dalla stazione
+
+Scena: connettore 3 prenotato **e onorato** da `cp.js` (quindi `charging` **con** claim — un
+walk-in non ne ha), connettore 1 prenotato da un secondo veicolo. `docker network disconnect`
+sul leader.
+
+```
+14:33:54.181   >>> disconnect del leader coord3
+14:33:56.298   coord3   QUORUM LOST (1 of 3) ... election: out of quorum, abdicating   [2,12 s]
+14:33:56.468   coord2   election: leader vs@coord3 is gone, electing / is now the leader
+14:33:56.470   coord2   rebuild: asked 2 station node(s) -> 2 answered, 2 claim(s)     [118 us]
+14:33:56.470   coord2   coordinator vs@coord2 serving with 2 adopted claim(s)          [2,29 s]
+14:34:58.747   coord2   ** Node vs@coord3 not responding **                            [64,6 s]
+```
+
+**2,29 s** dalla partizione a un leader nuovo che serve con entrambi i claim. Il costo del
+failover non è ricostruire, è accorgersi: le stazioni hanno risposto al `who_do_you_hold` in
+**118 microsecondi**.
+
+**Come se ne accorge la stazione: non se ne accorge.** Nel log di station1 non c'è **una sola**
+riga `claim client: renew failed on every coordinator`. `handle_info({who_do_you_hold, …})`
+risponde **e** fa `State#state{leader = CoordNode}`: la stazione impara il leader nuovo dentro
+la risposta, gratis. **La finestra dei renew nel vuoto è stata di zero tick** — non fra 30 s
+(republish) e 60 s (tick), come stimava il piano. Il tick della distribuzione è arrivato 28
+volte più tardi dell'heartbeat e non ha rilevato niente che non fosse già deciso: non è il
+rilevatore, è la pulizia.
+
+**Che cosa ha visto il conducente: niente.** Un osservatore del canale driver connesso per
+tutta la partizione ha ricevuto **30 frame `state`, tutti con `coordinator_reachable: true`** e
+la griglia immobile (`held` / `charging` a 150 kW). `coordinator_reachable` si scrive solo in
+`handle_info({renew_result, error}, …)`, e quel clause non è mai stato raggiunto.
+
+Alla riconnessione il rango più alto riprende la corona in **1,08 s** — ed è lì che si è aperta
+la cosa seria (③).
+
+### ② M2 — la strada lenta, misurata due volte
+
+`vs_coord_rebuild:station_nodes/0` è `[N || N <- nodes(), not lists:member(N, Coords)]`:
+**«asked 0 station node(s)» non vuol dire che le stazioni tacciono, vuol dire che il leader
+nuovo non aveva una connessione dist verso di loro.** Non il silenzio, la lista dei conoscenti.
+
+La misura buona è arrivata **da sé**, alla riconnessione di M1 (connessioni smontate dal tick e
+non ancora ristabilite):
+
+```
+14:35:35.556  rebuild: asked 0 station node(s), waiting up to 2000 ms
+14:35:37.557  0 station(s) answered with 0 claim(s) -> serving with 0 adopted claim(s)
+14:35:42.96   coord3: 2 claim        <-- rientrati dal CICLO DI RENEW, non dal rebuild
+```
+
+**7,41 s** in tutto (2,00 di finestra piena + 5,40 di fase del renew). Predetto **3-13 s,
+centro ~8**: dentro. Il «~12 s» del piano è il **bordo alto**, non il centro — i dieci secondi
+di periodo si pagano interi solo con la fase peggiore. La ricetta deliberata
+(`erlang:disconnect_node/1` da coord2 verso le stazioni, poi `docker stop coord3`) riproduce il
+presupposto a comando, ma `global` stacca anche i coordinatori fra loro
+(«*to prevent overlapping partitions*») e la corsa diventa una rielezione: buona come prova
+della ricetta, non come misura.
+
+### ③ Il difetto: P18, GRAVE, trovato guardando la riconnessione
+
+Nei **5,40 s** in cui coord3 serviva con la tabella vuota, la domanda ovvia era se in quella
+finestra si potesse rompere l'esclusività. Sì. Riprodotto con una gara a 300 ms:
+
+```
+14:45:45.647  coord3    serving with 0 adopted claim(s)
+14:45:45.919  station2  connector 5 reserved by user 12 (claim c-EED83F0B90A0F402)   <-- CONCESSA
+14:45:59.570  station2  claim c-EED83F0B90A0F402 revoked by the coordinator
+```
+
+**272 ms** dopo l'inizio del servizio, il veicolo 88 — che stava **caricando** su station1 —
+tiene due prenotazioni su due stazioni. Dura **13,65 s**, poi «oldest wins» (§5.5) revoca
+quella nuova e la ricarica non viene toccata: la regola sceglie il verso giusto.
+
+La difesa esiste e `vs_coord_rebuild` la documenta («*zero answers is when we know least, so
+that is the one case that waits out the full window*»), ma è **2000 ms contro un periodo di
+renew di 10 000**: copre un quinto di ciclo. **Non corretto**, P18 in `PROBLEMI_TROVATI.md` con
+le due direzioni possibili — allungare l'attesa a un periodo di renew, oppure non passare a
+`serving` con zero risposte *e* zero claim. È un compromesso disponibilità/correttezza, da
+discutere.
+
+### ④ M3 — la scadenza naturale, e perché la ricetta ovvia non funziona più
+
+**Post-P15 uccidere il connettore non produce una scadenza: produce un rilascio in
+millisecondi** (il `DOWN` fa partire `cast_leader({release, …})`). Servono quattro condizioni
+insieme: nessun `release` che parta (il client deve morire **senza processare il `DOWN`**),
+nessun renew, **nessuno che ripresenti** (P14: il connettore non deve essere vivo e con
+l'`hold` quando il client riavviato chiede), e il nodo stazione **vivo e connesso** — perché
+`{nodedown, Node}` → `forget_node/2` butta la stazione *e i suoi claim*, quindi un
+`docker kill station1` farebbe sparire il claim subito invece che in 960 s.
+
+Ricetta che le soddisfa: due `exit(Pid, kill)` consecutivi dal nodo sonda, client per primo —
+stesso canale dist, stesso segmento TCP. I log lo confermano: due `SUPERVISOR REPORT` con
+`reason: killed` nello **stesso millisecondo** (14:14:02.452).
+
+E una cosa che nessun documento diceva: **la scadenza si conta dall'ultimo renew, non dalla
+concessione**, perché `do_renew/3` ricalcola `NewExpiry = now_ms() + (Lease+Grace)*1000` a ogni
+giro. Predetto «fra 950 e 960 s dall'uccisione»; misurato **956,955 s**.
+
+```
+14:14:02.452  uccisi client + connettore     -> orfano: coord3 1 claim, client 0 claim
+14:14:22.924  station2 -> NO_CLAIM "your vehicle already holds a reservation"
+              (connettore locale gia' `free`: nessuna prenotazione esiste, e il veicolo
+               e' escluso da tutta la rete — la forma di P15, ma questa si sana da sola)
+14:29:59.407  expires_at
+14:29:59.727  T+320 ms: l'orfano e' ANCORA nella mappa del coordinatore
+14:29:59.846  T+439 ms: prenotazione dello stesso veicolo su station2 CONCESSA
+```
+
+**Il meccanismo è la lettura pigra, non lo scrub.** `live_claim/2` passa da `vs_time:expired/1`
+(`now_ms() >= ExpiresAt`) e tratta un claim scaduto come assente: il veicolo è tornato libero
+**mentre la riga era ancora fisicamente lì**. Lo scrub non è mai passato su quell'orfano — nel
+log di coord3 non c'è nessun `sweeping N expired claim(s)` — perché il claim nuovo per lo
+stesso veicolo ha sovrascritto la riga via `store/2` prima del giro da 5 s. Risposta esatta:
+**la lettura pigra ha liberato il veicolo, `store/2` ha tolto la riga, lo scrub non ha avuto
+occasione.**
+
+Lo scrub l'ho osservato a parte, in una corsa dichiarata a timer accorciati
+(`LEASE_SECONDS=20 CLAIM_GRACE_SECONDS=5`, coordinatori riportati ai default subito dopo e
+riverificati): `sweeping 1 expired claim(s)` **23,5 s** dopo l'uccisione. Non è la misura dei
+960 s: è la conferma del secondo meccanismo.
+
+### ⑤ M4 — il redirect circolare, prodotto nei container
+
+Fino a oggi solo in eunit. Serve uno standby il cui `leader` punti a un nodo che non serve:
+esiste per i ~2 s in cui un leader appena eletto è `rebuilding`. Sonda a 250 ms già in corsa
+prima della perturbazione:
+
+```
+14:45:43.812 .. 14:45:45.571   coord1 -> {not_serving,vs@coord3}   coord2 -> {not_serving,vs@coord3}
+                               (e coord3 in quel momento era `rebuilding`)
+```
+
+E il giro non si è chiuso, provato **sul percorso vero del client**: in quella finestra un
+conducente su station2 ha ricevuto **undici `RETRY_LATER` di fila** — cioè
+`map_refusal(rebuilding)` — invece di rimbalzare. Il client ha seguito **un** redirect, ha
+trovato un nodo che rifiuta, e ha restituito il rifiuto: è il flag `Followed` di `try_nodes/4`.
+**Un redirect solo, mai un giro**, sul codice di produzione.
+
+### Verificato — girato davvero
+
+- `beam_lib:md5` uguale host/container su cinque nodi, prima di misurare;
+- `./src/scripts/eunit_check.sh` → **386 tests, 0 failures** prima e dopo: nessun codice
+  toccato, l'ambiente non ha sporcato il repo;
+- ambiente rimesso e **verificato**: 7 container tutti e soli su `voltshare_voltshare`, zero
+  claim su tutti e cinque i nodi, connettori `{4,0,0}` e `{3,0,0}`, `LEASE=900 GRACE=60`
+  riletti dai coordinatori, `git status --short` vuoto;
+- `sessions`: **due righe aggiunte** (17 e 18), dalle due ricariche vere della scena di M1 e
+  della prova della ricetta pixel. Non ne è stata cancellata nessuna: la stazione in `sessions`
+  solo inserisce.
+
+### Non provato — e perché
+
+- **I pixel**: nessuna estensione browser in questa sessione, come il prompt prevede. In
+  `REPORT_M3A_CODA.md` §7 c'è la ricetta della scena **provata per intero al primo colpo**
+  (comandi, URL, e il fatto che **non esiste una credenziale di prova**: `schema.sql` non
+  semina utenti, l'unico utente del DB ha `'$2a$10$fixture.not.a.real.hash'` come hash e
+  `cc-probe` in questo database non c'è più — si entra registrandosi da `/register.jsp`, che
+  crea utente e veicolo e fa login da solo).
+- **Lo scrub sulla scadenza vera dei 960 s**: per vederlo servirebbe una seconda corsa da
+  sedici minuti in cui nessuno riprenoti quel veicolo, cioè rinunciando alla prova della
+  lettura pigra. Ho scelto la lettura pigra.
+- **Il caso peggiore della strada lenta** (fase sfavorevole, ~12-13 s totali): le due corse
+  hanno estratto 5,40 s e 13,65 s di attesa; il totale peggiore resta interpolato.
+- **Una seconda misura di P18**: colto una volta, su 272 ms di margine. Riproducibile ma non
+  deterministico: va scritto in eunit, dove la finestra si controlla.
+
+---
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
@@ -3158,7 +3355,12 @@ server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il s
 l'emulatore dei driver (§7w) e i due ritocchi al contratto della colonnina (§7x). La fatturazione non gira più su righe inserite a mano: l'auto
 carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
 fine della sessione. Quello che resta di M2-A è la verifica del fuso in `history.jsp`, che
-richiede un browser e una password che non ho.
+richiede un browser e una password che non ho. **Chiuso il 01/09 (§7zj)**: una credenziale di
+prova non esiste e non è mai esistita in questo database — `schema.sql` semina solo `stations` e
+`connectors`, l'unico utente presente ha `'$2a$10$fixture.not.a.real.hash'` come hash (nessun
+bcrypt lo soddisfa) e `cc-probe` qui non c'è più. Non è un blocco: `/register.jsp` crea utente **e**
+veicolo e fa login da solo, quindi il fuso in `history.jsp` lo può guardare chiunque apra il
+browser. Ricetta completa in `REPORT_M3A_CODA.md` §7.
 
 ### Prima di M5
 
@@ -3173,10 +3375,17 @@ rete bridge di default, nomi nodo agganciati agli hostname dei container, esatta
 schema. Il requisito del corso dice *"deployata su più **nodi**"*, non su più host, e di nodi ne
 abbiamo sette veri. "Tipicamente cloud" è un esempio, non un obbligo.
 
-Resta un motivo **solo** per volerlo, e non è il requisito: su una macchina sola non si può
-produrre una **partizione di rete vera**. Il quorum è progettato per le partizioni, non solo per i
-crash, quindi oggi la minoranza che si sospende si mostra con `docker kill` invece che staccando
-il Wi-Fi. Miglioramento della demo, non un buco — e da valutare solo se avanza tempo.
+~~Resta un motivo **solo** per volerlo, e non è il requisito: su una macchina sola non si può
+produrre una **partizione di rete vera**.~~ **Falso, e chiuso due volte.** `docker network
+disconnect voltshare_voltshare <container>` produce una partizione vera su un host solo: il
+nodo resta acceso, si crede vivo, non manda nessun FIN. B lo aveva mostrato sui follower il
+27/08 (§7y); il 01/09 (§7zj) l'ho fatto **sul leader**, con due claim vivi e una ricarica in
+corso, e misurato tutto: `QUORUM LOST (1 of 3) … abdicating` a **2,12 s**, un leader nuovo che
+serve con entrambi i claim a **2,29 s**, e la nodedown della distribuzione solo a **64,6 s** —
+la prova che senza FIN si paga il tick, che è esattamente ciò che `docker kill` non può
+mostrare. **Quindi non resta nessun motivo per il deploy multi-host**, e nella demo la
+partizione va accanto al `docker kill`: sono due guasti diversi e il sistema li tratta in modo
+diverso.
 
 Se lo si fa, la conseguenza tecnica è una sola e va saputa prima: `-sname` non basta più. I nomi
 corti funzionano solo dentro lo stesso dominio DNS, e `Dockerfile.erlang` dice *"long names would
