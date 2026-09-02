@@ -71,10 +71,18 @@ services:
       ERL_APP: vs_station
       ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
       STATION_ID: 1
-      # M0 only: probe the other station. In M1 this is replaced by
-      # COORD_NODES and the real claim client.
-      PING_TARGET: vs@station2
-      PING_INTERVAL_MS: 3000
+      # PING_TARGET is deliberately unset. It was the M0 connectivity probe,
+      # replaced in M1 by COORD_NODES and the real claim client, and left
+      # switched on afterwards out of habit: two log lines every three seconds,
+      # per station, for a fact nothing reads. That is what buried the station
+      # pane during the demo rehearsal — the interesting lines were there, under
+      # a thousand pings, and `grep -v ping` only removed the message and left
+      # the orphan `=NOTICE REPORT====` headers behind it.
+      #
+      # `vs_ping` stays in the supervision tree and still answers `ping` calls;
+      # without a target it simply never initiates (vs_ping:init/1). To probe
+      # connectivity by hand: `PING_TARGET=vs@station2 docker compose up -d
+      # station1`, or from a shell `vs_ping:ping('vs@station2')`.
       # M1+
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
@@ -119,8 +127,7 @@ services:
       ERL_APP: vs_station
       ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
       STATION_ID: 2
-      PING_TARGET: vs@station1
-      PING_INTERVAL_MS: 3000
+      # Unset, same as station1 above.
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}

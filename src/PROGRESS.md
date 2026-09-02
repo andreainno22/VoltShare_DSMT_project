@@ -3407,6 +3407,56 @@ proprio nella finestra fra la chiusura di quello temporaneo e l'apertura di quel
 (`Can't connect … through socket`). Chi semina subito dopo un boot pulito deve aspettare le
 **tabelle**, non il ping.
 
+### Il ping di M0, acceso da quattro milestone
+
+Provando i pannelli della demo, il log della stazione era **illeggibile**: due righe ogni tre
+secondi, per stazione, di `ping vs@station2 -> pong from vs@station2`. È `vs_ping`, la sonda
+di connettività di M0, sostituita in M1 da `COORD_NODES` e dal claim client vero e lasciata
+accesa per abitudine — `vs_station_sup` la descrive già come *«retired when the real claim
+client arrived»*, ma `PING_TARGET` era ancora nel compose.
+
+Il filtro che `DEMO.md` suggeriva, `grep -v ping`, **non funziona** e questo è il dettaglio
+che vale la pena ricordare: il logger di Erlang stampa due righe per messaggio, una
+intestazione `=NOTICE REPORT==== <timestamp> ===` e il testo. Togliendo la riga col ping
+restano le intestazioni orfane, cioè il pannello continua a scorrere mostrando **solo**
+timestamp. Sembrava che la stazione non stesse loggando niente; stava loggando solo rumore
+a cui era stata tolta la metà riconoscibile.
+
+Tolto `PING_TARGET` dai due servizi. Nessuna modifica al codice e nessuna ricostruzione:
+`vs_ping:init/1` senza target non arma il tick e si limita a rispondere, e lo dichiara nel
+log — `vs_ping ready on vs@station1 (answering only)`. Per sondare a mano resta
+`PING_TARGET=vs@station2 docker compose up -d station1`.
+
+**Effetto collaterale utile**: ricreare le due stazioni ha staccato le due auto di sfondo, e
+si sono **riagganciate da sole al primo giro** — il backoff di `cp.js` provato senza volerlo.
+
+### La catena delle penalità si è dimostrata da sé, dal vivo
+
+Mentre spiegavo la logica del no-show, l'account del presentatore si è **sospeso da solo**:
+due prenotazioni fatte dal browser e mai onorate, a 90 s di lease. Le due notifiche in
+tabella, con l'ora:
+
+```
+15:37:22  reservation_expired  "… 1 of 2 — reaching 2 suspends reservations for 1 day(s)."
+15:39:02  suspended            "Reservations are suspended until 03/09/2026 17:39 …"
+```
+
+È il beat marcato 🔴 nella checklist di `DEMO.md` — *«meccanismo misurato al database il
+31/08; queste sono le pagine, mai viste»*. Ha girato tutto: stazione che segnala, coordinatore
+che inoltra, Java che conta, scrive la sospensione, azzera il contatore e la **spinge al
+leader** (`coord3 suspensions=1`). E c'è la prova del fuso in una riga sola: `15:39:02` in
+tabella (UTC), **17:39** nel testo della notifica, cioè l'ora di Roma — `util/Times.java`
+scritto stamattina.
+
+**Una cosa trovata sbloccando l'account**: `ErlangBridge.notifyUnsuspension(int)` esiste, e
+`vs_coord_srv` ha la clausola `{user_unsuspended, UserId}` che la riceve, ma **nessuno in Java
+la chiama**. Non è un difetto di comportamento — `is_suspended/2` confronta `Until >
+erlang:system_time(second)`, quindi la sospensione decade da sola all'ora giusta — ma sono un
+metodo morto e una voce che resta nella mappa del coordinatore per sempre. Per togliere una
+sospensione in anticipo (come oggi) bisogna scrivere sul database **e** mandare il messaggio a
+mano via `rpc`, altrimenti la ripubblicazione del back office la rimette entro 30 secondi.
+Annotato, non corretto.
+
 ### Verificato — girato davvero
 
 - **Il volume regge un `down`**: riga marcatore inserita in `users`, `docker compose down`
