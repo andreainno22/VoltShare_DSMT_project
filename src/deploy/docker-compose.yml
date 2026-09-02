@@ -24,15 +24,34 @@ services:
       MYSQL_PASSWORD: voltshare
     # schema.sql lives in contracts/ because it is a shared contract; it is
     # mounted here rather than copied, so there is only one copy to change.
+    #
+    # The named volume is what makes the data outlive the container. Without it
+    # everything sat in the container's writable layer, so a single
+    # `docker compose down` destroyed the accounts, the sessions and the
+    # notifications — including the presenter's account on the morning of the
+    # demo. It also means the two-phase initialisation (temporary server →
+    # init scripts → real server) happens once instead of on every `down`.
+    #
+    # To start genuinely clean — a fresh schema, no rows — the volume has to go
+    # too: `docker compose down -v`. That is now a deliberate act rather than a
+    # side effect of stopping the stack.
     volumes:
+      - mysql-data:/var/lib/mysql
       - ../contracts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     ports:
       - "3306:3306"
+    # 60 retries at 5 s = five minutes. Generous on purpose: the first boot on a
+    # cold volume measured over six minutes on a developer laptop — InnoDB alone
+    # took forty seconds — and with the previous twenty retries the check gave up
+    # first, so the stations and the back office refused to start against a
+    # database that was merely slow. Every later boot answers in seconds, so the
+    # ceiling costs nothing once the volume exists.
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pvoltshare"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 60
+      start_period: 30s
     networks: [voltshare]
 
   station1:
@@ -233,3 +252,8 @@ services:
 networks:
   voltshare:
     driver: bridge
+
+volumes:
+  # The database survives `docker compose down`. Removing it is `down -v`, and
+  # then the next boot replays contracts/schema.sql from scratch.
+  mysql-data:

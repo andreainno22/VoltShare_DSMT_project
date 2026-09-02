@@ -3321,6 +3321,118 @@ trovato un nodo che rifiuta, e ha restituito il rifiuto: è il flag `Followed` d
 
 ---
 
+## 7zk. Passata di review su tutto il progetto, e la demo resa lanciabile — 2 settembre
+
+Tre lavori nella stessa giornata: una review completa di `src/`, gli otto file che il runbook
+della demo dava per esistenti e non esistevano, e la caccia a un guasto dell'infrastruttura che
+ha finito per scoprirne uno peggiore.
+
+### La review: tredici rilievi, sei miei
+
+Non un diff — tutto `src/` a `78aa01c`, aprendo i file. **Sei erano miei e li ho corretti**;
+sette sono nel perimetro di A e stanno in `contracts/review-per-A-progetto.md`, **ancora da
+mandargli**.
+
+I due miei che contano, e sono entrambi nel coordinatore:
+
+1. **`vs_coord_rebuild:run/1` faceva `spawn_link`**, e `vs_coord_srv` non fa `trap_exit`. Una
+   qualunque eccezione nel worker — per esempio un `{holds, …}` malformato da una stazione —
+   avrebbe ucciso **il processo che tiene tutti i claim della rete**, e `rest_for_one` avrebbe
+   portato giù l'intero sottoalbero. È lo stesso guasto che il catch-all in `renew_one/4`
+   esiste per prevenire, reintrodotto due milestone dopo **da una parola**. Ora è
+   `spawn_monitor`.
+2. **Lo stato `rebuilding` non aveva uscita.** L'unica via era il messaggio `{rebuilt, _}`: se
+   il worker moriva prima di mandarlo, il coordinatore rifiutava **ogni prenotazione della rete,
+   per sempre**, e nei log non c'era niente a dirlo. Ora ci sono il `DOWN` del monitor e una
+   deadline di sicurezza (`deadline_ms/0`); in entrambi i casi si passa a `serving` con un
+   warning, perché i rinnovi adottano comunque entro dieci secondi e restare bloccati è
+   strettamente peggio.
+
+Gli altri quattro: **XSS stored** nello username reso senza `<c:out>` in `page.tag` — e quel
+tag rende su **ogni** pagina autenticata, mentre `validate` controlla solo la lunghezza 3-50,
+quindi `<img src=x onerror=…>` (32 caratteri) passava la registrazione; e tutto il percorso
+delle sospensioni che leggeva e scriveva con l'orologio della JVM mentre `sessions` è in UTC,
+ora unificato su UTC con `util/Times.java` per la resa in `APP_TIMEZONE`.
+
+Vale la pena notarlo per l'orale: i primi due sono difetti di **supervisione**, non di logica.
+Il codice era corretto; sbagliato era cosa succede quando non lo è.
+
+### Gli otto file della demo, e uno scritto da zero
+
+`DEMO.md` dava per esistenti `.env.demo`, `seed-demo.sql` e sei script. Non c'erano. Creati
+tutti; due meritano una riga.
+
+**`emulator/demo/reserve.js`, scritto da zero.** A lo dava per esistente come
+`scena-pixel-driver.js`, che non è mai arrivato. Serve per una battuta sola: lasciare **una
+prenotazione in piedi** prima del failover. Non si può usare `driver.js --scenario
+one-vehicle`, che alla fine cancella deliberatamente la prenotazione superstite, né un walk-in
+via `cp.js`, che non crea nessun claim (`vs_connector:free/3` adotta la sessione con `claim_id
+= undefined`). Senza, la battuta del failover mostrerebbe il nuovo leader che ricostruisce una
+tabella vuota: il coordinatore che funziona perfettamente e non dimostra niente.
+
+**`emulator/demo/coord-status.sh`, riscritto.** La versione dell'appendice usava `erl -remsh`
+col comando su stdin e **non stampava niente**: la shell remota legge l'EOF e termina prima di
+emettere il risultato, si vede solo `*** Shell process terminated! Read EOF ***`. Ora avvia un
+nodo effimero che fa una `rpc:call` e chiude — nessuna shell di mezzo, nessun EOF da cui
+dipendere — e riporta anche le sospensioni.
+
+### Il container zombie che erano dieci, e il guasto peggiore che ci stava sotto
+
+Sintomo: la lobby diceva «no station is reporting» con `mysql` e `backoffice` regolarmente su.
+`docker ps -a`: **cinque container `Exited (137)`** (coord1/2/3, station1/2) e **cinque in
+`Created`** con nomi prefissati da un hash. Causa: un `up -d --build` interrotto a metà. Compose
+rinomina il vecchio container con un prefisso, crea il nuovo, poi rimuove il vecchio; fermarlo
+nel mezzo lascia i vecchi uccisi e i nuovi mai partiti.
+
+**Ripulito con `down --remove-orphans`, che ha funzionato e ha cancellato il database.** Il
+servizio `mysql` non aveva un volume nominato: l'unico `volumes:` era il bind di sola lettura
+di `schema.sql`, quindi i dati stavano nel layer scrivibile del container. Persi utenti,
+sessioni e notifiche, compreso l'account del presentatore. Errore mio: andava detto **prima** di
+lanciare il comando, non dopo.
+
+Il danno è stato nullo perché erano dati di prova, ma ha reso visibile una cosa che il giorno
+della demo sarebbe costata cara, e ne ha portata a galla una seconda: il primo boot su database
+vuoto ha impiegato **oltre sei minuti**, e la healthcheck (20 tentativi × 5 s) è scaduta molto
+prima — quindi stazioni e back office si sono rifiutati di partire contro un database che era
+soltanto lento. Sembrava tutto rotto mentre MySQL stava solo nascendo.
+
+**Correzione, in `docker-compose.yml`:** volume nominato `mysql-data` su `/var/lib/mysql`,
+`retries` da 20 a 60 e `start_period: 30s`. Da ora `down` è innocuo e `down -v` è l'unico modo
+di perdere i dati — un atto deliberato invece di un effetto collaterale.
+
+Una trappola trovata verificando: **la healthcheck può passare sul server sbagliato.** L'entrypoint
+di MySQL alza un server temporaneo per eseguire gli script di init, e `mysqladmin ping -h
+localhost` passa dal socket, quindi risponde già lì; il mio primo caricamento del seed è finito
+proprio nella finestra fra la chiusura di quello temporaneo e l'apertura di quello vero
+(`Can't connect … through socket`). Chi semina subito dopo un boot pulito deve aspettare le
+**tabelle**, non il ping.
+
+### Verificato — girato davvero
+
+- **Il volume regge un `down`**: riga marcatore inserita in `users`, `docker compose down`
+  completo (container e rete rimossi), `up -d`, riga **ritrovata al primo tentativo**,
+  `utenti=7`. Marcatore poi cancellato, `utenti=6`. `docker volume ls` mostra
+  `voltshare_mysql-data`.
+- **Nessuna reinizializzazione al secondo boot**: sul volume già popolato MySQL ha risposto al
+  primo colpo, contro i >6 minuti del primo. È la misura che giustifica la modifica.
+- **Stack completo risalito**: 7 container su, `mysql healthy`, `GET /` → `302` (redirect al
+  login, cioè `AuthFilter` vivo), `coord3 mode=serving` con coord1 e coord2 in `standby` —
+  l'ordine bully atteso, il rango più alto vince.
+- **Seed ricaricato**: 6 utenti, 6 veicoli, 2 stazioni, 7 connettori.
+- `eunit_check.sh` verde a **386**, Java 14 test verdi (dalla passata di review).
+
+### Non provato — e perché
+
+- **La demo non è ancora stata corsa per intero.** Lo stack è sano e seminato, ma l'account del
+  presentatore è morto col database e va **ri-registrato da `/register`** prima di cominciare,
+  rileggendo `$PV`.
+- **I sette rilievi ad A non gli sono ancora arrivati.** `review-per-A-progetto.md` è scritto e
+  committato; il più concreto è il clamp mancante su `idle_timeout` in `vs_cp_ws`, che con
+  `CP_HEARTBEAT_MISSED=1` dà `0` e chiude ogni socket colonnina appena inattivo.
+- **Il PR di `b/review-progetto` non è aperto**, quindi niente di questo è su `main`.
+
+---
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha

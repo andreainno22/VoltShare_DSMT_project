@@ -126,7 +126,7 @@ Tutto da `src/deploy/` salvo diverso avviso.
 ```bash
 # 1. su i sette container con il profilo demo
 cd src/deploy
-docker compose --env-file .env.demo up -d --build
+docker compose --env-file .env.demo up -d
 docker compose --env-file .env.demo ps          # 7 up, mysql healthy
 
 # 2. semina le colonnine di sfondo (schema.sql è già girato al primo boot)
@@ -146,6 +146,12 @@ cd ../emulator && node driver.js --self-test        # deve dire "identical to th
 ./demo/coord-logs.sh
 #    deve mostrare, a regime: coord3 = leader (rango più alto), coord1/coord2 = standby
 ```
+
+**Niente `--build` la mattina della demo.** Le immagini si costruiscono la sera prima
+(`docker compose --env-file .env.demo build`, una volta): con `--build` il passo 1 impiega
+minuti invece di secondi, e se lo si interrompe a metà si resta con i vecchi container
+uccisi e i nuovi fermi in `Created` — cluster giù e lobby che dice «no station is
+reporting» senza spiegare perché. Il ripristino è `up -d` di nuovo, non `down`.
 
 Verifiche prima di cominciare:
 
@@ -482,13 +488,35 @@ Se qualcosa si impunta a fondo: `docker compose --env-file .env.demo restart sta
 
 ## 12. Reset tra una prova e l'altra
 
+Tre livelli, dal più leggero. **Scegli il più leggero che basta**: solo il terzo costa la
+ri-registrazione dell'account del presentatore.
+
+Reset completo dei processi, database intatto — è quello da usare fra una prova e l'altra:
+
 ```bash
 cd src/deploy
-docker compose --env-file .env.demo down -v      # -v azzera anche MySQL
-docker compose --env-file .env.demo up -d --build
+docker compose --env-file .env.demo down
+docker compose --env-file .env.demo up -d
+```
+
+Account, storico e notifiche sopravvivono, perché dal 2/09 MySQL scrive su un volume
+nominato (`voltshare_mysql-data`) invece che nel layer del container. Verificato: riga
+inserita, `down`, `up -d`, riga ancora lì — e MySQL pronto al primo colpo, senza rifare
+l'inizializzazione da sei minuti.
+
+Database vuoto, schema ricreato da `contracts/schema.sql`:
+
+```bash
+docker compose --env-file .env.demo down -v      # -v distrugge il volume: NON in T−20
+docker compose --env-file .env.demo up -d
 docker exec -i mysql mysql -uvoltshare -pvoltshare voltshare < seed-demo.sql
 # ri-registra 'andrea' dal form, ri-esporta $PV
 ```
+
+Il `-v` è ora l'unico modo di perdere i dati, ed è un atto deliberato. **Il primo boot su
+volume vuoto ha impiegato oltre sei minuti** su un portatile: se lo lanci a T−20 la demo
+comincia in ritardo, e finché la healthcheck non passa stazioni e back office si rifiutano
+di partire — sembra tutto rotto mentre il database sta solo nascendo.
 
 Reset veloce senza ricreare il DB (tiene l'account, azzera penalità e prenotazioni):
 
@@ -522,7 +550,8 @@ quello che rendono. Averle in tasca con la risposta pronta vale più che mostrar
 
 ```dotenv
 # VoltShare — profilo demo.  Uso, da src/deploy/:
-#   docker compose --env-file .env.demo up -d --build
+#   docker compose --env-file .env.demo build     una volta, la sera prima
+#   docker compose --env-file .env.demo up -d     la mattina, in pochi secondi
 # "Tempo veloce" = lease e grazie corti; nessun orologio scalato. Dirlo nella relazione.
 
 ERLANG_COOKIE=voltshare
@@ -706,6 +735,10 @@ almeno una volta.
 - [ ] `.env.demo`, `seed-demo.sql`, i **6** script creati e `chmod +x` (incluso
       `reserve.js`, copiato dalla root di A); la riga `${STATION1_SITE_POWER_KW:-350}` in
       `docker-compose.yml`.
+- [ ] **immagini costruite la sera prima** (`build`, non `up -d --build`), così la mattina
+      il passo 1 dura secondi.
+- [ ] `docker volume ls` mostra `voltshare_mysql-data`: senza quello un `down` cancella
+      l'account del presentatore, e il boot successivo rifà l'inizializzazione (>6 min).
 - [ ] `up` pulito, 7 container, coord3 leader nei log; `docker network ls` mostra
       `voltshare_voltshare`.
 - [ ] `world.sh`: Livorno 6 e 7 vanno `charging` in lobby entro ~30 s.
