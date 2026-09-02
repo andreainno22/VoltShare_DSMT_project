@@ -9,7 +9,7 @@ import it.unipi.dsmt.voltshare.util.Times;
 
 import java.sql.SQLException;
 import java.time.LocalDateTime;
-import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.logging.Level;
@@ -167,7 +167,11 @@ public final class PenaltyService {
         // A second on a one-day penalty changes nothing for a driver. It is fixed anyway
         // because two components that are meant to agree on one instant should not be storing
         // different numbers, and the fix is one call. Flagged in the review of PR #5.
-        LocalDateTime until = LocalDateTime.now()
+        //  …and in UTC, because that is the convention every timestamp in this database
+        // follows: the station writes `sessions` in UTC, and a second column on a second
+        // clock would mean two meanings for one datatype. Read back as UTC by
+        // User.isSuspended, shown in local time by Times.
+        LocalDateTime until = LocalDateTime.now(ZoneOffset.UTC)
                 .plusDays(suspensionDays)
                 .truncatedTo(ChronoUnit.SECONDS);
 
@@ -193,7 +197,7 @@ public final class PenaltyService {
         // last step on purpose: if this message is lost the database still knows, and the next
         // leader change replays it through pushAllSuspensions().
         ErlangBridge.getInstance().notifySuspension(
-                userId, until.atZone(ZoneId.systemDefault()).toEpochSecond());
+                userId, until.toEpochSecond(ZoneOffset.UTC));
 
         LOG.log(Level.INFO, "User {0} suspended until {1}", new Object[]{userId, until});
     }

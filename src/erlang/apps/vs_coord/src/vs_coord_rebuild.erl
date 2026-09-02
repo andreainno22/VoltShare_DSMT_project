@@ -49,7 +49,7 @@
 %%%-------------------------------------------------------------------
 -module(vs_coord_rebuild).
 
--export([run/1, station_nodes/0]).
+-export([run/1, deadline_ms/0, station_nodes/0]).
 
 -define(CLIENT, vs_claim_client).
 
@@ -59,10 +59,30 @@
 %% Runs in its own process: it waits on the network, and the coordinator must
 %% stay responsive while it does — it is still answering `not_serving' and
 %% still accepting renewals, which are themselves a source of adoptions.
--spec run(pid()) -> pid().
+%%
+%% **Monitored, never linked.** This was `spawn_link', and a link points both
+%% ways: an exception in here — a malformed `{holds, …}' from any node reaching
+%% the arithmetic below — would have killed `vs_coord_srv', the one process
+%% holding every claim in the network, and `rest_for_one' would then have taken
+%% the whole coordinator subtree with it. That is precisely the failure the
+%% catch-all in `renew_one/4' exists to prevent, reintroduced two milestones
+%% later by one word.
+%%
+%% A monitor gives the coordinator the same news without the lethality: it
+%% learns that the worker died and can decide what to do, which is what
+%% `vs_coord_srv' now does.
+-spec run(pid()) -> {pid(), reference()}.
 run(ReplyTo) ->
     TimeoutMs = vs_env:get_int("COORD_REBUILD_TIMEOUT_MS", 2000),
-    spawn_link(fun() -> do_run(ReplyTo, TimeoutMs) end).
+    spawn_monitor(fun() -> do_run(ReplyTo, TimeoutMs) end).
+
+%% @doc How long the caller should wait before giving up on the answer.
+%%
+%% Comfortably longer than the worker's own window, so that on a healthy
+%% rebuild the answer always arrives first and this deadline never fires.
+-spec deadline_ms() -> pos_integer().
+deadline_ms() ->
+    vs_env:get_int("COORD_REBUILD_TIMEOUT_MS", 2000) * 2 + 1000.
 
 %% @doc Connected nodes that are not coordinators. Exported for the tests.
 -spec station_nodes() -> [node()].
@@ -85,8 +105,12 @@ do_run(ReplyTo, TimeoutMs) ->
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
     Holds = collect(length(Targets), Deadline, []),
 
+    %% Counted defensively: `Claims' comes from another node, and a non-list
+    %% there would raise inside the log line — harmless now that the worker is
+    %% only monitored, but it would still cost the rebuild for no reason.
+    Counted = lists:sum([length(H) || {_, H} <- Holds, is_list(H)]),
     logger:notice("rebuild: ~p station(s) answered with ~p claim(s) in total",
-                  [length(Holds), lists:sum([length(H) || {_, H} <- Holds])]),
+                  [length(Holds), Counted]),
 
     ReplyTo ! {rebuilt, Holds},
     ok.

@@ -1,6 +1,7 @@
 package it.unipi.dsmt.voltshare.model;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 
 import it.unipi.dsmt.voltshare.util.Times;
 
@@ -47,8 +48,20 @@ public class User {
         return suspendedUntil == null ? "" : Times.format(suspendedUntil);
     }
 
+    /**
+     * Whether the reservation privilege is currently withdrawn.
+     *
+     * <p>Compared against <b>UTC</b> now, because that is what the column holds. It used to be
+     * compared against {@code LocalDateTime.now()} — the JVM's own zone — while
+     * {@link #getSuspendedUntilText()} passed the same field through {@link Times}, which reads
+     * it as UTC. The two agreed only because the containers happen to run on UTC: on a Tomcat
+     * in Europe/Rome the profile page would have told a driver their suspension lifts two hours
+     * after this method had already stopped enforcing it.
+     *
+     * <p>One field, one meaning: stored UTC, read as UTC, displayed local.
+     */
     public boolean isSuspended() {
-        return suspendedUntil != null && suspendedUntil.isAfter(LocalDateTime.now());
+        return suspendedUntil != null && suspendedUntil.isAfter(LocalDateTime.now(ZoneOffset.UTC));
     }
 
     public int getId() {
