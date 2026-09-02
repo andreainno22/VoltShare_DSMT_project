@@ -357,7 +357,9 @@ Non è cosmetica: a un driver a cui si dice "connettore occupato" prova quello a
 
 Prime dipendenze esterne del progetto: `cowboy 2.18.0`, `jsx 3.1.0`, `jose 1.11.12` — le più recenti su hex, verificate con `rebar3 pkgs` invece che copiate da una nota di progetto, e compilate davvero su OTP 29.0.5.
 
-`warnings_as_errors` di primo livello **si propaga alle dipendenze**: `jose` usa ancora la forma `catch Expr` che OTP 29 ha deprecato, e il build moriva su un warning in sorgente altrui. Rimedio: `{overrides, [{del, [{erl_opts, [warnings_as_errors]}]}]}`, che abbassa la severità **solo** per le deps. Sul nostro codice resta: è una regola per ciò che scriviamo noi, non per ciò che scaricano gli altri.
+`warnings_as_errors` di primo livello **si propaga alle dipendenze**: `jose` usa ancora la forma `catch Expr` che OTP 29 ha deprecato, e il build moriva su un warning in sorgente altrui. Rimedio: `{overrides, [{del, [{erl_opts, [warnings_as_errors]}]}]}`, con l'intenzione di abbassare la severità **solo** per le deps e di tenerla sul nostro codice.
+
+> **Corretto il 02/09 — l'intenzione non è ciò che accade.** La forma `{del, Options}` senza nome dell'applicazione vale per **tutte**, `apps/` comprese: `warnings_as_errors` non è mai stato in vigore sul nostro codice, per tutto il tempo in cui questa riga è esistita. Misurato, e non corretto qui perché è una modifica al build di tutto l'albero: **§27.7**.
 
 `rebar.lock` si committa (la riga in `.gitignore` è stata tolta) e il `Dockerfile.erlang` lo copia accanto a `rebar.config`: senza, due macchine e il container possono risolvere versioni diverse — esattamente la classe di problema per cui esisteva il pin di OTP 29.0.5. `vs_station.app.src` elenca le tre app fra le `applications`, altrimenti `application:ensure_all_started(vs_station)` le lascia ferme e il listener parte su una libreria non avviata.
 
@@ -2819,3 +2821,160 @@ stato corretto**: allungare l'attesa a un periodo di renew costa dieci secondi a
 rifiutare finché non si sa costa qualche `retry_later`. È un compromesso
 disponibilità/correttezza e va deciso, non aggiustato di corsa.
 
+
+---
+
+## 27. La quarta volta della lezione §20, e la variante: l'evento al posto del timer (P18, misurato)
+
+*2 settembre 2026, `a/p18-nodeup`. Sta qui perché è la stessa lezione per la quarta volta e
+perché la quarta volta è diversa dalle altre tre — e la differenza è il punto.*
+
+### 27.1 Il difetto non era il meccanismo: era il momento
+
+P18: un leader che rientra da una partizione ricostruisce l'indice chiedendo alle stazioni, ma
+`vs_coord_rebuild:station_nodes/0` è `[N || N <- nodes(), not lists:member(N, Coords)]` — **la
+lista dei conoscenti, non l'elenco delle stazioni**. Al rientro il mesh non si è ancora
+riformato, quindi `asked 0 station node(s)`, attesa della finestra piena
+(`COORD_REBUILD_TIMEOUT_MS`, 2000 ms), e poi `serving` con la tabella vuota. Misurato l'1/09:
+272 ms dopo, lo stesso veicolo teneva due prenotazioni su due stazioni, e l'invariante di
+`SCOPE` §4 è rimasta rotta **13,65 s**.
+
+L'indagine ha però chiarito una cosa che ha cambiato la forma della correzione: **il meccanismo
+di ripresentazione esisteva già ed era corretto.** Il `renew_tick` manda al leader il batch di
+*tutti* i claim col `granted_at` originale, `try_nodes/4` segue il redirect `not_serving` con lo
+stesso messaggio, e il `renew_one/4` del coordinatore adotta un claim sconosciuto conservando
+l'ordinamento. Non mancava niente da dire, e non mancava nessuno a cui dirlo.
+
+**Mancava il momento.** La ripresentazione partiva quando scattava il tick — fino a
+`CLAIM_RENEW_INTERVAL_MS` (10 s) più la fase — mentre la finestra pericolosa si apre ~2 s dopo
+il rientro. In una riga: **il claim client aspettava un orologio per dire una cosa che sapeva
+già.**
+
+### 27.2 Perché è §20 di nuovo, e che cosa cambia rispetto alle prime tre
+
+La lezione §20 è *chi possiede lo stato lo ridice a chi lo aggrega, senza aspettare di essere
+interrogato*. Le tre applicazioni precedenti avevano tutte la stessa forma — **ridire invece di
+ricordare**:
+
+| | chi possiede | chi aggrega | il rimedio |
+|---|---|---|---|
+| rebuild del coordinatore (M3) | la stazione | il coordinatore | il leader nuovo **chiede**, non replica un log |
+| P14 | il connettore | il claim client | il client riavviato **chiede** ai connettori |
+| P15 | il connettore | il claim client | il `DOWN` del monitor **dice** che il claim non ha più padrone |
+| **P18** | **la stazione** | **il coordinatore** | **il ridire c'era già: mancava l'evento al posto del timer** |
+
+La quarta riga è la variante che vale la pena dire all'orale, perché è una lezione diversa
+travestita da ripetizione: **un sistema che reagisce a un fatto è più veloce di uno che lo
+controlla a intervalli, e la differenza è esattamente la finestra del difetto.** Il rimedio non
+aggiunge un messaggio, non cambia un contratto e non tocca il tick: aggiunge *quando*.
+
+`net_kernel:monitor_nodes(true)` in `init/1`, e due clausole in `handle_info/2` **sopra** il
+catch-all. Un nodo che torna e che sta in `coord_nodes` → riannuncio e giro di renew immediato.
+Tutto il resto era già lì.
+
+### 27.3 I numeri, misurati due volte sullo stesso scenario
+
+Scena identica nelle due corse: connettore 1 prenotato, connettore 3 in **carica** con claim
+vivo, `docker network disconnect` sul leader, failover, poi `connect`.
+
+```
+                                   PRIMA                           DOPO
+apertura della finestra            rebuild a 0 risposte, 2000 ms   uguale
+il claim client se ne accorge      al prossimo renew_tick          {nodeup}, +657 ms dal connect
+i claim entrano nella tabella      4,11 s DOPO `serving`           1,74 s PRIMA di `serving`
+la riga del coordinatore           serving with 0 adopted          serving with 2 adopted
+`stations` conosciute              [] per altri 19,7 s             [1,2], prima di servire
+```
+
+**Finestra di esposizione: 4,11 s → 0 ms.** E lo zero è verificabile e non ottimistico: un
+osservatore a 100 ms ha fotografato coord3 in `mode=rebuilding` con già `vehicles=[88,201]` e
+`stations=[1,2]` in tabella. La riga del rebuild è rimasta `asked 0 station node(s) … 0
+station(s) answered`: la strada del `who_do_you_hold` non è cambiata di un millisecondo, i claim
+sono entrati dal renew adottato **durante** la ricostruzione.
+
+### 27.4 Il confine dichiarato: accorcia, non chiude
+
+Questa è la parte che non va lasciata implicita, perché è ciò che distingue una correzione da
+una che sembra tale.
+
+**La nostra metà non può chiudere la finestra.** Il renew immediato deve vincere una gara: se il
+leader precedente non ha ancora abdicato quando gli arriva, la rinnova lui, e il leader nuovo
+passa a `serving` a tabella vuota lo stesso. Nella corsa misurata il margine su quella gara era
+di **265 ms** — sufficiente, ma non garantito da niente. E se un coordinatore serve a tabella
+vuota *prima* che chiunque abbia potuto parlargli, nessuna prontezza del lato stazione arriva in
+tempo, per costruzione.
+
+Chiuderla richiede l'altra metà, che è del coordinatore e che **non abbiamo fatto**: non passare
+a `serving` con zero risposte *e* zero claim finché non è arrivato almeno un renew
+(`src/contracts/nota-per-B-p18.md`). È un compromesso disponibilità/correttezza — qualche
+`retry_later` in più a ogni rientro cieco — e si decide in due.
+
+**Il tick periodico non è stato toccato**, ed è la ragione per cui il rischio di regressione è
+quasi nullo: nessun `send_after` cancellato, spostato o rischedulato. Il giro immediato è *in
+più*, non *invece*, e il tick resta la rete di sicurezza per tutti i casi che nessun evento
+annuncia. Il corpo del giro è stato **estratto** in `renew_round/1` e chiamato dai due punti —
+copiarlo sarebbe stato il rilievo B3 della review di B (due posti che devono restare d'accordo)
+tre giorni dopo averlo chiuso — ma il `send_after` è rimasto **fuori** dalla funzione estratta,
+prima riga del tick: se ci fosse entrato, la strada del `nodeup` riprogrammerebbe il timer
+periodico come effetto collaterale, e «in più, non invece» smetterebbe di essere vero.
+
+### 27.5 Il debounce, e perché l'ordine delle due condizioni è una misura e non uno stile
+
+Quando il mesh si riforma i `nodeup` arrivano a raffica. Tre giri di renew non sarebbero
+pericolosi — sono idempotenti, ognuno è un solo `call_round` — ma sono rumore sul percorso
+critico di ogni `acquire`, e si evitano con un campo in `#state` che ricorda l'istante
+dell'ultimo giro. **Un campo, non un timer**: niente da cancellare, niente che possa sopravvivere
+a un cambio di stato.
+
+La finestra è **1000 ms**, e non è un numero scelto a occhio. Isolando la stazione e
+riconnettendola, station1 ha visto:
+
+```
+nodeup   +517 ms   vs@station2      <-- una STAZIONE, per prima
+         +777 ms   vs@coord3
+         +777 ms   vs@coord2
+         +788 ms   vs@coord1
+```
+
+**Quattro `nodeup` in 271 ms**, i tre coordinatori entro 11 ms. Un secondo li copre con margine e
+resta un ordine di grandezza sotto la finestra di rebuild (2 s) e sotto il tick (10 s).
+
+E la stessa misura decide una cosa che sembrava un dettaglio di scrittura: **il filtro sui
+`coord_nodes` deve stare prima del debounce.** Il primo `nodeup` della raffica è di una
+*stazione*, 260 ms davanti ai coordinatori; se il debounce si segnasse prima del filtro, il
+ritorno di una stazione consumerebbe la finestra e i tre `nodeup` che contano verrebbero
+ingoiati — cioè P18 resterebbe aperto esattamente nel caso per cui il fix esiste. Non l'avremmo
+saputo senza misurare la raffica: è il tipo di scelta che si prende bene solo con un numero
+davanti.
+
+### 27.6 Il `nodedown` non fa niente, e la clausola c'è lo stesso
+
+`handle_info({nodedown, Node}, …)` scrive una riga e basta: non tocca la tabella, non sposta il
+leader, non «prepara» nulla. **Un nodo che cade non dice chi serve adesso**, e reagire
+indovinando è la stessa specie di errore del coordinatore che serve a tabella vuota. La
+degradazione ha già il suo posto — `{renew_result, error}` è l'unico istante in cui la stazione
+sa *per certo* che nessun coordinatore ha risposto, ed è lì che si scrive il flag che il canale
+driver mostra.
+
+La clausola esiste solo perché il messaggio arriva comunque, e un fatto di quella taglia non
+deve sparire nel `logger:debug` del catch-all. È a livello `info` di proposito: al livello
+primario di default della release (`notice`, nessun `sys.config` da nessuna parte) quella riga
+non esce nel log dei container, ed è giusto così — serve a essere leggibile nel sorgente e ad
+essere alzata da chi sta debuggando una partizione, non a raccontare il cluster.
+
+**E le due clausole nuove stanno sopra il catch-all.** Sotto sarebbero codice morto e i test
+sarebbero verdi per il motivo sbagliato. Verificato con una mutazione invece che per
+ragionamento: spostandole sotto, il compilatore emette
+`this clause for handle_info/2 cannot match because a previous clause always matches` (due
+volte) e **quattro** dei sei test nuovi diventano rossi.
+
+### 27.7 Una cosa trovata mentre si misurava, e che riguarda il build
+
+`rebar.config` dichiara `{erl_opts, [debug_info, warnings_as_errors]}` e subito dopo
+`{overrides, [{del, [{erl_opts, [warnings_as_errors]}]}]}`, col commento *«The severity is
+dropped for the deps only — never for apps/»*. **Non è così**: la forma `{del, Options}` senza
+nome dell'applicazione vale per tutte, le nostre comprese. Misurato: la mutazione qui sopra
+compila con exit 0 nonostante due warning, e altrettanto fa una funzione inutilizzata con una
+variabile inutilizzata. Non corretto qui — rimettere `warnings_as_errors` su `apps/` è una
+modifica al build di tutto l'albero e va fatta guardando che cosa si rompe, non di sfuggita
+dentro un pair su un altro difetto. Registrata in `PROBLEMI_TROVATI.md`.
