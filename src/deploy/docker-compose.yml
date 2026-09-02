@@ -72,7 +72,10 @@ services:
       VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
       # Must mirror the seed rows of contracts/schema.sql for this station:
       # connector ids are globally unique (station 1 owns 1..4).
-      SITE_POWER_KW: 350
+      # Parametrico solo qui, e solo per la demo: `.env.demo` lo porta a 200 kW così
+      # che due auto bastino a rendere visibile il riparto della potenza. Il default
+      # resta 350, cioè il sito reale descritto in SCOPE §3.
+      SITE_POWER_KW: ${STATION1_SITE_POWER_KW:-350}
       CONNECTORS: "1:150,2:150,3:150,4:50"
       STATION_NAME: "Pisa Centro"
       WS_URL: "ws://localhost:9101/ws/driver"
