@@ -113,21 +113,24 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-    # Two networks, because a real charging site has two and they fail
-    # separately: `site1` is the LAN that joins this controller to its chargers,
-    # `voltshare` is the uplink to the operator's cluster.
+    # One network, and it is enough — including for the failure that seemed to
+    # need two.
     #
-    # This is what makes a station partition demonstrable. `docker network
-    # disconnect voltshare_voltshare station1` now cuts the uplink and leaves the
-    # site running: the coordinator loses the station, the browser loses it, and
-    # the cars keep charging — which is the failure the lease and the node
-    # monitor exist for, and the one with the clearest meaning outside this room.
+    # A second `site1` network, with the charge point emulators containerised on
+    # it, was added on 3/09 and removed the same day. The premise was that
+    # `docker network disconnect voltshare_voltshare station1` severed the
+    # station's uplink *and* its chargers at once, because the emulators run on
+    # the developer's machine and reach the station through a published port.
+    # The premise was wrong, and measuring properly is what showed it: a
+    # published port keeps working while the container is off the bridge, and a
+    # host emulator goes on charging right through the partition — 0.248 → 0.403
+    # → 0.558 kWh, side by side with a containerised one at 14.069 → 14.139 →
+    # 14.208.
     #
-    # With a single network we could not show it. Measured 3/09 before the split:
-    # the isolated station went on reporting `charging` while the energy stayed
-    # frozen at 34.523 kWh across three samples — the last reading before the
-    # cable went quiet, not a car still drawing power.
-    networks: [voltshare, site1]
+    # What had looked like proof of the opposite was a reconnect window sampled
+    # too fast: the meter tick is five seconds and the readings were three in
+    # six. The station partition is demonstrable exactly as it always was.
+    networks: [voltshare]
 
   station2:
     build:
@@ -159,62 +162,19 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-    # Same split as station1, for the same reason.
-    networks: [voltshare, site2]
+    networks: [voltshare]
 
-  # ------------------------------------------- charge points on the site LAN
+  # The charge points are NOT here, and that is deliberate.
   #
-  # The chargers of Livorno, as containers on `site2` — the station's own
-  # network. They are the same `cp.js` the demo scripts run from the host; what
-  # changes is *where they are attached*, and that is the whole point.
+  # They are emulated hardware, not part of the system (SCOPE §7), and they run
+  # from the host with `emulator/demo/world.sh` — one model for all seven
+  # connectors rather than two containerised and five not.
   #
-  # A charge point on the host reaches its station through a published port on
-  # the `voltshare` bridge, so isolating the station cut the cars off too. Here
-  # the cable is a link on `site2`, which a `docker network disconnect
-  # voltshare_voltshare station2` does not touch. The site keeps working while
-  # the operator goes blind — the failure we want to show.
+  # Two of them lived here briefly on 3/09, to put them on a per-site network so
+  # that a station partition would not cut the cables along with the uplink.
+  # Measuring properly showed the cables were never cut: see the note on
+  # station1's `networks`.
   #
-  # They are on Livorno and not on Pisa on purpose: Pisa's connectors belong to
-  # the presenter (§4 of DEMO.md), and a permanently attached charger there would
-  # take the socket that `presenter-cp.sh` needs, answering it 4409.
-  #
-  # `restart: unless-stopped` is the compose equivalent of the supervision loop
-  # in world.sh, and exists for the same reason: a charger that dies and is not
-  # replaced leaves the connector `out_of_service` thirty seconds later, and the
-  # lobby quietly offers one socket fewer for the rest of the demo.
-  cp6: &cp
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.emulator
-    image: voltshare-emulator:local
-    container_name: cp6
-    restart: unless-stopped
-    environment: &cp_env
-      # By service name, not localhost: this is the site LAN, and the station is
-      # a host on it.
-      CP_URL: ws://station2:8081/ws/cp
-      CP_STATION: "2"
-      CP_CONNECTOR: "6"
-      CP_VEHICLE: "101"
-      CP_SOC: "30"
-      CP_BATTERY: "60"
-      CP_MAX_KW: "50"
-    depends_on:
-      station2:
-        condition: service_started
-    networks: [site2]
-
-  cp7:
-    <<: *cp
-    container_name: cp7
-    environment:
-      <<: *cp_env
-      CP_CONNECTOR: "7"
-      CP_VEHICLE: "102"
-      CP_SOC: "55"
-      CP_BATTERY: "40"
-    networks: [site2]
-
   # ------------------------------------------------------- coordinators (M3)
   #
   # Three replicas of the same image and the same configuration. They differ
@@ -325,21 +285,11 @@ services:
     networks: [voltshare]
 
 networks:
-  # The operator's network: the cluster, the back office, the database. This is
-  # the one a partition is applied to.
+  # One network. `docker network disconnect voltshare_voltshare <container>` on
+  # it produces a real partition — the node stays up, believes itself alive, and
+  # sends no FIN — which is the failure `docker kill` cannot show and the reason
+  # the coordinators run a heartbeat instead of trusting `nodedown`.
   voltshare:
-    driver: bridge
-
-  # One LAN per site, joining a station to its own chargers. Nothing else is on
-  # them — not the coordinators, not the back office — because in a real
-  # deployment nothing else would be: these are cables in a car park.
-  #
-  # Their existence is what makes `docker network disconnect
-  # voltshare_voltshare stationN` a *partition* rather than a power cut. Without
-  # them the two links were the same link.
-  site1:
-    driver: bridge
-  site2:
     driver: bridge
 
 volumes:

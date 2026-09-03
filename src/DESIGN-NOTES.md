@@ -146,7 +146,7 @@ fail, and each gets a different answer:
 | a coordinator (crash) | `nodedown`, immediately | election; the new leader rebuilds from the stations | nothing; reservations refused for ~2 s |
 | a coordinator (partition) | heartbeat, 3 s | the minority suspends itself | new reservations, on the minority side only |
 | a station node (crash) | `monitor_node`, immediately | the coordinator drops that station's claims | sessions in progress there |
-| a station's uplink (partition) | `monitor_node`, on the tick | the coordinator drops the station; **the site keeps charging** | nothing; the operator's view of it |
+| a station's uplink (partition) | `monitor_node`, on the tick | the coordinator drops the station; **the site keeps charging**, but can start nothing new | the operator's view of it |
 | a charge point | its socket closes; 30 s grace | session closed with the last measured energy; connector `out_of_service` | nothing measured |
 | the back office (JVM) | nothing — it is a hidden node | the cluster is unaffected; on restart it re-reads and re-pushes | nothing durable |
 | MySQL | connection errors | **not tolerated** — see §7 | writes, until it returns |
@@ -187,37 +187,44 @@ path. **Two kinds of failure need two experiments**, which is why the demo shows
 
 The failure above is a station *dying*. The more interesting one — and the one with a
 meaning outside this room — is a station that is **alive and unreachable**: the car park is
-delivering power, and the operator cannot see it.
+delivering power, and the operator cannot see it. `docker network disconnect
+voltshare_voltshare station2` produces it, and unlike `kill` it has a plain real-world
+reading: the site's uplink is down.
 
-Showing it needs the deployment to admit that a charging site has **two networks**, which a
-real one does: a local LAN joining the controller to its chargers, and an uplink to the
-operator. They fail independently, and conflating them makes the failure undemonstrable.
+Measured on 3 September, with the station isolated:
 
-Until 3 September we had conflated them. The charge point emulators ran on the developer's
-machine and reached the station through a published Docker port on the cluster bridge, so
-`docker network disconnect` severed the uplink *and* the cables at once. The symptom was
-subtle enough to be believed: the isolated station went on reporting `charging` while the
-energy sat frozen at 34.523 kWh across three consecutive samples — the last reading before
-the cable went quiet, not a car still drawing power. A demo built on that would have
-claimed something false.
+- **the cars keep charging.** Energy climbing inside the isolated station across the
+  partition: 0.248 → 0.403 → 0.558 kWh on one connector, 14.069 → 14.139 → 14.208 on
+  another.
+- **the coordinator drops it**: `** Node vs@station2 not responding **` followed by
+  `node vs@station2 is down, dropping stations [2] and their claims`, and the leader down
+  to one known station.
+- **the lobby empties**, because the lobby is drawn from what the coordinator pushes.
+- on reconnect, the station re-announced, the leader was back to two, and neither session
+  was interrupted.
 
-The fix is topological, not algorithmic: each station now sits on `voltshare` **and** on a
-`siteN` network, and its charge points sit only on `siteN`. Nothing about the Erlang code
-changed. Measured after the split, with the uplink cut:
+Two details make the story sharper rather than weaker.
 
-- energy climbing inside the isolated station — **0.875 → 0.944 → 1.014 kWh**
-- the leader down to one known station, after `Node vs@station2 not responding` and
-  `dropping stations [2] and their claims`
-- on reconnect, the station re-announced and the leader was back to two, with **no
-  interruption** to either session (1.014 → 1.569 kWh across the whole episode)
+**The published ports survive.** Port 9102 still answers `426 Upgrade Required` while the
+station is isolated, so a driver physically at the site can still open its page and use it.
+What is lost is the operator's view. That is the honest shape of this failure — everything
+works except the party that needs to know — and it is exactly why reservations expire on
+their own instead of depending on someone to cancel them.
 
-One detail that makes the story sharper rather than weaker: **the published ports survive
-the partition**. Port 9102 still answers `426 Upgrade Required` while the station is
-isolated, so a driver physically at the site could still open its page. What is lost is the
-*lobby*, because the lobby is drawn from what the coordinator pushes. That is the honest
-shape of this failure — everything works except the party that needs to know — and it is
-exactly why reservations expire on their own instead of depending on someone to cancel
-them.
+**But no new session can start.** Authorising a car means resolving vehicle → owner, and
+that is a MySQL query across the severed link. `vs_cp_proto` logs `no account for vehicle N`
+and opens nothing; charges already running are untouched, because they never touch the
+database. An isolated site therefore finishes what it started and accepts nobody new —
+which is what a real site controller does with an unknown card and no uplink, and is worth
+saying out loud rather than discovering on stage.
+
+*A note on how this was established, because the method matters more than the result.* The
+first attempt appeared to show the opposite: the isolated station reported `charging` while
+the energy sat frozen at 34.523 kWh. That reading produced a whole redesign — a second
+network per site, the emulators containerised onto it — on the theory that a published port
+could not survive the disconnect. It could. The frozen number was a reconnect window
+sampled three times in six seconds against a five-second meter tick. The redesign was
+reverted the same day; **what survived is the measurement, taken slowly.**
 
 ### A station dies: the coordinator frees its vehicles
 

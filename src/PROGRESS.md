@@ -3629,6 +3629,13 @@ paragrafo sui due rilevatori, perché condiziona ciò che P2b e P4 possono prome
 sono la sua cronaca; ma dove servivano a sostenere un'affermazione — P18 in `DESIGN-NOTES`
 §4c — ho messo i numeri per esteso invece del rimando, così la frase regge da sola.
 
+### ⚠️ La sezione qui sotto è sbagliata nella diagnosi, e la correzione sta dopo
+
+Quello che segue è stato scritto e committato (`3840cc8`) sulla base di una misura letta
+male, e **la modifica è stata annullata lo stesso giorno**. Lo lascio perché la conclusione
+finale non si capisce senza, e perché l'errore è più istruttivo del risultato: vedi *«La
+misura rifatta piano»* più sotto.
+
 ### La partizione di una stazione, che dichiaravamo e non sapevamo mostrare
 
 Il guasto più raccontabile del progetto — **il sito funziona, le auto caricano, l'operatore
@@ -3687,13 +3694,85 @@ caso duro — sessioni perse, verificato con `sessions` ferma a 3 prima e dopo �
 tempo stringe si tiene il `disconnect`, che è quello che si racconta senza dover spiegare
 cosa sia un container.
 
+### La misura rifatta piano, e la modifica buttata
+
+La sezione precedente poggiava su un numero: **34,523 kWh fermo su tre letture** a stazione
+isolata. Da lì la conclusione «la porta pubblicata non sopravvive al `disconnect`, quindi il
+cavo è tagliato insieme all'uplink», e da lì una riprogettazione del deploy — reti per sito,
+emulatori containerizzati.
+
+**La conclusione era falsa.** Ecco l'esperimento che l'ha smontata, fatto perché A ha
+obiettato che due colonnine in container e cinque no non è un progetto ma una modifica
+lasciata a metà.
+
+Con `station2` isolata, una `cp.js` **lanciata dall'host** si collega senza problemi:
+
+```
+10:38:44  conn5 connecting to ws://localhost:9202/ws/cp
+10:38:44  conn5 connected
+10:38:44  conn5 boot accepted
+```
+
+E, con un'auto già in carica, l'energia **sale attraverso la partizione**, fianco a fianco
+con una containerizzata:
+
+```
+conn 5  (host)        0,248 → 0,403 → 0,558
+conn 6  (container)  14,069 → 14,139 → 14,208
+```
+
+Identiche. **I container non servivano.** Il numero congelato di stamattina era la finestra
+di riconnessione, campionata tre volte in sei secondi contro un tick di cinque. È il terzo
+errore dello stesso tipo in una giornata: due volte ho letto un contatore troppo in fretta e
+ho concluso che si fosse fermato.
+
+Annullato: via `cp6`, `cp7`, le reti `site1`/`site2` e `Dockerfile.emulator`. Torna
+`world.sh` per tutte e sette le prese, un modello solo. Il beat della partizione funziona
+come prima — anzi, ora si sa che funziona, invece di crederlo.
+
+**Cosa sopravvive della giornata, ed è la parte che vale**: le misure, che valgono comunque
+di dove girino gli emulatori.
+
+1. **Una stazione isolata continua a erogare** e il coordinatore la scarta:
+   `** Node vs@station2 not responding **` → `dropping stations [2] and their claims`, leader
+   sceso a una stazione, lobby svuotata. Alla riconnessione, due stazioni e nessuna
+   interruzione.
+2. **Le porte pubblicate sopravvivono**: la 9102 risponde `426` a stazione isolata, quindi
+   chi è fisicamente lì può ancora aprire la pagina. Si perde la *vista* dell'operatore,
+   non il servizio. È la forma onesta di questo guasto.
+3. **Ma una sessione nuova non parte.** Autorizzare un'auto significa risalire dal veicolo
+   al proprietario, cioè MySQL, che sta oltre il taglio: `no account for vehicle 104` e
+   nessuna sessione aperta. Le ricariche già in corso non se ne accorgono, perché non
+   toccano il database. Realistico — è ciò che fa una colonnina vera con una tessera
+   sconosciuta e nessuna linea — e mai scritto prima.
+4. **Un difetto vero, nel perimetro di A.** `vs_station_db` si riprende dopo la partizione,
+   ma non all'istante; e un `plugged` che arriva in quella finestra viene **perso in
+   silenzio**. `vs_cp_proto:with_account/4` logga `no account for vehicle N`, ritorna
+   `{[], Session}` — nessuna risposta sul canale, nessun ritardo, nessun tentativo — e la
+   colonnina continua a misurare nel vuoto per sempre. Visto dal vivo: `limit 0 kW`, dodici
+   `meter` a `0 kW, 0 kWh` di fila. Serve almeno un tentativo, o un rifiuto esplicito.
+   **Da mettere nella nota per A.**
+
+### La lezione, che vale più della modifica
+
+Un contatore che non si muove **non è la prova che il sistema sia fermo**: è la prova che
+non hai aspettato abbastanza. Tre volte oggi ho scambiato la seconda cosa per la prima, e
+la terza mi è costata una riprogettazione del deploy e quaranta minuti.
+
+Nel runbook è finita come regola operativa: davanti a un'energia che non sale, guardare per
+**almeno mezzo minuto** prima di concludere — il tick è di cinque secondi e dopo una
+partizione c'è una finestra di riconnessione.
+
 ### Non provato — e perché
 
 - **La demo intera in sequenza** non è ancora stata corsa: la giornata è stata di
   diagnosi. Le singole battute sì.
-- **La partizione di `station1`** non è stata provata: solo quella di `station2`, che è
-  l'unica con le colonnine containerizzate. Su Pisa le prese restano del presentatore e
-  l'esperimento darebbe il vecchio risultato — cavi tagliati insieme all'uplink.
+- **La partizione di `station1`** non è stata provata, solo quella di `station2`. Ora che si
+  sa che gli emulatori sull'host reggono, non c'è motivo perché dia un risultato diverso —
+  ma è una deduzione, non una misura.
+- **Il difetto n. 4 non è stato riprodotto una seconda volta**: colto una volta sola, nella
+  finestra di ripresa del database. Riproducibile fermando MySQL per qualche secondo, non
+  provato.
 - **`not_your_reservation` e `unknown_vehicle` end-to-end**: i due rifiuti del canale
   colonnina hanno test unitari ma nessuna corsa. Si producono in due comandi
   (`cp.js --vehicle 88` per lo sconosciuto, un veicolo seminato diverso dal titolare per
