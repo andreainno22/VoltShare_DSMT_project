@@ -122,7 +122,36 @@
                 claims = #{} :: #{binary() => #claim{}},
                 last_stats  = undefined :: undefined |
                                            {non_neg_integer(), non_neg_integer(),
-                                            non_neg_integer()}}).
+                                            non_neg_integer()},
+                %% P18 — when the last round provoked by a `nodeup' went
+                %% out, on the monotonic clock. The whole debounce: no new
+                %% timer, so there is nothing to cancel and nothing that can
+                %% outlive a state change. `undefined' until the first one.
+                %%
+                %% Monotonic, not `vs_time:now_ms/0': this number never
+                %% leaves the node and is only ever subtracted from another
+                %% reading of itself, which is exactly the case the wall
+                %% clock can get wrong (an NTP step during a partition would
+                %% make the window a random length). Every timestamp that
+                %% goes on the wire still goes through vs_time.
+                %%
+                %% **Appended, and that is deliberate.** This record has no
+                %% header and lives in this module alone, so every probe
+                %% that has ever read it — the `sys:get_state' recipes in
+                %% REPORT_CLAIM_RIFLESSO §348, REPORT_M3A_VERIFICA §262 and
+                %% REPORT_M3A_CODA §1.4/§10 — reads it *by position*.
+                %% Inserting a field higher up would silently move `leader'
+                %% (4) and `claims' (9) under all of them.
+                last_nodeup = undefined :: undefined | integer()}).
+
+%% P18 — how long a round provoked by a `nodeup' silences the next ones.
+%%
+%% Measured, not imagined (REPORT_P18 §1.3): a whole mesh reformation seen
+%% from a station is **four `nodeup' in 271 ms**, the three coordinators
+%% within 11 ms of each other. A second covers that burst with room to
+%% spare and stays an order of magnitude below every scale it has to
+%% respect — the coordinator's rebuild window is 2 s, the renew tick 10 s.
+-define(NODEUP_DEBOUNCE_MS, 1000).
 
 %%%===================================================================
 %%% claim_mod interface
@@ -321,6 +350,17 @@ init(Opts) ->
                                       ['coord1@coord1', 'coord2@coord2', 'coord3@coord3'])),
     Info = maps:get(station_info, Opts, station_info_from_env(StationId)),
     init_reach_table(),
+    %% P18 — from here on, a coordinator coming back is something this
+    %% process is *told*, not something the next tick discovers. See the
+    %% `nodeup' clause of handle_info/2 for what is done with it.
+    %%
+    %% Asserted rather than swallowed: the plan's rule for this line is
+    %% that a station which cannot subscribe to node events is a boot that
+    %% failed, and a silently ignored return would leave the periodic tick
+    %% as the only path with nothing red anywhere to say so. Measured on
+    %% OTP 29: this answers `ok' on a node that is not distributed too, so
+    %% the eunit VM is not a special case and needs no branch here.
+    ok = net_kernel:monitor_nodes(true),
     {ok, #state{station_id  = StationId,
                 nodes       = Nodes,
                 leader      = hd(Nodes),            %% §4: first entry until told better
@@ -513,32 +553,12 @@ handle_cast(_Msg, State) ->
 
 %% -- the renew loop --------------------------------------------------
 
-handle_info(renew_tick, State0 = #state{claims = Claims0}) ->
-    erlang:send_after(State0#state.renew_ms, self(), renew_tick),
-    %% The safety net (piano §1.4), applied before the batch is built so
-    %% that nothing dead can be in it. See drop_expired/1 for why it is
-    %% here at all and why it shouts.
-    Claims = drop_expired(Claims0),
-    State = State0#state{claims = Claims},
-    case map_size(Claims) of
-        0 -> ok;
-        _ ->
-            %% Five fields (contract PR of 24/08): UserId so that a new
-            %% leader adopting the claim can enforce suspensions, and the
-            %% coordinator-issued GrantedAt so that adoption preserves the
-            %% original ordering instead of resetting it.
-            Batch = [{ClaimId, C#claim.vehicle_id, C#claim.conn_id,
-                      C#claim.user_id, C#claim.granted_at}
-                     || {ClaimId, C} <- maps:to_list(Claims)],
-            Msg = {renew, State#state.station_id, Batch},
-            Self = self(),
-            {Leader, Nodes, T} = {State#state.leader, State#state.nodes,
-                                  State#state.timeout_ms},
-            %% Ephemeral worker (scelte §4.4): the round of remote calls
-            %% happens out there, the outcome comes back as a message.
-            _ = spawn(fun() -> Self ! {renew_result, call_round(Msg, Leader, Nodes, T)} end)
-    end,
-    {noreply, State};
+%% The tick re-arms itself and then does one round. The re-arming is the
+%% FIRST line and stays out of renew_round/1 on purpose: see the note
+%% there.
+handle_info(renew_tick, State) ->
+    erlang:send_after(State#state.renew_ms, self(), renew_tick),
+    {noreply, renew_round(State)};
 
 handle_info({renew_result, error}, State) ->
     %% No coordinator answered. NOT a revocation (§5.4): claims are kept,
@@ -645,6 +665,105 @@ handle_info(announce_tick, State) ->
     erlang:send_after(State#state.announce_ms, self(), announce_tick),
     {noreply, State};
 
+%% -- a coordinator came back (P18) -----------------------------------
+
+%% The whole of P18 on our side, and it is a change of *when*, not of what:
+%% the messages sent here are the two this process already sends.
+%%
+%% What P18 measured: a leader that comes back from a partition rebuilds by
+%% asking `vs_coord_rebuild:station_nodes/0', which is a filter on `nodes()'
+%% — and at the instant it is elected the distribution mesh towards the
+%% stations has not been rebuilt yet, so it asks nobody, waits out
+%% COORD_REBUILD_TIMEOUT_MS (2 s) and starts serving with an empty table.
+%% Until some station renews, it will grant a vehicle that is already
+%% charging somewhere else. Re-presentation already existed and was already
+%% correct — it just waited for the tick, up to CLAIM_RENEW_INTERVAL_MS
+%% (10 s). The station knew, and was waiting for a clock to say it.
+%%
+%% Measured on the live cluster (REPORT_P18 §1.1, §2.3): the `nodeup' lands
+%% 959 ms after the network is back — 342 ms INSIDE the coordinator's
+%% rebuild window and 1.7 s before it starts serving — while the tick took
+%% 4.1 s beyond that point to close the same gap.
+%%
+%% Three things this clause deliberately does NOT do:
+%%
+%%   * it does not touch `leader'. A node coming up says nothing about who
+%%     leads; the renew round below finds that out for real, through the
+%%     `not_serving' redirect, and the answer moves the leader then.
+%%   * it does not touch the tick. No `send_after' is cancelled, moved or
+%%     rescheduled anywhere in this clause: the immediate round is one
+%%     MORE, never one INSTEAD. The tick stays the safety net for every
+%%     case no event announces.
+%%   * it does not ping anybody to keep connections warm. That was the
+%%     alternative (piano §4) and it depends on winning a race we do not
+%%     control; a defence that only works when it is lucky is worse than
+%%     one declared absent.
+handle_info({nodeup, Node}, State = #state{nodes = Nodes, last_nodeup = Last}) ->
+    Now = erlang:monotonic_time(millisecond),
+    %% The filter comes FIRST, and the order of these two conditions is not
+    %% style. A mesh reformation is four nodeups in 271 ms and the first one
+    %% measured was a *station*, 260 ms ahead of the coordinators
+    %% (REPORT_P18 §1.3). A debounce stamped before the filter would let a
+    %% station's return eat the window and swallow the three that matter —
+    %% leaving P18 open in exactly the case this exists for.
+    case lists:member(Node, Nodes) andalso not debounced(Now, Last) of
+        false ->
+            %% Not a coordinator, or one round already went out for this
+            %% same reformation. Silence is the whole answer.
+            {noreply, State};
+        true ->
+            logger:notice("claim client: coordinator ~p is back — re-announcing "
+                          "and renewing ~p claim(s) now",
+                          [Node, map_size(State#state.claims)]),
+            %% Announcement first, then the renew, and the order is the one
+            %% `handle_continue(announce, …)' already fixes at boot for the
+            %% reason written there: *"a claim presented to a coordinator
+            %% that has never heard of this station comes back
+            %% `unknown_station' on the first renew; announcing first costs
+            %% one cast and removes that round trip"*. A leader that has
+            %% just rebuilt from zero answers IS such a coordinator.
+            %%
+            %% Read on the coordinator, not assumed (REPORT_P18 §1.2): B's
+            %% `do_renew/3' does not consult `stations' at all, so a renew
+            %% from an unknown station is adopted rather than refused —
+            %% the announcement is precedence here, not necessity. What it
+            %% does buy is the request AFTER this one: adoption fills
+            %% `claims' and never `stations', so without the announcement
+            %% the next `acquire' from this station is still refused
+            %% `unknown_station'. Measured: 19.7 s of exactly that, waiting
+            %% for the 30 s announce tick (REPORT_P18 §2.3).
+            %%
+            %% Both go out from their own throwaway process, so "first" is
+            %% the order they are handed over in, not an ordering on the
+            %% wire — pairwise FIFO needs one sender and one destination
+            %% (see do_acquire/4, which relies on it and says so). Nothing
+            %% here depends on which arrives first; that is why it is safe
+            %% to state it as a precedence rather than to enforce it.
+            do_announce(State),
+            State1 = renew_round(State),
+            {noreply, State1#state{last_nodeup = Now}}
+    end;
+
+%% A node went away, and the right amount of work to do about it is none.
+%%
+%% Nothing here touches the claim table, moves the leader, or "prepares"
+%% anything: a node that falls does not say who serves now, and reacting on
+%% a guess is the same mistake as a coordinator serving from an empty table.
+%% Degradation already has its place — `{renew_result, error}' is the one
+%% moment this station knows for certain that no coordinator answered, and
+%% that is where `coordinator_reachable' is written.
+%%
+%% The clause exists only because the message arrives whether we want it or
+%% not, and a fact of this size should not disappear into the catch-all's
+%% `logger:debug'. `info' rather than `notice' deliberately: at the release's
+%% default primary level (`notice', no sys.config anywhere) this line does
+%% not reach the container log, which is right — it is here to be readable
+%% in the source and to be turned up when somebody is debugging a partition,
+%% not to narrate the cluster.
+handle_info({nodedown, Node}, State) ->
+    logger:info("claim client: ~p went down — nothing to do here", [Node]),
+    {noreply, State};
+
 handle_info(Info, State) ->
     logger:debug("claim client ignoring ~p", [Info]),
     {noreply, State}.
@@ -728,6 +847,54 @@ call_one(Msg, Node, T) ->
 %%%===================================================================
 %%% internal
 %%%===================================================================
+
+%% One renew round: sweep what has expired, batch what is left, hand the
+%% remote calls to a throwaway process. Returns the state with the swept
+%% table.
+%%
+%% Two callers — the periodic tick and the `nodeup' clause — and one body,
+%% because the alternative is two places that have to keep agreeing about
+%% the shape of a batch. That is rilievo B3 of B's review, closed three
+%% days ago; re-opening it here to save a function would be a poor trade.
+%%
+%% **The `send_after' of the tick is not in here, and must not be.** The
+%% tick re-arms itself on its own first line. If the re-arming lived in
+%% this function the `nodeup' path would reschedule the periodic timer as a
+%% side effect of doing something else — the two would stop being
+%% independent, and "the immediate round is one more, never one instead"
+%% would quietly stop being true.
+renew_round(State0 = #state{claims = Claims0}) ->
+    %% The safety net (piano §1.4), applied before the batch is built so
+    %% that nothing dead can be in it. See drop_expired/1 for why it is
+    %% here at all and why it shouts.
+    Claims = drop_expired(Claims0),
+    State = State0#state{claims = Claims},
+    case map_size(Claims) of
+        0 -> ok;
+        _ ->
+            %% Five fields (contract PR of 24/08): UserId so that a new
+            %% leader adopting the claim can enforce suspensions, and the
+            %% coordinator-issued GrantedAt so that adoption preserves the
+            %% original ordering instead of resetting it.
+            Batch = [{ClaimId, C#claim.vehicle_id, C#claim.conn_id,
+                      C#claim.user_id, C#claim.granted_at}
+                     || {ClaimId, C} <- maps:to_list(Claims)],
+            Msg = {renew, State#state.station_id, Batch},
+            Self = self(),
+            {Leader, Nodes, T} = {State#state.leader, State#state.nodes,
+                                  State#state.timeout_ms},
+            %% Ephemeral worker (scelte §4.4): the round of remote calls
+            %% happens out there, the outcome comes back as a message.
+            _ = spawn(fun() -> Self ! {renew_result, call_round(Msg, Leader, Nodes, T)} end)
+    end,
+    State.
+
+%% P18 — has a nodeup-driven round already gone out inside the window?
+%%
+%% `undefined' is the first one ever, and it is never debounced: a client
+%% that has just booted has no round to be too close to.
+debounced(_Now, undefined) -> false;
+debounced(Now, Last)       -> Now - Last < ?NODEUP_DEBOUNCE_MS.
 
 %% Wire refusals → the connector's refusal atoms (claim.md §3.1 table).
 %%
