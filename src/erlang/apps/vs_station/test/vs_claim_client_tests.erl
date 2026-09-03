@@ -12,6 +12,11 @@
 -define(VEHICLE, 88).
 -define(CONN, 3).
 
+%% P18 — a second claim, so that "the round carried *everything* the
+%% station holds" is an assertion about a batch and not about a singleton.
+-define(VEHICLE2, 201).
+-define(CONN2, 1).
+
 %%%===================================================================
 %%% fixtures
 %%%===================================================================
@@ -94,6 +99,18 @@ history_has(Pred) ->
 
 acquire() ->
     vs_claim_client:acquire(?VEHICLE, ?USER, 1, ?CONN).
+
+acquire2() ->
+    vs_claim_client:acquire(?VEHICLE2, ?USER, 1, ?CONN2).
+
+%% How many messages of one kind the coordinator has received. `history_has'
+%% answers "at least one", which is the wrong question for P18: the whole
+%% point of the debounce is that a burst produces *exactly* one round.
+count(Tag) ->
+    length([M || M <- vs_mock_coord:history(), element(1, M) =:= Tag]).
+
+renews() ->
+    [M || M <- vs_mock_coord:history(), element(1, M) =:= renew].
 
 %% P15 — who is monitoring this process. The manager monitors every
 %% connector too (its registry heals on the DOWN), so the assertions
@@ -854,3 +871,172 @@ a_notification_with_an_unreachable_leader_is_dropped_test() ->
         wait_gone([vs_claim_client]),
         flush()
     end.
+
+%%%===================================================================
+%%% P18 — a coordinator comes back, and the claims go out at once
+%%%===================================================================
+%%
+%% The defect these six describe is not a missing mechanism: the renew
+%% batch already carries every claim with its original `granted_at', and a
+%% leader that rebuilt from zero answers adopts them. What was missing was
+%% the *moment*. A coordinator that comes back was discovered by the next
+%% `renew_tick' — up to CLAIM_RENEW_INTERVAL_MS later, 10 s in production —
+%% while it starts granting reservations about 2 s after it is elected. The
+%% station knew, and was waiting for a clock to ask it.
+%%
+%% Every one of these drives the client with a `{nodeup, …}' sent straight
+%% to the process. That is not a shortcut around a cluster: `nodeup' IS an
+%% `handle_info' message, so sending it is the same event the VM would
+%% deliver, and the whole scenario becomes deterministic — no second node,
+%% no partition, no sleep (P11: nothing here is measured on a clock).
+%%
+%% `renew_interval_ms => 60000' everywhere except the last one, and it is
+%% part of the assertion rather than tidiness: with the tick pushed out past
+%% the end of the test, a batch that shows up can only have come from the
+%% `nodeup'. `client_opts/0' shortens the tick to 50 ms, which would put a
+%% renew in the history twenty times a second and make every count below
+%% meaningless.
+
+%% The one that says what P18 is about: two claims, one event, both
+%% re-presented at once — and the announcement with them, because a leader
+%% that has just rebuilt from nothing is exactly a coordinator that has
+%% never heard of this station (the reason `handle_continue(announce, …)'
+%% announces before it asks the connectors).
+a_coordinator_coming_back_re_presents_every_claim_at_once_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        {ok, C1, G1, _} = acquire(),
+        {ok, C2, G2, _} = acquire2(),
+        %% the boot announcement has landed; from here the history is ours
+        ok = wait_until(fun() -> count(station_up) >= 1 end),
+        ok = vs_mock_coord:reset(),
+        vs_claim_client ! {nodeup, node()},
+        ok = wait_until(fun() -> count(renew) >= 1 end),
+        %% one round, and it carried the whole table — five fields per
+        %% entry, with the coordinator-issued GrantedAt echoed back
+        ?assertEqual([{renew, 1, lists:sort([{C1, ?VEHICLE,  ?CONN,  ?USER, G1},
+                                             {C2, ?VEHICLE2, ?CONN2, ?USER, G2}])}],
+                     [{renew, S, lists:sort(B)} || {renew, S, B} <- renews()]),
+        %% and the announcement went with it
+        ?assertEqual(1, count(station_up))
+    end).
+
+%% A mesh reformation is not one event. Measured on the live cluster
+%% (REPORT_P18 §1.3), a station that comes back sees four `nodeup' inside
+%% 271 ms — the three coordinators within 11 ms of each other. Three rounds
+%% would not be dangerous (they are idempotent, and each is one
+%% `call_round'), but they are noise on the path every `acquire' goes
+%% through, and the cheap way to not make it is a debounce.
+%%
+%% The synchronisation is the `get_route' call: it is a call, so it cannot
+%% be answered before all three `nodeup' messages ahead of it in this
+%% process's mailbox have been handled to the end. What is counted
+%% afterwards is therefore what the client *decided* to send, not what the
+%% scheduler had got round to.
+three_nodeups_in_a_burst_produce_one_round_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        {ok, _C, _G, _E} = acquire(),
+        ok = wait_until(fun() -> count(station_up) >= 1 end),
+        ok = vs_mock_coord:reset(),
+        lists:foreach(fun(_) -> vs_claim_client ! {nodeup, node()} end, [1, 2, 3]),
+        _ = gen_server:call(vs_claim_client, get_route),
+        ok = wait_until(fun() -> count(renew) >= 1 end),
+        ?assertEqual(1, count(renew)),
+        ?assertEqual(1, count(station_up))
+    end).
+
+%% The filter, and it is the first of the two conditions rather than the
+%% second for a reason the same measurement gives: in that burst of four,
+%% the first `nodeup' to arrive was a **station**, 260 ms ahead of the
+%% coordinators. A debounce stamped before the filter would let a station's
+%% return eat the window and swallow the three that matter.
+%%
+%% Which is also how this test is built. The stranger goes first; then a
+%% second claim is acquired — a synchronous round trip through the client,
+%% so by the time it returns the stranger's `nodeup' has been handled to
+%% the end — and only then the real one. A round provoked by the stranger
+%% would carry **one** claim and would have stamped the debounce, so the
+%% real `nodeup' would be swallowed and the two-claim batch below would
+%% never appear: the wait times out rather than quietly passing.
+a_nodeup_from_a_node_that_is_not_a_coordinator_does_nothing_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        {ok, C1, G1, _} = acquire(),
+        ok = wait_until(fun() -> count(station_up) >= 1 end),
+        ok = vs_mock_coord:reset(),
+        vs_claim_client ! {nodeup, 'stranger@nowhere'},
+        {ok, C2, G2, _} = acquire2(),
+        vs_claim_client ! {nodeup, node()},
+        ok = wait_until(fun() ->
+            [] =/= [B || {renew, _S, B} <- renews(), length(B) =:= 2]
+        end),
+        ?assertEqual([{renew, 1, lists:sort([{C1, ?VEHICLE,  ?CONN,  ?USER, G1},
+                                             {C2, ?VEHICLE2, ?CONN2, ?USER, G2}])}],
+                     [{renew, S, lists:sort(B)} || {renew, S, B} <- renews()]),
+        ?assertEqual(1, count(station_up))
+    end).
+
+%% Nothing to re-present is not a reason to stay quiet about being here.
+%% The announcement is what puts this station back in the coordinator's
+%% `stations' map, and adoption never does that — measured on the cluster:
+%% a leader served with two adopted claims and `stations = []' for 19.7 s,
+%% refusing this station's next `acquire' with `unknown_station', until the
+%% 30 s announce tick came round (REPORT_P18 §2.3).
+%%
+%% The renew, on the other hand, is skipped for exactly the reason the tick
+%% skips it: `map_size(Claims) =:= 0 -> ok'. An empty batch would be a
+%% question with no content.
+a_coordinator_coming_back_is_announced_to_even_with_no_claims_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        ok = wait_until(fun() -> count(station_up) >= 1 end),
+        ok = vs_mock_coord:reset(),
+        vs_claim_client ! {nodeup, node()},
+        ok = wait_until(fun() -> count(station_up) >= 1 end),
+        _ = gen_server:call(vs_claim_client, get_route),
+        ?assertEqual(1, count(station_up)),
+        ?assertEqual(0, count(renew))
+    end).
+
+%% The other half of the pair, and the whole of it is that nothing happens.
+%%
+%% A node going down does not say who serves now, and a claim client that
+%% "prepared" for it — moving the leader, dropping rows, re-presenting
+%% pre-emptively — would be guessing, which is the same mistake as a
+%% coordinator that serves from an empty table. Degradation already has a
+%% place: `{renew_result, error}' is the one moment this station knows for
+%% certain that nobody answered, and that is where the flag is written.
+%%
+%% `holds()' is compared whole — claim id, granted_at and expires_at — so
+%% "identical" means identical, not "still one row".
+a_nodedown_leaves_the_claim_table_exactly_as_it_was_test() ->
+    with_client(#{renew_interval_ms => 60000}, fun() ->
+        {ok, _C, _G, _E} = acquire(),
+        ok = wait_until(fun() -> count(station_up) >= 1 end),
+        ok = vs_mock_coord:reset(),
+        Before = holds(),
+        ?assertMatch({1, [_]}, Before),
+        vs_claim_client ! {nodedown, node()},
+        %% a call: it cannot be answered before the nodedown has been handled
+        Route = gen_server:call(vs_claim_client, get_route),
+        ?assertEqual(Before, holds()),
+        %% the leader was not moved either
+        ?assertEqual({node(), [node()], 60000}, Route),
+        %% nothing was sent to anybody, and nothing is queued to be
+        ?assertEqual(0, count(station_up)),
+        ?assertEqual(0, count(renew)),
+        ?assertEqual({message_queue_len, 0},
+                     process_info(whereis(vs_claim_client), message_queue_len))
+    end).
+
+%% The regression guard for the extraction. `renew_round/1' is now called
+%% from two places, and the one thing that must NOT have moved into it is
+%% the tick's `erlang:send_after/3': a tick that fired once and never again
+%% would still pass `renew_batches_the_claims_every_tick_test', because one
+%% batch is all that one asserts.
+%%
+%% Three batches, so the tick has re-armed itself at least twice. Bounded
+%% retry, not a measurement: at the 50 ms of `client_opts/0' this leaves
+%% after ~150 ms, and only a red run ever reaches the ceiling.
+the_periodic_tick_still_re_arms_itself_test() ->
+    with_client(fun() ->
+        {ok, _C, _G, _E} = acquire(),
+        ok = wait_until(fun() -> count(renew) >= 3 end)
+    end).

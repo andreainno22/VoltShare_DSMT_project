@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 28 agosto 2026 — M1-B, M2-B, M3-B e **M4-B** chiuse. Penalità verificate end-to-end, comprese le sospensioni che sopravvivono a un failover. Partizione di rete vera dimostrata su un host solo. 133 test, 0 fallimenti.
+**Ultimo aggiornamento:** 2 settembre 2026 — **tutte le milestone di codice sono chiuse sui due lati.** M0, M1, M2, M3 e M4, di A e di B, sono su `main` (`9ff8e63`). Lato A si sono chiuse **M3-A** (§7zd, §7ze, §7zj) e **M4-A** (§7zf, §7zg, §7zh, §7zi), e l'1/09 il giro intero è stato guardato **in un browser vero** (§7zk) — era l'ultima cosa che restava fuori dal M1. Del difetto grave **P18** la **metà di A è fatta e misurata** il 02/09 (§7zl, `a/p18-nodeup`): finestra di esposizione da **4,11 s a 0 ms**, suite da 386 a **392 test**, 0 fallimenti su tre giri con `eunit_check.sh`. La **metà di B resta aperta** ed è una decisione, non una correzione (§8, `src/contracts/nota-per-B-p18.md`). Poi la M5: prova generale, demo, relazione.
 
 ---
 
@@ -12,11 +12,11 @@ Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md
 | Milestone | A (stazione, emulatore, viste live) | B (coordinatore, back office, pagine) |
 |---|---|---|
 | **M0** fondamenta | ✅ impianto Erlang, ping fra nodi, deploy | ✅ contratti, schema, token di esempio |
-| **M1** percorso base | ✅ **chiusa e verificata in Docker il 27/08**: 7 container, token emesso da Tomcat e verificato dalla stazione, `reserve` fino al coordinatore vero e ritorno, dedup provata dentro `vs_coord_srv`, lease che libera da solo, riconnessione dopo `stop station1`. Resta fuori solo la resa visiva in un browser vero (estensione non disponibile): la logica del rendering è provata con un DOM minimale, non i pixel | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
-| **M2** sessione e potenza | ✅ **chiusa il 28/08**: canale colonnina, riparto della potenza, INSERT su `sessions`, `session.jsp`, emulatore | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
-| **M3** tolleranza ai guasti | ⬜ rinnovo contro il nuovo leader, revoca, riconnessione client | ✅ **elezione, quorum, ricostruzione** — failover provato in Docker (§7m) |
-| **M4** regole di dominio | ⬜ overstay, lista d'attesa, segnalazione no_show | ✅ **penalità, notifiche, profilo** — provate contro il cluster (§7z) |
-| **M5** consegna | ⬜ | ⬜ |
+| **M1** percorso base | ✅ **chiusa e verificata in Docker il 27/08**: 7 container, token emesso da Tomcat e verificato dalla stazione, `reserve` fino al coordinatore vero e ritorno, dedup provata dentro `vs_coord_srv`, lease che libera da solo, riconnessione dopo `stop station1`. La resa visiva, unica cosa rimasta fuori per settimane, è **chiusa l'1/09** nel Chrome vero (§7zk): fino a quel giorno la logica del rendering era provata con un DOM minimale, non coi pixel | ✅ **chiusa e verificata in Docker il 25/08**: coordinatore vero, ponte JInterface, Tomcat, lobby con dati veri dal browser |
+| **M2** sessione e potenza | ✅ **chiusa il 28/08**: canale colonnina, riparto della potenza, INSERT su `sessions`, `session.jsp`, emulatore. L'ultima pendenza — il fuso di `history.jsp`, che serviva un browser — è chiusa l'1/09 (§7zj, §7zk) | ✅ **fatturazione e storico**, provati contro MySQL (§7k) |
+| **M3** tolleranza ai guasti | ✅ **chiusa fra il 29/08 e l'1/09**: il claim client smette di *ricordare* i claim e li **riflette** dai connettori (P14/P15, §7zd); il canale driver non risponde più «non è tuo» a un connettore che sta riavviando (P13/P12, §7ze); e le quattro misure di coda — partizione vera del leader vista dalla stazione, strada lenta, scadenza naturale, redirect circolare prodotto nei container (§7zj). Da quest'ultima è uscito **P18**, grave, misurato e non corretto per scelta (§8) | ✅ **elezione, quorum, ricostruzione** — failover provato in Docker (§7m) |
+| **M4** regole di dominio | ✅ **chiusa fra il 30/08 e l'1/09**: `overstay` come fase derivata da `complete`, con `overstay_seconds` **netto** scritto all'unplug (§7zf); no-show e show-up raccontati al coordinatore **at-most-once** (§7zg); il frame `notification` di `ws-driver.md` §5.3 finalmente **emesso** — sei kind live al browser, quattro anche in copia durevole (§7zh); più i cinque rilievi della review di B, applicati per intero (§7zi). **La lista d'attesa resta fuori di proposito**: non è M4, e il contratto ora dichiara `waitlist_offer` non producibile invece di lasciarlo sembrare implementato | ✅ **penalità, notifiche, profilo** — provate contro il cluster (§7z) |
+| **M5** consegna | ⬜ prova generale, demo, relazione | ⬜ prova generale, demo, relazione |
 
 ### Cosa è stato realmente eseguito
 
@@ -53,8 +53,11 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | ② Dedup attraverso il **coordinatore vero** | ✅ **chiusa il 27/08** — buttato via il primo frame, il client ha ritrasmesso lo **stesso** `request_id`; `vs_coord_srv:claims()` sul leader `vs@coord3` mostra **un solo** claim. P7 dimostrata sul sistema intero, non più solo nei test |
 | ③ Novanta secondi di inattività senza scollegarsi | ✅ **chiusa il 27/08** — **101 secondi** senza inviare nulla: socket sempre aperto, `["connecting","online"]` e nessuna riconnessione, 23 push di stato ricevuti. Il `pong` automatico tiene davvero fermo l'`idle_timeout` (60 s) di cowboy. Misurato con un client Node, che risponde ai ping esattamente come un browser |
 | ④ JWT in transito (B firma con `JwtUtil`, A verifica con `vs_jwt`) | ✅ **chiusa il 27/08** — registrato un utente vero da Tomcat, letto il `TOKEN` dalla pagina renderizzata (`sub:"1"`, `vehicle_id:1`, `iss:voltshare-backoffice`, 60 min) e usato per il `join`: accettato. È l'ultimo pezzo del confine fra le due metà, ed era l'unico mai provato |
-
 | **Suite completa dopo il merge di `a/m2-cp-touchups` (P11)** | ✅ **307 test** — misurati il 29/08 su `a/p11-suite-flake`: **stesso totale su 26 giri della suite completa**, e 0 fallimenti su 25 di quei 26 (l'unico rosso è il terzo difetto di §7zb, prima della sua correzione; dopo la correzione, 13 giri su 13 verdi). Da oggi il numero non è più una nota: `src/scripts/eunit_check.sh` lo confronta e fallisce se cambia (§7zb). **311 dal 29/08 con i quattro test di P10** (§7zc) |
+| **Suite completa oggi** | ✅ **392 test, 0 fallimenti** — `./src/scripts/eunit_check.sh`, tre giri consecutivi verdi, `EXPECTED_TESTS=392`. Erano **386** su `9ff8e63`: i sei nuovi sono i test della metà A di P18 (§7zl). Aggiornare quel numero fa parte dell'aggiungere test, e il conteggio è un'asserzione, non una speranza (§7zb) |
+| **Il giro intero in un browser vero** | ✅ **1/09** (§7zk) — registrazione, griglia, countdown, `charging`, stop → `complete` istantaneo con la potenza che rientra nel pool, `complete` → `overstay` al tick, la riga in `/notifications` con l'ora locale giusta, e in `/history` la sessione a **1,58 kWh · overstay 10 min · € 5,71**, conto verificato al centesimo. È la riga che chiude il «non i pixel» di M1 |
+| **Partizione di rete vera sul *leader*** | ✅ **1/09** (§7zj) — `docker network disconnect` sul leader con due claim vivi e una ricarica in corso: `QUORUM LOST (1 of 3) … abdicating` a **2,12 s**, leader nuovo che serve con entrambi i claim a **2,29 s**, nodedown della distribuzione solo a **64,6 s**. Senza FIN si paga il tick — è ciò che `docker kill` non può mostrare |
+| **Redirect circolare prodotto nei container** | ✅ **1/09** (§7zj) — fino a quel giorno solo in eunit. Nella finestra in cui un leader appena eletto è `rebuilding`, un conducente ha ricevuto **undici `RETRY_LATER` di fila** invece di rimbalzare: un redirect solo, mai un giro, sul codice di produzione |
 
 **Prerequisiti ancora da installare:** solo Docker Desktop. Erlang/OTP 29 (erts 17.0.5) + rebar3 3.27, JDK 17 e Maven 3.9.9 ci sono e funzionano.
 
@@ -207,12 +210,15 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
 rebar3 compile                         # quattro applicazioni, nessun warning
-rebar3 eunit                           # 333 test, 0 fallimenti (30/08, dopo P13)
+rebar3 eunit                           # 392 test, 0 fallimenti (02/09, con la metà A di P18)
 #
 # Dal 29/08 il controllo vero prima di un push è lo script, non il comando nudo.
 # Si posiziona da sé, quindi gira da qualunque directory (qui dalla radice):
 #
-#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "333 tests, 0 failures"
+#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "392 tests, 0 failures"
+#
+# Il numero atteso vive in EXPECTED_TESTS dentro lo script: chi aggiunge test lo
+# aggiorna nello stesso commit, altrimenti il guardiano diventa rosso a ragione.
 #
 # `rebar3 eunit' da solo non basta: un giro può stampare "0 failures" e avere
 # ventidue test cancellati, o perderne otto dal conteggio (§7zb).
@@ -498,14 +504,55 @@ Da verificare in quel momento, perché è il vero punto di contatto fra le due m
 - ~~Il back office non è mai stato deployato su Tomcat~~ **chiuso il 25/08** (§7g, §7i).
 - ~~Il matcher del `renew` a cinque campi~~ **chiuso il 24/08** (§7e): `renew_one` tollera le tre forme.
 - ~~`user_id = 0` nei claim adottati~~ **chiuso il 24/08**: il rinnovo a cinque campi porta `UserId`.
-- **Client browser del canale driver (A)**: `js/ws.js`, `js/station.js`, `station.jsp` finita. È l'unico pezzo che separa la demo di M1 dal funzionare end-to-end (§7j).
-- **JWT B→A mai verificato in transito**: da provare al primo `join` reale.
+- ~~**Client browser del canale driver (A)**: `js/ws.js`, `js/station.js`, `station.jsp` finita~~ **chiuso**: il codice il 27/08 (§7j è la diagnosi), e i **pixel** l'1/09 (§7zk). La demo dal browser funziona.
+- ~~**JWT B→A mai verificato in transito**~~ **chiuso il 27/08** (④ nella tabella di §1): utente registrato da Tomcat, `TOKEN` letto dalla pagina renderizzata e usato per il `join`, accettato.
 - La lista stazioni si aggiorna con `<meta http-equiv="refresh">` a 15 secondi: scelta deliberata, da dichiarare nella relazione.
 - ~~Il coordinatore è sempre leader e non ha quorum~~ **chiuso il 25/08** (§7m): elezione bully, quorum di maggioranza e ricostruzione, failover provato in Docker.
 - **PR su `claim.md` per `session_closed`** stazione → coordinatore: la modifica **non è stata fatta**, apposta, per poterla proporre prima del codice invece che dopo. È la PR che sostituisce quella "retroattiva" proposta da A — vedi sotto.
 - **Le clausole legacy del `renew`** e l'inversione di copertura dei test (§7l): in attesa della risposta di A sulla variante col catch-all.
-- **Overstay: chi sottrae la tolleranza** (`nota-per-A-M2.md` §2). Da decidere prima che A implementi M4, perché l'errore sarebbe invisibile.
-- La **potenza** (M2-A) non è ancora allocata: le sessioni non esistono, quindi la fatturazione gira su righe inserite a mano. Il calcolo è verificato, il flusso completo no.
+- ~~**Overstay: chi sottrae la tolleranza**~~ **deciso e implementato** (§7zf): la sottrae **la stazione**, che è l'unico posto dove la tolleranza è configurata, e in `sessions` finisce `overstay_seconds` **netto**. Il back office lo prezza e basta. Era il tipo di errore che sarebbe stato invisibile: due sottrazioni o zero.
+- ~~La **potenza** (M2-A) non è ancora allocata: la fatturazione gira su righe inserite a mano~~ **chiuso** (§7q, §7s): l'auto carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a **38 ms** dalla fine della sessione.
+
+### Aperti oggi (2 settembre)
+
+- **P18 — GRAVE. Metà di A fatta e misurata il 02/09 (§7zl); metà di B aperta, ed è una
+  decisione, non una correzione.**
+
+  *Il difetto.* Un coordinatore che rientra da una partizione più lunga del `net_ticktime`
+  ricostruisce l'indice chiedendo alle stazioni, ma la sua lista di conoscenti è vuota
+  (`asked 0 station node(s)`): aspetta la finestra piena di rebuild (**2000 ms**) e comincia a
+  servire **con la tabella vuota**. Misura originale in §7zj ③: 272 ms dopo, lo stesso veicolo —
+  che sta caricando altrove — ottiene una **seconda prenotazione**, e l'invariante di
+  `SCOPE.md` §4 resta rotta **13,65 s**, finché il primo renew ripresenta il claim più vecchio e
+  «oldest wins» revoca il nuovo.
+
+  *Perché è una taratura.* **Il difetto è il rapporto** fra i 2000 ms di attesa e i 10 000 ms di
+  periodo di renew, non l'uno o l'altro numero: la difesa copre un quinto di ciclo.
+
+  *Cosa ha fatto A (§7zl).* `net_kernel:monitor_nodes(true)` nel claim client; sul `nodeup` di un
+  coordinatore conosciuto, riannuncio più un giro di renew immediato — che è già la
+  ripresentazione di tutti i claim. Sulla stessa scena la finestra di esposizione passa da
+  **4,11 s a 0 ms**, e il coordinatore rientrato comincia a servire dicendo
+  `serving with 2 adopted claim(s)` invece di `0`. **Ma è una gara vinta con 265 ms di margine**:
+  dal lato stazione la finestra si **accorcia**, non si chiude. Lo zero misurato è l'esito di una
+  corsa, non una garanzia — se il coordinatore avesse cominciato a servire mezzo secondo prima,
+  si sarebbe riaperta.
+
+  *Cosa resta, e va deciso insieme.* Lato B: **non passare a `serving` con zero risposte *e* zero
+  claim** finché non è arrivato almeno un renew. È l'unica delle due metà che chiude davvero la
+  finestra, e costa un po' di disponibilità: è il compromesso disponibilità/correttezza del
+  progetto, e nessuno dei due può sceglierlo da solo. I client trattano già `rebuilding` come
+  `RETRY_LATER` — misurato, §7zj ⑤ (undici di fila, nessun giro). La richiesta col suo costo
+  onesto è in **`src/contracts/nota-per-B-p18.md`**.
+- **P16 — BASSO, misurato il 29/08.** `vs_claim_client` parte con `leader = hd(COORD_NODES)` e
+  non lo corregge finché non ha un motivo (concessione, renew riuscito, `who_do_you_hold`):
+  la prima prenotazione dopo un boot paga sempre un **redirect §4.2 in più**. Nessuna azione
+  proposta — è il comportamento che `claim.md` §4 descrive, ed è coperto da
+  `vs_claim_peer_tests`. Registrato qui perché non venga riscoperto come difetto.
+- **Limite dichiarato, non difetto**: non c'è alcun tetto sullo stato `complete`. Un'auto ferma
+  col cavo dentro occupa davvero la presa, e liberarla d'ufficio dopo un timeout sarebbe peggio.
+  La conseguenza da saper dire: una colonnina che non manda mai `unplugged` lascia la sessione in
+  RAM e non fatturata.
 
 ---
 
@@ -3785,44 +3832,64 @@ partizione c'è una finestra di riconnessione.
 
 ## 9. Prossimo passo
 
-Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
-già tutto ciò su cui viene giudicato: coordinazione, tolleranza ai guasti, e la dimostrazione
-che P2 sopravvive a un failover.
+**Le quattro milestone di codice sono chiuse su entrambi i lati** e verificate in Docker. Il
+progetto ha tutto ciò su cui viene giudicato: coordinazione, tolleranza ai guasti, la
+dimostrazione che P2 sopravvive a un failover, e — dall'1/09 — il giro intero visto in un
+browser vero (§7zk). Quello che resta non è più codice di milestone: è **un difetto**, la
+**demo** e la **relazione**.
 
-### Per B — M4, regole di dominio
+### 1. P18 — **la metà di A è fatta**, quella di B va decisa insieme
 
-E' la milestone più leggera delle quattro, ed è quasi tutta Java:
+Rompeva l'invariante di `SCOPE.md` §4 — un veicolo, una prenotazione in rete — per **13,65 s**
+misurati. La scheda è in §8, la misura originale in §7zj ③, il lavoro del 02/09 in §7zl.
 
-1. **`PenaltyService`** — N=2 no-show consecutivi sospendono per K=1 giorno. Il contatore è
-   **solo di B** (`schema.sql`): A lo segnala con `{no_show, UserId, StationId, ConnId}`, mai con
-   una UPDATE. La sospensione si propaga al coordinatore con `{user_suspended, UserId, Until}`,
-   che `vs_coord_srv` già riceve e già applica in `check_can_grant`.
-2. **Notifiche** — `notifications` e `notifications.jsp`, più `{notify, UserId, Kind, Text}` sul
-   ponte.
-3. **`profile.jsp`** — anagrafica, veicolo, stato della penalità.
+- **la metà di A**, `monitor_nodes` + riannuncio e renew sul `nodeup`: **fatta e misurata**
+  (`a/p18-nodeup`). La finestra di esposizione è passata da **4,11 s** a **0 ms** sulla stessa
+  scena, con il coordinatore che comincia a servire dicendo `with 2 adopted claim(s)` invece di
+  `0`. **Accorcia**, e nel caso misurato ha chiuso — ma per aver vinto una gara, con **265 ms**
+  di margine;
+- **la metà di B**, non passare a `serving` con zero risposte *e* zero claim finché non è
+  arrivato almeno un renew: **da decidere**, al prezzo di un po' di disponibilità. La richiesta
+  con tutti i numeri è in `src/contracts/nota-per-B-p18.md`.
 
-La concorrenza qui è già risolta: la sospensione è una decisione presa in un posto solo e letta
-dal coordinatore, che è lo stesso schema del claim. Non introduce un secondo oggetto conteso —
-scelta deliberata, documentata in `DESIGN-NOTES` §4b.
+Se il coordinatore serve a tabella vuota **prima** che chiunque possa parlargli, nessuna
+prontezza del lato stazione arriva in tempo: le due metà non sono alternative, la prima da sola
+non basta e non finge di bastare. I client trattano già `rebuilding` come `RETRY_LATER` —
+misurato, §7zj ⑤.
 
-### Quello che manca davvero, e non è di B
+### 2. La demo (M5)
 
-**Il client browser del canale driver** (§7j). E' l'unico pezzo che separa la demo *dal browser*
-dal funzionare, e senza di esso lo scenario 5 si mostra dai log invece che da una pagina. Il lato
-server di A è pronto e verificato (`426 Upgrade Required` sull'endpoint, e il suo
-`vs_claim_client` ha risposto correttamente a `who_do_you_hold` durante tutti e tre i failover).
+Il deploy è già quello dichiarato, e la scaletta è scritta. Manca la **prova generale**, e serve
+soprattutto per le **tre cose mai viste con gli occhi** elencate in §7zk: il riparto
+75 · 75 · 50, le pagine del no-show, e il giro intero **col cronometro**.
 
-**M2-A è completo**: canale colonnina (§7p), allocazione della potenza (§7q), INSERT su
-`sessions` (§7s), il frame `session` con la sua pagina (§7v), il riaggancio del socket con
-l'emulatore dei driver (§7w) e i due ritocchi al contratto della colonnina (§7x). La fatturazione non gira più su righe inserite a mano: l'auto
-carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a 38 ms dalla
-fine della sessione. Quello che resta di M2-A è la verifica del fuso in `history.jsp`, che
-richiede un browser e una password che non ho. **Chiuso il 01/09 (§7zj)**: una credenziale di
-prova non esiste e non è mai esistita in questo database — `schema.sql` semina solo `stations` e
-`connectors`, l'unico utente presente ha `'$2a$10$fixture.not.a.real.hash'` come hash (nessun
-bcrypt lo soddisfa) e `cc-probe` qui non c'è più. Non è un blocco: `/register.jsp` crea utente **e**
-veicolo e fa login da solo, quindi il fuso in `history.jsp` lo può guardare chiunque apra il
-browser. Ricetta completa in `REPORT_M3A_CODA.md` §7.
+Due cose da concordare prima, non durante:
+
+- **su quale macchina**. I database **non sono condivisi**: ogni misura «sul database» va fatta
+  su una macchina sola, e un eventuale `DELETE FROM sessions;` va concordato prima, non
+  improvvisato davanti al professore.
+- **chi guida** e chi commenta.
+
+E una regola imparata sul campo: **in demo non si usa il Ctrl-C sugli emulatori**. L'1/09 uno dei
+due processi è sopravvissuto al Ctrl-C e me ne sono accorto solo leggendo il suo terminale. Gli
+stop passano dalla pagina, gli unplug dal `--linger` di `cp.js`.
+
+### 3. La relazione
+
+Il materiale c'è quasi tutto ed è già scritto sotto `src/`: questo documento per «verificato vs
+mai provato», `src/erlang/scelte_di_progetto.md` per le motivazioni (§18-§26 sono degli ultimi
+giorni), i contratti per il confine fra le due metà. L'ossatura del capitolo di progettazione
+sono le lezioni ricorrenti — la firma di ritorno che decide quali distinzioni i chiamanti possono
+fare; chi possiede lo stato lo ridice a chi lo aggrega; tre garanzie di consegna diverse per tre
+nature diverse; una copia durevole serve solo per un fatto che non registra nessun altro; e le
+misure scadono.
+
+### In attesa di B
+
+- **La riga «`do_renew` si fida dei renew perché vale P15»**, da mettere agli atti: il ricalcolo
+  della scadenza a ogni giro è innocuo **perché** dal lato stazione nessuno rinnova più un claim
+  fantasma (§7zd). È una difesa sola per un difetto a due metà, e la dipendenza va scritta dove
+  si vede, non lasciata implicita.
 
 ### Prima di M5
 
