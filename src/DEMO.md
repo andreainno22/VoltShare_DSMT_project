@@ -79,6 +79,7 @@ Nessuna modifica al codice applicativo, agli emulatori o ai contratti. Solo:
 | `emulator/demo/logs.sh` | **il pannello principale**: i sette servizi in una colonna sola, denoised, con l'ora e il nodo colorato | [C](#appendice-c--gli-script) |
 | `emulator/demo/coord-logs.sh` | solo i coordinatori. Resta per quando serve guardare l'elezione da sola; in scena si usa `logs.sh` | [C](#appendice-c--gli-script) |
 | `emulator/demo/unsuspend.sh` | toglie una sospensione dal database **e** dalla cache dei tre coordinatori (la riga da sola non basta) | [C](#appendice-c--gli-script) |
+| `emulator/demo/socket.sh` | l'estintore: riattacca una colonnina vuota a una presa andata `out_of_service`, e ce la tiene. Serve solo dopo un errore — tipicamente un Ctrl-C dato a un `presenter-cp.sh` per riprendersi il terminale | [C](#appendice-c--gli-script) |
 | `emulator/demo/coord-status.sh` | `mode` e numero di claim di un coordinatore (bonus) | [C](#appendice-c--gli-script) |
 | `emulator/demo/p2.sh` | P2 come one-shot, se le due tab dal vivo sono scomode | [C](#appendice-c--gli-script) |
 | `emulator/demo/reserve.js` | **(A, nuovo)** client minimo del canale driver: `join` con un JWT firmato e una singola azione (`reserve`, `cancel_reservation`, `none`). Serve al co-pilota per far prenotare un veicolo seminato — è con questo che l'auto del riparto prende un claim vero (§8 T+3:10, §10.1). È il mio `scena-pixel-driver.js`, con cui ho preso le misure dell'1/09: da promuovere qui | [C](#appendice-c--gli-script) |
@@ -523,7 +524,8 @@ riferimento, non l'ha fatto.
 | Un `reserve` passa quando non dovrebbe, subito dopo che un coordinatore è rientrato | **P18**: leader che serve con la tabella vuota (§10.2) | è il difetto noto, non un caso fortuito: aspetta ~10 s dopo ogni rientro. Se è già successo davanti al professore, raccontalo — è scritto in `PROBLEMI_TROVATI.md` con la misura |
 | `coord-status.sh` dice `claims=0` al failover | l'auto del connettore 3 ha attaccato **senza prenotare prima** (§0 n.1) | rifai il T+3:10 nell'ordine: `reserve.js` e poi `presenter-cp.sh` |
 | Il nome della rete non esiste (`docker network disconnect` fallisce) | il prefisso del progetto compose | `docker network ls`: è `voltshare_voltshare`, non `voltshare` |
-| Un connettore diventa `out_of_service` e la lobby ne offre uno di meno | **la sua colonnina non risponde più**. La stazione aspetta 30 s e poi dichiara la presa inutilizzabile, perché dal suo lato un emulatore uscito e un caricatore rotto sono la stessa cosa | attaccagli una colonnina: `node cp.js --url ws://localhost:9201/ws/cp --station 1 --connector N --vehicle 107 --plug-after 9999 --stay`. Il `boot` con stato `available` lo rimette `free` da solo (`vs_connector`: "out_of_service ──boots available──▶ free") |
+| Un connettore diventa `out_of_service` e la lobby ne offre uno di meno | **la sua colonnina non risponde più**. La stazione aspetta 30 s e poi dichiara la presa inutilizzabile, perché dal suo lato un emulatore uscito e un caricatore rotto sono la stessa cosa. La causa più probabile in scena: un Ctrl-C dato a un `presenter-cp.sh` per riprendersi il terminale | `./demo/socket.sh N` — attacca una colonnina vuota e ce la tiene. Il `boot` con stato `available` rimette la presa `free` all'istante (`vs_connector`: "out_of_service ──boots available──▶ free") |
+| Una presa si rispegne qualche minuto dopo essere stata riparata | il processo che l'aveva riattaccata è morto a sua volta — tipicamente perché lanciato dentro un `timeout`. **Nessun processo che rappresenta hardware va lanciato a scadenza**: una colonnina sta al muro | `socket.sh` si auto-rilancia proprio per questo. Se hai usato `cp.js` a mano, rilancialo senza `timeout` |
 | Idem, **dopo** una ricarica finita bene | fino al 3/09 `cp.js` usciva allo `unplugged`: diceva di essere la colonnina ma viveva quanto l'auto, e ogni sessione completata spegneva la presa | risolto da `--stay`, che `presenter-cp.sh` e `world.sh` passano già. Se lanci `cp.js` a mano per una demo, mettilo |
 | Un'auto di sfondo sparisce e non torna | fino al 3/09 `world.sh` lanciava i due `cp.js` e faceva `wait`: se uno moriva, l'altro teneva vivo lo script e il morto non ripartiva mai | risolto — ora ogni auto gira in un ciclo che la rilancia (uscita 2 esclusa: è un errore di configurazione, e rilanciarlo lo nasconderebbe) |
 | Nei log compare `'global' … requested disconnect … to prevent overlapping partitions` | `global` risolve una vista incoerente della membership disconnettendo due nodi. Lo provocano i nodi effimeri di `coord-status.sh`, che entrano nel cluster e muoiono subito | innocuo, si riconnettono. Se capita in scena **dillo**: è lo stesso istinto del nostro quorum — rifiutarsi di lavorare con una vista ambigua |
@@ -779,9 +781,9 @@ non nella pagina (`ws-driver.md` §7.5). È esattamente ciò che serve al T+3:10
 «già visto» del §2): se saltasse solo la prova generale, sono questi due a dover girare
 almeno una volta.
 
-- [ ] `.env.demo`, `seed-demo.sql`, gli **8** script creati e `chmod +x` (`world.sh`,
+- [ ] `.env.demo`, `seed-demo.sql`, gli **9** script creati e `chmod +x` (`world.sh`,
       `presenter-cp.sh`, `logs.sh`, `coord-logs.sh`, `coord-status.sh`, `unsuspend.sh`,
-      `p2.sh`, `reserve.js`); la riga `${STATION1_SITE_POWER_KW:-350}` in
+      `socket.sh`, `p2.sh`, `reserve.js`); la riga `${STATION1_SITE_POWER_KW:-350}` in
       `docker-compose.yml`.
 - [ ] `logs.sh` mostra `claim GRANTED` e `claim REFUSED` da un coordinatore durante P2.
       Se non compaiono, l'immagine dei coordinatori è precedente al 3/09: `build coord1`
