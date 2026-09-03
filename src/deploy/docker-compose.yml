@@ -113,7 +113,21 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-    networks: [voltshare]
+    # Two networks, because a real charging site has two and they fail
+    # separately: `site1` is the LAN that joins this controller to its chargers,
+    # `voltshare` is the uplink to the operator's cluster.
+    #
+    # This is what makes a station partition demonstrable. `docker network
+    # disconnect voltshare_voltshare station1` now cuts the uplink and leaves the
+    # site running: the coordinator loses the station, the browser loses it, and
+    # the cars keep charging — which is the failure the lease and the node
+    # monitor exist for, and the one with the clearest meaning outside this room.
+    #
+    # With a single network we could not show it. Measured 3/09 before the split:
+    # the isolated station went on reporting `charging` while the energy stayed
+    # frozen at 34.523 kWh across three samples — the last reading before the
+    # cable went quiet, not a car still drawing power.
+    networks: [voltshare, site1]
 
   station2:
     build:
@@ -145,7 +159,61 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-    networks: [voltshare]
+    # Same split as station1, for the same reason.
+    networks: [voltshare, site2]
+
+  # ------------------------------------------- charge points on the site LAN
+  #
+  # The chargers of Livorno, as containers on `site2` — the station's own
+  # network. They are the same `cp.js` the demo scripts run from the host; what
+  # changes is *where they are attached*, and that is the whole point.
+  #
+  # A charge point on the host reaches its station through a published port on
+  # the `voltshare` bridge, so isolating the station cut the cars off too. Here
+  # the cable is a link on `site2`, which a `docker network disconnect
+  # voltshare_voltshare station2` does not touch. The site keeps working while
+  # the operator goes blind — the failure we want to show.
+  #
+  # They are on Livorno and not on Pisa on purpose: Pisa's connectors belong to
+  # the presenter (§4 of DEMO.md), and a permanently attached charger there would
+  # take the socket that `presenter-cp.sh` needs, answering it 4409.
+  #
+  # `restart: unless-stopped` is the compose equivalent of the supervision loop
+  # in world.sh, and exists for the same reason: a charger that dies and is not
+  # replaced leaves the connector `out_of_service` thirty seconds later, and the
+  # lobby quietly offers one socket fewer for the rest of the demo.
+  cp6: &cp
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.emulator
+    image: voltshare-emulator:local
+    container_name: cp6
+    restart: unless-stopped
+    environment: &cp_env
+      # By service name, not localhost: this is the site LAN, and the station is
+      # a host on it.
+      CP_URL: ws://station2:8081/ws/cp
+      CP_STATION: "2"
+      CP_CONNECTOR: "6"
+      CP_VEHICLE: "101"
+      CP_SOC: "30"
+      CP_BATTERY: "60"
+      CP_MAX_KW: "50"
+    depends_on:
+      station2:
+        condition: service_started
+    networks: [site2]
+
+  cp7:
+    <<: *cp
+    container_name: cp7
+    environment:
+      <<: *cp_env
+      CP_CONNECTOR: "7"
+      CP_VEHICLE: "102"
+      CP_SOC: "55"
+      CP_BATTERY: "40"
+    networks: [site2]
 
   # ------------------------------------------------------- coordinators (M3)
   #
@@ -257,7 +325,21 @@ services:
     networks: [voltshare]
 
 networks:
+  # The operator's network: the cluster, the back office, the database. This is
+  # the one a partition is applied to.
   voltshare:
+    driver: bridge
+
+  # One LAN per site, joining a station to its own chargers. Nothing else is on
+  # them — not the coordinators, not the back office — because in a real
+  # deployment nothing else would be: these are cables in a car park.
+  #
+  # Their existence is what makes `docker network disconnect
+  # voltshare_voltshare stationN` a *partition* rather than a power cut. Without
+  # them the two links were the same link.
+  site1:
+    driver: bridge
+  site2:
     driver: bridge
 
 volumes:

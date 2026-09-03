@@ -108,11 +108,13 @@ This section states the problems the project sets out to solve; it is the core o
 
 Communication problems addressed: heterogeneous components in different languages and runtimes (Java and Erlang) that must exchange structured data; long-lived low-latency connections towards many clients; asynchronous propagation of state between nodes without polling.
 
+**On the deployment topology**, one point belongs here because it changes what P4 *means*. Each station sits on two networks: the operator's cluster network, and a per-site LAN that joins it to its own charge points — which is how a real charging site is wired, and they fail independently. A station therefore has two distinct failures, not one: the node dying (sessions lost) and the uplink being cut, where the site goes on delivering power while the operator's view of it disappears. The second is the one the lease and the node monitor exist for, and it is only demonstrable because the two links are separate objects in the deployment.
+
 **On failure detection**, one point belongs here rather than only in the design notes, because it shapes what P2b and P4 can promise. Erlang's own `nodedown` fires when a TCP connection breaks — a crashed container — but a node that stops answering *without* closing its socket (a partition, a frozen host) is invisible to it until `net_ticktime` expires, which is sixty seconds by default. Sixty seconds of a minority leader still granting claims would defeat the quorum entirely. Liveness is therefore decided by an explicit heartbeat, one per second with three misses tolerated: three seconds to detect a partition instead of sixty. Both detectors are used, because they detect different failures — and both are demonstrated, `docker kill` for the crash and `docker network disconnect` for the partition. DESIGN-NOTES §4c gives the full account with the measurements.
 
 ## 6. Architecture
 
-Deployment is one process per node; nodes are separate containers and are demonstrated on more than one host.
+Deployment is one process per node; nodes are separate containers on one host, joined by Docker networks. The course requirement is a system deployed over several *nodes*, and there are seven real ones; a single host is also what the reference project graded 30 e lode did. What a single host cannot give for free is a **genuine network partition** — a node that is alive and unreachable rather than dead — and that is obtained here with `docker network disconnect`, which leaves the node running and sending nothing: see §5 and DESIGN-NOTES §4c for the measurements.
 
 | Node | Technology | Responsibility |
 |---|---|---|
@@ -125,6 +127,8 @@ The browser is not a node of the system: pages are rendered by the back office a
 **Why server-side rendering.** The pages that list stations, sessions and notifications are read-mostly and non-interactive; rendering them in a servlet costs less code than shipping a client-side application to draw them, and it keeps the project on the basic Java web technologies the course recommends. Real time is kept where it is actually needed — the driver WebSocket — instead of spreading across the whole front end.
 
 This split mirrors a real deployment. Dynamic load management is normally performed by a **site controller physically located at the station**, because it must react quickly and must keep working when the connection to the operator's cloud is down; registry and back office are central services. Our station node is that site controller, which is why §4 requires a station to keep serving plugged-in vehicles while isolated.
+
+The network layout says the same thing, and is what makes that requirement testable rather than merely asserted. Each station is on **two** networks: `voltshare`, the operator's cluster, and `siteN`, the local LAN joining it to its own charge points — the cables in the car park. Nothing central is on a `siteN`. Cutting a station off `voltshare` therefore severs the uplink and leaves the site intact: measured on 3 September, the isolated station kept charging (0.875 → 0.944 → 1.014 kWh) while the coordinator dropped it and the lobby stopped listing it. With one network the two links were the same link, and the experiment produced a station that *claimed* to be charging while its energy stayed frozen — an answer that looked right and was not.
 
 Protocols:
 

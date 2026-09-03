@@ -3629,10 +3629,71 @@ paragrafo sui due rilevatori, perché condiziona ciò che P2b e P4 possono prome
 sono la sua cronaca; ma dove servivano a sostenere un'affermazione — P18 in `DESIGN-NOTES`
 §4c — ho messo i numeri per esteso invece del rimando, così la frase regge da sola.
 
+### La partizione di una stazione, che dichiaravamo e non sapevamo mostrare
+
+Il guasto più raccontabile del progetto — **il sito funziona, le auto caricano, l'operatore
+non lo vede più** — era indimostrabile, e per un motivo che non stava nel codice.
+
+`SCOPE` §6 dice da sempre che la stazione è un *site controller* e *«must keep working when
+the connection to the operator's cloud is down»*. Ma gli emulatori `cp.js` giravano sul
+portatile e raggiungevano la stazione attraverso una porta pubblicata sul bridge del
+cluster: `docker network disconnect station2` tagliava l'uplink **e i cavi** insieme.
+
+E il sintomo era abbastanza sottile da essere creduto: la stazione isolata continuava a
+dire `charging`, con l'energia **ferma a 34,523 kWh su tre letture consecutive**. Non
+un'auto che carica: l'ultima misura prima che il cavo ammutolisse. Una demo costruita lì
+sopra avrebbe affermato una cosa falsa.
+
+**La correzione è topologica, non algoritmica.** Nessuna riga di Erlang toccata.
+
+- `Dockerfile.emulator`: `node:22-alpine` più `src/emulator`. Nessuna dipendenza da
+  installare — `cp.js` usa WebSocket e crypto nativi di Node 22 — e il build fa
+  `node --check`, così un errore di sintassi non arriva a run time dentro un container che
+  compose riavvierebbe all'infinito.
+- Due reti nuove, `site1` e `site2`: le LAN dei siti, cavi in un parcheggio. Non c'è sopra
+  nessun coordinatore e nessun back office, perché in un impianto vero non ci sarebbero.
+- Ogni stazione su **due** reti; le colonnine di Livorno (`cp6`, `cp7`) solo su `site2`, con
+  `restart: unless-stopped` — l'equivalente compose del ciclo di supervisione di `world.sh`.
+
+Sono su Livorno e non su Pisa apposta: i connettori di Pisa sono del presentatore, e una
+colonnina permanente lì risponderebbe `4409` a `presenter-cp.sh`.
+
+**Misurato dopo la modifica**, con l'uplink tagliato:
+
+- energia che **sale** dentro la stazione isolata: 0,875 → 0,944 → 1,014 kWh, e i numeri
+  della stazione coincidono con quelli che `cp6` scrive nel suo log;
+- il leader sceso a **una** stazione conosciuta, dopo `** Node vs@station2 not responding **`
+  e `dropping stations [2] and their claims`;
+- alla riconnessione, due stazioni note dopo undici giri di controllo e **nessuna
+  interruzione** delle due ricariche (1,014 → 1,569 kWh attraverso tutto l'episodio).
+
+**Una scoperta che rende la storia migliore, non peggiore**: le porte pubblicate
+**sopravvivono** alla partizione. La 9102 risponde `426` a stazione isolata, quindi un
+conducente fisicamente lì potrebbe ancora aprire la pagina. Quello che si perde è la
+**lobby**, perché la lobby la disegna il coordinatore. È la forma onesta di questo guasto —
+funziona tutto tranne chi deve saperlo — ed è precisamente il motivo per cui le
+prenotazioni scadono da sole invece di dipendere da qualcuno che le cancelli.
+
+**Due affermazioni false corrette in `SCOPE`**, entrambe trovate cercando dove scrivere
+questa: §6 diceva che il deploy è *«demonstrated on more than one host»* — non lo è, gira su
+una macchina sola, e la frase giusta è che i **nodi** sono sette e che la partizione vera si
+ottiene con `disconnect`, non con più host (BlackNet, il progetto da 30 e lode, non l'ha
+fatto). E §5 P4 sosteneva la riconciliazione al riavvio, già corretta nel commit
+precedente.
+
+**Conseguenza sulla demo**: `world.sh` non serve più a T+0, il layout scende da tre riquadri
+a due, e il beat di P4 diventa `network disconnect` invece di `kill`. Il `kill` resta come
+caso duro — sessioni perse, verificato con `sessions` ferma a 3 prima e dopo — ma se il
+tempo stringe si tiene il `disconnect`, che è quello che si racconta senza dover spiegare
+cosa sia un container.
+
 ### Non provato — e perché
 
 - **La demo intera in sequenza** non è ancora stata corsa: la giornata è stata di
   diagnosi. Le singole battute sì.
+- **La partizione di `station1`** non è stata provata: solo quella di `station2`, che è
+  l'unica con le colonnine containerizzate. Su Pisa le prese restano del presentatore e
+  l'esperimento darebbe il vecchio risultato — cavi tagliati insieme all'uplink.
 - **`not_your_reservation` e `unknown_vehicle` end-to-end**: i due rifiuti del canale
   colonnina hanno test unitari ma nessuna corsa. Si producono in due comandi
   (`cp.js --vehicle 88` per lo sconosciuto, un veicolo seminato diverso dal titolare per

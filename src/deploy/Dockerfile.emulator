@@ -1,0 +1,59 @@
+# The charge point emulator, containerised — so that it can live on the site's
+# own network instead of on the developer's laptop.
+#
+# ## Why this image exists at all
+#
+# Running `cp.js` from the host was fine while a charge point was just a way to
+# make a car appear. It stopped being fine the moment we tried to demonstrate a
+# **network partition of a station**, which is the most interesting failure in
+# the system and the one with the clearest real-world meaning: the site is
+# working, cars are charging, and the operator cannot see it.
+#
+# A real charging site has two networks — the local LAN that joins the
+# controller to its chargers, and the uplink to the operator. They fail
+# separately. With the emulators on the host, we had only one: `docker network
+# disconnect station1` cut the uplink *and* the chargers at once, because the
+# host reaches the station through a published port on that same bridge.
+# Measured on 3 September: the isolated station kept reporting `charging` while
+# the energy sat frozen at 34.523 kWh across three samples — the last reading
+# before the cable went quiet, not a car that was still drawing power.
+#
+# With the emulator in a container on a `siteN` network, the two links are
+# separate objects and can be cut separately. The partition then shows what it
+# is supposed to show.
+#
+# ## Node, and nothing else
+#
+# `cp.js` has no dependencies: WebSocket and crypto are built into Node >= 22,
+# which is why there is no package.json to install. The image is the runtime
+# plus one directory.
+
+FROM node:22-alpine
+
+# Build context is `src/`, like the other two Dockerfiles, so `emulator/` is
+# visible from here.
+WORKDIR /app
+COPY emulator/ ./emulator/
+
+# Refuse to build against a Node too old for the built-in WebSocket client, and
+# say so here rather than letting cp.js discover it at run time in a container
+# that is about to be restarted forever by compose.
+RUN node -e "if (+process.versions.node.split('.')[0] < 22) { console.error('cp.js needs Node >= 22'); process.exit(1) }" \
+ && node --check emulator/cp.js
+
+WORKDIR /app/emulator
+
+# Every parameter arrives from the environment so one image serves every socket.
+# The defaults are deliberately incomplete: CP_URL and CP_CONNECTOR have no
+# sensible default, and a charge point pointed at the wrong connector is worse
+# than one that refuses to start.
+ENV CP_VEHICLE=101 \
+    CP_SOC=30 \
+    CP_BATTERY=60 \
+    CP_MAX_KW=50
+
+# `--stay` is not optional in a container: without it the process exits when the
+# cable comes out, compose restarts it, and the station sees a charge point that
+# keeps vanishing. With it the socket stays, which is what a wall-mounted
+# charger does.
+CMD ["sh", "-c", "exec node cp.js --url \"$CP_URL\" --station \"$CP_STATION\" --connector \"$CP_CONNECTOR\" --vehicle \"$CP_VEHICLE\" --soc \"$CP_SOC\" --battery \"$CP_BATTERY\" --max-kw \"$CP_MAX_KW\" --stay"]

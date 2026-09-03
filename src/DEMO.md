@@ -59,7 +59,8 @@ manca, il beat è in §13 o nella checklist di prova.
 | Prenoto e non mi presento ×2 | **P3** — leasing | note `reservation_expired`; poi `notifications.jsp` con «1 of 2» / «2 of 2 — suspended 1 day»; `reserve` successivo → `SUSPENDED` | ⚠️ meccanismo ✅ 31/08 (SQL + log di tutta la catena), **pagine mai viste** |
 | Una seconda auto attacca mentre carico | **P5** — potenza come risorsa divisibile | `session.jsp`: i kW calano, `eta_seconds` salta | ⚠️ calcolo ✅ test + E2E letto via rpc (M2), **mai visto in pagina** |
 | Resto attaccato dopo la fine carica | overstay (§3.4) | fase `complete` → `overstay`, `overstay_seconds` che sale, addebito in `history.jsp` | ✅ 1/09 nel Chrome vero, fino a `1,58 kWh · 10 min · € 5,71` |
-| `docker kill station2` | **P4** — nodo stazione che cade | la lobby perde Livorno; le prenotazioni lì decadono | ✅ 27/08 (`stop station1`: chiusura 1001, backoff, ripopolamento 17 s dopo; claim a zero in 2 s) |
+| **`network disconnect` su station2** | **P4** — un sito che funziona ma che l'operatore non vede più | la lobby perde Livorno e il coordinatore ne scarta i claim, **mentre le auto continuano a caricare** | ✅ 3/09, dopo aver messo le colonnine sulla LAN del sito: energia 0,875 → 0,944 → 1,014 kWh a stazione isolata, e nessuna interruzione alla riconnessione |
+| `docker kill station2` | **P4** — il nodo stazione che muore | la lobby perde Livorno; sessioni in corso perse, nessuna riga scritta | ✅ 3/09: `sessions` ferma a 3 prima e dopo. L'energia però sopravvive, perché la conta la colonnina: 34,795 kWh prima, 34,812 al riavvio |
 | `docker kill coord3` (leader) mentre una sessione carica | **P2b** — failover, elezione bully, ricostruzione | pannello log coordinatori; la sessione a schermo non batte ciglio; `reserve` rifiutato durante il rebuild, poi di nuovo ok | ✅ 25/08 (B) e 1/09 (A, cronometrato: 2,29 s) |
 | **`network disconnect` su un coordinatore** | **P2b** — quorum contro split-brain | log `QUORUM LOST (1 of 3)`, `mode=suspended`; ogni `reserve` fallisce; la carica continua | ✅ 27/08 (B, PROGRESS §7y) e 1/09 (A, dal lato stazione) |
 | Tutta la corsa | **P6** snapshot completo pushato, **P7** at-most-once | la pagina non deriva stato; un frame perso non la sfasa | ✅ per costruzione, e visto in ogni corsa |
@@ -74,7 +75,8 @@ Nessuna modifica al codice applicativo, agli emulatori o ai contratti. Solo:
 |---|---|---|
 | `deploy/.env.demo` | i tempi corti (lease, grazie, sweep) + cookie + segreto JWT | [A](#appendice-a--deployenvdemo) |
 | `deploy/seed-demo.sql` | utenti + veicoli per le colonnine di sfondo (idempotente) | [B](#appendice-b--deployseed-demosql) |
-| `emulator/demo/world.sh` | il mondo di sfondo: walk-in scaglionati su Livorno | [C](#appendice-c--gli-script) |
+| `deploy/Dockerfile.emulator` | **(3/09)** la stessa `cp.js`, in un container, così può stare sulla LAN del sito invece che sul portatile. È ciò che rende dimostrabile la partizione di una stazione | — |
+| ~~`emulator/demo/world.sh`~~ | **non serve più a T+0.** Le due auto di Livorno le portano i container `cp6` e `cp7`, che partono con `docker compose up -d` e si riavviano da soli. Lo script resta per gli scenari fuori demo e per chi lavora senza containerizzare | [C](#appendice-c--gli-script) |
 | `emulator/demo/presenter-cp.sh` | helper del co-pilota: una colonnina per le azioni del presentatore | [C](#appendice-c--gli-script) |
 | `emulator/demo/logs.sh` | **il pannello principale**: i sette servizi in una colonna sola, denoised, con l'ora e il nodo colorato | [C](#appendice-c--gli-script) |
 | `emulator/demo/coord-logs.sh` | solo i coordinatori. Resta per quando serve guardare l'elezione da sola; in scena si usa `logs.sh` | [C](#appendice-c--gli-script) |
@@ -98,8 +100,8 @@ Da rispettare, altrimenti il mondo di sfondo ruba un connettore al presentatore 
 | 3 | Pisa Centro | 150 | mondo (su cue) | la «seconda auto» che fa calare la potenza di conn 1 — **prenota prima di attaccare**, ed è il suo il claim che il failover ricostruisce (§10.1) |
 | 4 | Pisa Centro | 50 | **presentatore** | no-show #2 |
 | 5 | Livorno Port | 150 | **presentatore** | bersaglio P2 B (tenuto ~2 s, poi cancellato) |
-| 6 | Livorno Port | 50 | mondo (`world.sh`) | walk-in che carica per tutta la demo, muore col `kill station2` |
-| 7 | Livorno Port | 50 | mondo (`world.sh`) | walk-in, muore col `kill station2` |
+| 6 | Livorno Port | 50 | container `cp6` | walk-in che carica per tutta la demo. **Sopravvive alla partizione** di station2, ed è questo il beat |
+| 7 | Livorno Port | 50 | container `cp7` | come sopra |
 
 Veicoli: presentatore = `$PV` (assegnato alla registrazione, vedi §6); mondo = 101, 102;
 auto del riparto su conn 3 = 103. Tutti in `seed-demo.sql` tranne `$PV`.
@@ -116,9 +118,14 @@ SCHERMO PROIETTATO  —  Browser (presentatore)
 
 A LATO  —  secondo monitor o terminale grande
   Pane A   ./emulator/demo/logs.sh      TUTTO il sistema, una colonna sola
-  Pane B   ./emulator/demo/world.sh     lo sfondo: si lancia e non si tocca più
-  Pane C   terminale libero             docker kill, presenter-cp.sh, coord-status.sh
+  Pane B   terminale libero             docker kill / network disconnect, coord-status.sh
+  Pane C   presenter-cp.sh              le colonnine di Pisa: si lancia e non si tocca
 ```
+
+**Due riquadri, non tre.** Lo sfondo non ha più un terminale: dal 3/09 le auto di Livorno
+sono i container `cp6` e `cp7`, che partono con `docker compose up -d` e si riavviano da
+soli. Un pannello in meno da sorvegliare, e una cosa in meno che muore se chiudi la
+finestra sbagliata.
 
 **Tre riquadri, non quattro, e il primo è nuovo.** La versione precedente aveva un
 pannello per servizio (`coord-logs.sh`, i log di `station1`, quelli del back office):
@@ -199,9 +206,9 @@ Verifiche prima di cominciare:
 
 ## 7. Ruoli
 
-**Presentatore** — browser, narrazione, `docker kill` / `docker start` dal Pane B.
-**Co-pilota** — lancia `world.sh` a T+0, poi esegue solo i comandi marcati 🡒 **co-pilota**
-nel copione. Ha `$PV` esportato nel suo shell.
+**Presentatore** — browser, narrazione, `docker kill` / `network disconnect` dal Pane B.
+**Co-pilota** — esegue i comandi marcati 🡒 **co-pilota** nel copione. Ha `$PV` nel suo
+shell (dal Profilo, «Vehicle #N»).
 
 ---
 
@@ -209,15 +216,19 @@ nel copione. Ha `$PV` esportato nel suo shell.
 
 I tempi sono indicativi: le attese dei no-show (90 s) sono assorbite dalle chiacchiere.
 
-### T+0:00 — il mondo parte
-🡒 **co-pilota**, Pane C:
-```bash
-cd src/emulator && ./demo/world.sh
-```
-Due auto (veicoli 101, 102) attaccano su Livorno 6 e 7 a 20 s di distanza.
+### T+0:00 — il mondo c'è già
+Nessun comando. Le due auto di Livorno sono i container `cp6` e `cp7`, partiti con lo
+stack; a T−20 la lobby mostra già Livorno con due connettori `charging`.
+
 **Dire:** «Questi sono altri automobilisti. La stazione non sa che sono emulati: per lei
-è un cavo che entra, esattamente come per un caricatore vero.»
-**Vedere:** la lobby — Livorno passa a 2 connettori `charging`, i kW allocati salgono.
+è un cavo che entra, esattamente come per un caricatore vero. E quei due caricatori
+stanno sulla **rete del sito**, non sulla nostra — come in un parcheggio vero.»
+
+Quella frase costa nulla adesso e serve fra dieci minuti: è ciò che rende comprensibile il
+beat della partizione (§10.4), dove il sito continua a funzionare mentre l'operatore
+diventa cieco.
+
+**Vedere:** la lobby — Livorno a 2 connettori `charging`, i kW allocati che salgono.
 
 ### T+0:30 — P2, un veicolo una prenotazione (dal vivo)
 **Presentatore:** tab 2 (Pisa) e tab 3 (Livorno) affiancate. `reserve` sul connettore 1 di
@@ -241,16 +252,46 @@ Mentre il lease di conn 2 scorre, il presentatore:
   `node driver.js --scenario contention --connector 3 --drivers 15` — 1 accettata,
   14 `ALREADY_HELD`. «Quindici richieste, un connettore, nessun lock: l'attore le ha
   messe in coda nella sua mailbox e risposte una alla volta.»
-- **P4 — stazione che sparisce.** Presentatore, Pane B:
+- **P4 — la stazione che l'operatore non vede più.** Presentatore, Pane B:
   ```bash
-  docker kill station2
+  MSYS_NO_PATHCONV=1 docker network disconnect voltshare_voltshare station2
   ```
-  **Vedere:** la lobby perde Livorno (o la mostra non disponibile); le due auto di sfondo
-  spariscono; una prenotazione tentata lì viene liberata.
-  **Dire:** «Il nodo stazione è caduto. Le sue prenotazioni decadono da sole per lease, gli
-  automobilisti sono liberi di prenotare altrove, il back office la toglie dalla lista.
-  Le sessioni che erano in corso lì sono perse — è un guasto parziale, dichiarato.»
-  *(Facoltativo: `docker start station2`, torna nella lista dopo qualche secondo.)*
+  **`disconnect`, non `kill`, e la differenza è il senso del beat.** `kill` è un blackout
+  del sito: la BEAM evapora, non c'è nessun dentro che continua, e la storia si esaurisce
+  in «si è rotto». `disconnect` taglia solo l'**uplink** e lascia in piedi la LAN del sito
+  (rete `site2`, dove stanno `cp6` e `cp7`): l'impianto continua a erogare mentre il
+  centro operativo lo perde di vista. È il guasto per cui esistono il lease e il monitor
+  sui nodi, ed è quello che si racconta senza dover spiegare cosa sia un container.
+
+  **Vedere**, e sono tre cose insieme:
+  - la **lobby perde Livorno** — la disegna il coordinatore, e il coordinatore non la vede;
+  - nel Pane A: `** Node vs@station2 not responding **` seguito da
+    `node vs@station2 is down, dropping stations [2] and their claims`;
+  - **le auto continuano a caricare.** Verifica dal vivo, se vuoi mostrarlo:
+    ```bash
+    docker exec cp6 sh -c 'tail -2 /proc/1/fd/1' 2>/dev/null || docker compose --env-file .env.demo logs --tail=3 cp6
+    ```
+    l'energia sale. Misurato il 3/09 a stazione isolata: **0,875 → 0,944 → 1,014 kWh**.
+
+  **Dire:** «Il sito funziona. Le auto caricano, chi è fisicamente lì può usarlo. Ma
+  l'operatore è cieco: la lobby non elenca più Livorno, perché la lobby la disegna il
+  coordinatore. È il guasto peggiore da diagnosticare — funziona tutto tranne chi deve
+  saperlo — ed è il motivo per cui le prenotazioni hanno una scadenza invece di dipendere
+  da qualcuno che le cancelli.»
+
+  Poi si riattacca, ed è il momento migliore:
+  ```bash
+  MSYS_NO_PATHCONV=1 docker network connect voltshare_voltshare station2
+  ```
+  Livorno torna in lobby e **la ricarica non si è mai interrotta**: la stazione si
+  riannuncia, il coordinatore la riprende. Misurato il 3/09: due stazioni note al leader
+  dopo undici giri di controllo, energia da 1,014 a 1,569 kWh senza un salto.
+
+  *(Se vuoi mostrare anche il crash: `docker kill station2` è il caso duro — sessioni
+  perse, nessuna riga scritta, verificato il 3/09 con `sessions` ferma a 3 prima e dopo.
+  L'energia però sopravvive, perché la conta la colonnina e la riporta al riavvio: 34,795
+  kWh prima del kill, 34,812 dopo. Due guasti, due reazioni: vale la pena mostrarli
+  entrambi, ma se il tempo stringe, quello che si tiene è il `disconnect`.)*
 
 ### ~T+1:40 — no-show #1 scade
 **Vedere:** nota `reservation_expired` accanto al connettore 2.
@@ -366,7 +407,9 @@ la correzione di P18, il numero sarà più alto: leggilo da `EXPECTED_TESTS` in
 ## 9. Ordine sintetico (da tenere sott'occhio)
 
 ```
-world.sh  →  P2 (2 tab) + cancel  →  no-show #1 (conn 2)  →  [P1 opener] [kill station2]
+(lo sfondo c'è già: cp6, cp7)
+          →  P2 (2 tab) + cancel  →  no-show #1 (conn 2)
+          →  [P1 opener]  [DISCONNECT station2: il sito vive, l'operatore è cieco]
           →  #1 scade → no-show #2 (conn 4)  →  #2 scade → SUSPENDED + notifications
           →  walk-in conn 1  →  conn 3: PRENOTA, poi attacca (riparto)   [§0 n.1]
           →  KILL COORD3 (§10.1)  →  DISCONNECT COORD2 (§10.2)  →  [bully: §10.3]
@@ -374,6 +417,19 @@ world.sh  →  P2 (2 tab) + cancel  →  no-show #1 (conn 2)  →  [P1 opener] [
           →  Stop su conn 1 → overstay → il --linger stacca da solo → history
           →  riepilogo  →  eunit_check
 ```
+
+**I tre guasti, e perché sono tre e non uno.** Vale la pena dirlo in chiusura, perché è la
+struttura dell'intera parte sulla tolleranza:
+
+| Manovra | Cosa rappresenta | Come lo scopre il sistema |
+|---|---|---|
+| `docker kill coord3` | un nodo che muore | `nodedown`, immediato: il socket si chiude |
+| `docker network disconnect … coord2` | un nodo **vivo** che non vede più gli altri | il battito, 3 s. `nodedown` arriverebbe a 60 |
+| `docker network disconnect … station2` | un **sito** che funziona ma è irraggiungibile | il monitor sul nodo, e la lobby che si svuota |
+
+Tre guasti diversi, tre rilevatori diversi, tre reazioni diverse. Un solo esperimento non
+li avrebbe mostrati: `kill` chiude il socket e quindi **non esercita affatto** il percorso
+del battito, che è il motivo per cui il battito esiste.
 
 ---
 
