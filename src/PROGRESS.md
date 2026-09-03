@@ -3589,6 +3589,46 @@ Aggiunto `--stay`: alla fine il processo non esce, tiene il socket e manda
   (`--plug-after 9999 --stay`). Pisa: `1 charging, 2 free, 3 free, 4 free`.
 - Fatturazione end-to-end sulla sessione reale: 11,817 kWh → `cost_cents = 532`.
 
+### La tolleranza ai guasti, finalmente scritta in un posto solo
+
+`DESIGN-NOTES` §4 copriva il coordinatore — elezione, quorum, ricostruzione — e basta. Tutto
+il resto era **nei commenti del codice**, che è il posto giusto per implementarlo e quello
+sbagliato per difenderlo all'orale. Scritta `DESIGN-NOTES` §4c, in inglese come il resto del
+documento.
+
+La tesi che tiene insieme la sezione, e che vale la pena dire con queste parole: **la
+tolleranza discende dalla proprietà dello stato, non dalla replicazione.** Ogni componente
+tiene solo ciò che possiede, e ogni altro tratta quello stato come recuperabile dal suo
+proprietario. Da lì discendono cose che sembrano scelte separate e non lo sono: perché non
+serve un log replicato, perché i claim si recuperano *chiedendo* e le sospensioni
+*spingendo*, perché una stazione morta libera i suoi veicoli.
+
+Contenuto: il modello di guasto in tabella (cosa fallisce, come si accorge, cosa succede,
+cosa si perde); **i due rilevatori e perché ce ne vogliono due** — con le tre misure
+dell'1/09, e l'osservazione che `docker kill` non esercita affatto quel percorso, perché
+chiude il socket; la stazione che muore e perché il coordinatore le scarta i claim invece di
+aspettare il lease; la colonnina che muore, i 30 s di grazia e la sessione chiusa con
+l'ultima energia misurata; **le tre strategie di supervisione e cosa afferma ciascuna**, con
+i due difetti di review che erano guasti di supervisione e non di logica; e le **tre
+garanzie di consegna diverse sullo stesso filo**, scelte per messaggio invece che per
+canale.
+
+E la parte che conta di più per il voto: **cosa non tollera niente**, dichiarato — MySQL,
+le sessioni sulla stazione morta, e P18 con i suoi numeri.
+
+**Una correzione in `SCOPE.md` §5.** P4 sosteneva che *"sessions in progress are reconciled
+for billing on restart"*. **È falso**: la riga in `sessions` la scrive la stazione alla
+chiusura, quindi se il nodo muore a metà sessione non viene scritto niente, e al riavvio i
+connettori ripartono senza memoria. Ciò che davvero sopravvive è la **misura**, e non per
+merito nostro: la colonnina è l'unico lato che conta l'energia e la riporta nel `plugged`
+che rimanda alla riconnessione. Riscritto per dire quello che succede. Aggiunto anche un
+paragrafo sui due rilevatori, perché condiziona ciò che P2b e P4 possono promettere.
+
+**Due file citati da PROGRESS non esistono nel repository**: `PROBLEMI_TROVATI.md` e
+`REPORT_M3A_CODA.md`, entrambi di A, mai committati. I riferimenti in §7zj restano perché
+sono la sua cronaca; ma dove servivano a sostenere un'affermazione — P18 in `DESIGN-NOTES`
+§4c — ho messo i numeri per esteso invece del rimando, così la frase regge da sola.
+
 ### Non provato — e perché
 
 - **La demo intera in sequenza** non è ancora stata corsa: la giornata è stata di
