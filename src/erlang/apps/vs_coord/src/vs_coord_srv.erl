@@ -442,9 +442,29 @@ do_claim(ReqId, VehicleId, UserId, StationId, ConnId, State) ->
             %% station stores it and echoes it in every renew, so that ordering
             %% is decided by one clock — this one — instead of comparing
             %% timestamps produced by machines that were never synchronised.
+            %% The decision, said out loud. Until 3/09 this whole function was
+            %% silent: the module has twenty-three logger calls and not one of
+            %% them on the path that grants or refuses, so the single most
+            %% important act in the system — deciding that a vehicle may hold
+            %% this connector and no other — left no trace anywhere. The
+            %% refusal was worse: neither side logged it, so "your vehicle
+            %% already holds a reservation elsewhere" existed only as a frame
+            %% in somebody's browser.
+            %%
+            %% `notice' and not `info': this is the outcome of the invariant the
+            %% whole cluster exists to keep, and a contention run printing one
+            %% line per driver is the point, not noise — fifteen refusals and
+            %% one grant is the clearest picture of P2 the system can produce.
+            logger:notice("claim GRANTED to vehicle ~p (user ~p) on station ~p "
+                          "connector ~p — ~s",
+                          [VehicleId, UserId, StationId, ConnId,
+                           Claim#claim.claim_id]),
             {{ok, ReqId, Claim#claim.claim_id, Claim#claim.granted_at, Claim#claim.expires_at},
              store(Claim, State)};
         {error, Reason} ->
+            logger:notice("claim REFUSED to vehicle ~p (user ~p) on station ~p "
+                          "connector ~p — ~p",
+                          [VehicleId, UserId, StationId, ConnId, Reason]),
             {{error, ReqId, Reason}, State};
         {not_serving, Leader} ->
             %% Note the shape: `not_serving' carries no ReqId, because it is

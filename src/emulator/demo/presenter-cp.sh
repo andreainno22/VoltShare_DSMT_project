@@ -12,5 +12,12 @@ conn=${1:?connettore richiesto}; veh=${2:-88}
 shift $(( $# > 1 ? 2 : 1 ))
 port=9201; st=1
 case "$conn" in 5|6|7) port=9202; st=2;; esac
+# `--stay` non è negoziabile in scena: senza, quando l'auto stacca il processo
+# esce, e trenta secondi dopo la stazione dichiara la presa `out_of_service` —
+# perché dal suo lato un emulatore uscito è indistinguibile da un caricatore
+# rotto. Dopo due battute mezza stazione sarebbe spenta. Con il flag la colonnina
+# resta collegata, il connettore torna `free`, e la presa si può riusare.
+# Si spegne, se proprio serve, con `--stay false`... che non esiste: si lancia
+# `cp.js` a mano.
 exec node cp.js --url ws://localhost:$port/ws/cp --station $st --connector "$conn" \
-                --vehicle "$veh" "$@"
+                --vehicle "$veh" --stay "$@"

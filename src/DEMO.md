@@ -76,7 +76,9 @@ Nessuna modifica al codice applicativo, agli emulatori o ai contratti. Solo:
 | `deploy/seed-demo.sql` | utenti + veicoli per le colonnine di sfondo (idempotente) | [B](#appendice-b--deployseed-demosql) |
 | `emulator/demo/world.sh` | il mondo di sfondo: walk-in scaglionati su Livorno | [C](#appendice-c--gli-script) |
 | `emulator/demo/presenter-cp.sh` | helper del co-pilota: una colonnina per le azioni del presentatore | [C](#appendice-c--gli-script) |
-| `emulator/demo/coord-logs.sh` | il pannello che rende visibile l'elezione | [C](#appendice-c--gli-script) |
+| `emulator/demo/logs.sh` | **il pannello principale**: i sette servizi in una colonna sola, denoised, con l'ora e il nodo colorato | [C](#appendice-c--gli-script) |
+| `emulator/demo/coord-logs.sh` | solo i coordinatori. Resta per quando serve guardare l'elezione da sola; in scena si usa `logs.sh` | [C](#appendice-c--gli-script) |
+| `emulator/demo/unsuspend.sh` | toglie una sospensione dal database **e** dalla cache dei tre coordinatori (la riga da sola non basta) | [C](#appendice-c--gli-script) |
 | `emulator/demo/coord-status.sh` | `mode` e numero di claim di un coordinatore (bonus) | [C](#appendice-c--gli-script) |
 | `emulator/demo/p2.sh` | P2 come one-shot, se le due tab dal vivo sono scomode | [C](#appendice-c--gli-script) |
 | `emulator/demo/reserve.js` | **(A, nuovo)** client minimo del canale driver: `join` con un JWT firmato e una singola azione (`reserve`, `cancel_reservation`, `none`). Serve al co-pilota per far prenotare un veicolo seminato — è con questo che l'auto del riparto prende un claim vero (§8 T+3:10, §10.1). È il mio `scena-pixel-driver.js`, con cui ho preso le misure dell'1/09: da promuovere qui | [C](#appendice-c--gli-script) |
@@ -112,10 +114,35 @@ SCHERMO PROIETTATO  —  Browser (presentatore)
   tab 4  /session       tab 5  /notifications       tab 6  /history
 
 A LATO  —  secondo monitor o terminale grande
-  Pane A   ./emulator/demo/coord-logs.sh        (elezione / quorum)
-  Pane B   terminale libero del presentatore    (docker kill ...)
-  Pane C   co-pilota: world.sh gira qui, e i presenter-cp.sh
+  Pane A   ./emulator/demo/logs.sh      TUTTO il sistema, una colonna sola
+  Pane B   ./emulator/demo/world.sh     lo sfondo: si lancia e non si tocca più
+  Pane C   terminale libero             docker kill, presenter-cp.sh, coord-status.sh
 ```
+
+**Tre riquadri, non quattro, e il primo è nuovo.** La versione precedente aveva un
+pannello per servizio (`coord-logs.sh`, i log di `station1`, quelli del back office):
+seguirne quattro mentre si parla è ingestibile, e soprattutto **la storia da raccontare
+è una sola** — la prenotazione parte dal browser, il coordinatore decide, la stazione
+apre la sessione, Java la prezza. Su quattro riquadri quella storia è a pezzi.
+
+`logs.sh` segue i sette servizi insieme, in ordine di tempo, con l'ora e il nome del
+nodo colorato, e toglie il rumore periodico (le intestazioni doppie del logger Erlang,
+la ripubblicazione del leader ogni 30 s, il ciclo di vita di Tomcat). `VERBOSE=1
+./demo/logs.sh` rimette tutto; `./demo/logs.sh coord1 coord2 coord3` restringe.
+
+Così si legge:
+
+```
+08:21:10  station1    driver channel: user 103 (vehicle 103) joined station 1
+08:21:10  coord3      claim GRANTED to vehicle 103 (user 103) on station 1 connector 3 — c-67C6…
+08:21:11  station2    driver channel: user 103 (vehicle 103) joined station 2
+08:21:11  coord3      claim REFUSED to vehicle 103 (user 103) on station 2 connector 5 — already_held
+```
+
+Quelle due righe di `coord3` sono state aggiunte il 3/09: fino a quel giorno
+`vs_coord_srv` aveva ventitré chiamate al logger e **nessuna** sul percorso che concede
+o rifiuta, quindi P2 — la battuta centrale della demo — non lasciava traccia da nessuna
+parte. Il rifiuto non era loggato né dal coordinatore né dalla stazione.
 
 ---
 
@@ -134,18 +161,25 @@ docker exec -i mysql mysql -uvoltshare -pvoltshare voltshare < seed-demo.sql
 
 # 3. account del presentatore: registrazione dal form (crea utente + veicolo e fa login)
 #    http://localhost:8080/register   →   andrea / demo1234 / batteria 60 / max 150
-#    poi leggi l'id del veicolo e tienilo a portata:
-docker exec mysql mysql -uvoltshare -pvoltshare voltshare -N -e \
-  "SELECT v.id FROM vehicles v JOIN users u ON u.id=v.user_id WHERE u.username='andrea'"
-#    → export PV=<quel numero>       (nel pane C del co-pilota)
+#    poi apri il Profilo: il numero del veicolo è stampato lì, "Vehicle #N".
+#    → export PV=N                   (nel pane C)
+#    Non serve nessuna query: profile.jsp lo mostra, ed è la pagina che hai già aperto.
 
 # 4. prova rapida che il confine regge (facoltativa, 20 s)
 cd ../emulator && node driver.js --self-test        # deve dire "identical to the published fixture"
 
 # 5. apri il pannello log in Pane A
-./demo/coord-logs.sh
+./demo/logs.sh
 #    deve mostrare, a regime: coord3 = leader (rango più alto), coord1/coord2 = standby
 ```
+
+**Un account nuovo a ogni prova generale è la strada giusta**, e costa dieci secondi. In
+profilo demo il lease è di 90 secondi, quindi una prenotazione fatta per mostrare P2 e poi
+dimenticata diventa uno strike, e **due strike chiudono l'account fuori per un giorno**
+(è successo due volte in ventiquattro ore). Registrarsi di nuovo è più rapido che
+sbloccare. Se proprio serve sbloccare quello vecchio: `./demo/unsuspend.sh <username>` —
+tocca il database **e** la cache dei tre coordinatori, perché cancellare solo la riga non
+basta (la ripubblicazione del back office la rimette entro 30 s).
 
 **Niente `--build` la mattina della demo.** Le immagini si costruiscono la sera prima
 (`docker compose --env-file .env.demo build`, una volta): con `--build` il passo 1 impiega
@@ -234,15 +268,24 @@ scritto. Nessun valore conteso in più — è la stessa forma del claim.»
 🡒 **co-pilota** — walk-in sul connettore 1 col veicolo del presentatore, cavo che resta
 dentro 60 s dopo lo stop (è l'overstay, e finisce da solo — vedi §8 T+6:30):
 ```bash
-./demo/presenter-cp.sh 1 "$PV" --soc 45 --battery 60 --max-kw 150 --linger 60
+./demo/presenter-cp.sh 1 "$PV" --linger 60
 ```
+
+> `--soc 45 --battery 60 --max-kw 150` erano nel comando fino al 3/09 e **sono i default
+> di `cp.js`**: riscriverli non cambiava niente e allungava una riga che va digitata
+> davanti a un pubblico. `--linger` invece serve, ed è l'unico argomento che serve: senza,
+> l'emulatore stacca subito dopo lo Stop e l'overstay non esiste.
+>
+> `presenter-cp.sh` passa anche `--stay` da sé: la colonnina sopravvive all'auto, così
+> quando la ricarica finisce il connettore torna `free` invece di andare
+> `out_of_service` (§11).
 **Presentatore:** tab 4 `session.jsp` — la sessione parte, ~150 kW (Pisa a 200 kW di
 budget nel profilo demo, una sola auto sta sotto).
 
 🡒 **co-pilota** — la seconda auto, **che prima prenota e poi attacca** (due comandi):
 ```bash
 node demo/reserve.js --station 1 --connector 3 --user 103 --vehicle 103 --action reserve
-./demo/presenter-cp.sh 3 103 --soc 40 --battery 75 --max-kw 150
+./demo/presenter-cp.sh 3 103
 ```
 > **Perché prenota invece di fare un walk-in** *(correzione di A, §0 n.1)*: un walk-in
 > **non ha claim** — `free/3` apre la sessione con `adopt(Info, undefined, Data)`. Se tutte
@@ -480,6 +523,10 @@ riferimento, non l'ha fatto.
 | Un `reserve` passa quando non dovrebbe, subito dopo che un coordinatore è rientrato | **P18**: leader che serve con la tabella vuota (§10.2) | è il difetto noto, non un caso fortuito: aspetta ~10 s dopo ogni rientro. Se è già successo davanti al professore, raccontalo — è scritto in `PROBLEMI_TROVATI.md` con la misura |
 | `coord-status.sh` dice `claims=0` al failover | l'auto del connettore 3 ha attaccato **senza prenotare prima** (§0 n.1) | rifai il T+3:10 nell'ordine: `reserve.js` e poi `presenter-cp.sh` |
 | Il nome della rete non esiste (`docker network disconnect` fallisce) | il prefisso del progetto compose | `docker network ls`: è `voltshare_voltshare`, non `voltshare` |
+| Un connettore diventa `out_of_service` e la lobby ne offre uno di meno | **la sua colonnina non risponde più**. La stazione aspetta 30 s e poi dichiara la presa inutilizzabile, perché dal suo lato un emulatore uscito e un caricatore rotto sono la stessa cosa | attaccagli una colonnina: `node cp.js --url ws://localhost:9201/ws/cp --station 1 --connector N --vehicle 107 --plug-after 9999 --stay`. Il `boot` con stato `available` lo rimette `free` da solo (`vs_connector`: "out_of_service ──boots available──▶ free") |
+| Idem, **dopo** una ricarica finita bene | fino al 3/09 `cp.js` usciva allo `unplugged`: diceva di essere la colonnina ma viveva quanto l'auto, e ogni sessione completata spegneva la presa | risolto da `--stay`, che `presenter-cp.sh` e `world.sh` passano già. Se lanci `cp.js` a mano per una demo, mettilo |
+| Un'auto di sfondo sparisce e non torna | fino al 3/09 `world.sh` lanciava i due `cp.js` e faceva `wait`: se uno moriva, l'altro teneva vivo lo script e il morto non ripartiva mai | risolto — ora ogni auto gira in un ciclo che la rilancia (uscita 2 esclusa: è un errore di configurazione, e rilanciarlo lo nasconderebbe) |
+| Nei log compare `'global' … requested disconnect … to prevent overlapping partitions` | `global` risolve una vista incoerente della membership disconnettendo due nodi. Lo provocano i nodi effimeri di `coord-status.sh`, che entrano nel cluster e muoiono subito | innocuo, si riconnettono. Se capita in scena **dillo**: è lo stesso istinto del nostro quorum — rifiutarsi di lavorare con una vista ambigua |
 
 Se qualcosa si impunta a fondo: `docker compose --env-file .env.demo restart stationN`
 (oppure `coordN`) e prosegui dai log invece che dalla pagina.
@@ -732,9 +779,16 @@ non nella pagina (`ws-driver.md` §7.5). È esattamente ciò che serve al T+3:10
 «già visto» del §2): se saltasse solo la prova generale, sono questi due a dover girare
 almeno una volta.
 
-- [ ] `.env.demo`, `seed-demo.sql`, i **6** script creati e `chmod +x` (incluso
-      `reserve.js`, copiato dalla root di A); la riga `${STATION1_SITE_POWER_KW:-350}` in
+- [ ] `.env.demo`, `seed-demo.sql`, gli **8** script creati e `chmod +x` (`world.sh`,
+      `presenter-cp.sh`, `logs.sh`, `coord-logs.sh`, `coord-status.sh`, `unsuspend.sh`,
+      `p2.sh`, `reserve.js`); la riga `${STATION1_SITE_POWER_KW:-350}` in
       `docker-compose.yml`.
+- [ ] `logs.sh` mostra `claim GRANTED` e `claim REFUSED` da un coordinatore durante P2.
+      Se non compaiono, l'immagine dei coordinatori è precedente al 3/09: `build coord1`
+      e `up -d coord1 coord2 coord3` (i tre condividono l'immagine, quindi si costruisce
+      una volta sola).
+- [ ] dopo una ricarica **finita**, il connettore torna `free` e non `out_of_service`:
+      è la verifica che `--stay` sia in `presenter-cp.sh`.
 - [ ] **immagini costruite la sera prima** (`build`, non `up -d --build`), così la mattina
       il passo 1 dura secondi.
 - [ ] `docker volume ls` mostra `voltshare_mysql-data`: senza quello un `down` cancella

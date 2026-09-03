@@ -3483,6 +3483,126 @@ Annotato, non corretto.
 
 ---
 
+## 7zl. Provando la demo per davvero: quattro difetti, tutti trovati guardando — 3 settembre
+
+Nessuno di questi è emerso da un test. Sono emersi perché per la prima volta abbiamo
+**guardato girare la demo intera** invece dei pezzi. Vale la pena dirlo nella relazione: la
+suite era verde a 386 mentre tutti e quattro erano lì.
+
+### ① Il coordinatore era muto sulla decisione che lo definisce
+
+`vs_coord_srv` ha **ventitré** chiamate al logger. Nessuna su `do_claim/6`. Concedere o
+rifiutare un claim — l'atto che l'intero cluster esiste per compiere — non lasciava traccia
+da nessuna parte, e il **rifiuto** non era loggato nemmeno dalla stazione: `NO_CLAIM`
+esisteva solo come frame in un browser.
+
+In scena significa che la battuta centrale («nessuna delle due stazioni può decidere da
+sola, decide il coordinatore») non aveva niente a supporto sui log. Aggiunte due
+`logger:notice`, sui due rami:
+
+```
+coord3  claim GRANTED to vehicle 103 (user 103) on station 1 connector 3 — c-67C6BC73
+coord3  claim REFUSED to vehicle 103 (user 103) on station 2 connector 5 — already_held
+```
+
+`notice` e non `info` deliberatamente: una corsa di contesa che stampa quindici rifiuti e
+una concessione è **il quadro più chiaro di P2 che il sistema sappia produrre**, non
+rumore.
+
+### ② Quattro pannelli erano un errore di impostazione
+
+Il §5 di `DEMO.md` prescriveva un riquadro per servizio. Provandolo: ingestibile, e
+sbagliato in linea di principio — **la storia è una sola** (browser → coordinatore →
+stazione → Java) e su quattro riquadri è a pezzi.
+
+Scritto `demo/logs.sh`: i sette servizi in una colonna, ordinati nel tempo, con l'ora e il
+nodo colorato. Tre cose lo rendono leggibile e senza di esse non lo sarebbe: il timestamp
+di Docker (`-t`) ridotto a `HH:MM:SS`; le intestazioni `=NOTICE REPORT==== … ===` buttate
+via (**il logger di Erlang stampa due righe per messaggio** e la prima non dice niente); e
+il colore per nodo, che è l'unica cosa che permette di seguire un attore senza rileggere.
+
+Il rumore tolto è solo periodico: la ripubblicazione del leader ogni 30 s, il ciclo di vita
+di Tomcat, e il ping di M0 se qualcuno lo riaccende. `VERBOSE=1` rimette tutto.
+
+### ③ `world.sh` non sorvegliava le sue auto
+
+Lanciava i due `cp.js` con `&` e poi `wait`. Se **una** moriva, `wait` restava sull'altra e
+la morta **non ripartiva mai**. La conseguenza non è "manca un'auto": trenta secondi dopo
+la stazione dichiara quel connettore `out_of_service`, perché una presa senza
+apparecchiatura non è una presa libera. Lo sfondo si spegneva a metà demo senza che si
+capisse perché.
+
+Ora ogni auto gira in un ciclo che la rilancia, con una pausa di 3 s. Distingue due casi,
+come farebbe un supervisore OTP: uscita 1 o segnale = incidente, si rilancia; **uscita 2**
+(`die()`: connettore inesistente, 4404, o 4409) = errore di configurazione, non si
+rilancia, perché si ripeterebbe identico e verrebbe nascosto.
+
+Verificato uccidendo un `cp.js` con `taskkill`: `world: conn 6 uscito (codice 1), rilancio
+fra 3s`, e il connettore è tornato **da `out_of_service` a `charging` da solo**.
+
+### ④ `cp.js` diceva di essere la colonnina ma viveva quanto l'auto
+
+Il difetto più interessante dei quattro, perché è di **modellazione**, non di codice.
+
+`unplug()` finiva sempre in `process.exit(0)`. Ma una colonnina è avvitata al muro e resta
+collegata al back end per anni mentre le auto vanno e vengono; questo processo sosteneva di
+esserne una e durava quanto una singola macchina. Quindi **ogni sessione completata
+lasciava la presa incustodita**, e trenta secondi dopo la stazione — correttamente, non
+avendo modo di distinguere "hardware sparito" da "hardware rotto" — la dichiarava
+`out_of_service`.
+
+Misurato dal vivo: `session 2 written: connector 2, user 108, 11.817 kWh` (fatturata,
+`cost_cents = 532`), poi `charge point socket gone in free (normal)`, poi
+`no charge point for 30000 ms - out of service`. Due battute e mezza stazione sarebbe stata
+spenta.
+
+Aggiunto `--stay`: alla fine il processo non esce, tiene il socket e manda
+`status: available` — che è anche ciò che **solleva** un connettore da `out_of_service`
+(`vs_connector`: *"out_of_service ──charge point boots available──▶ free"*). Passato da
+`presenter-cp.sh` e `world.sh`, quindi i comandi in scena non cambiano.
+
+### Il contorno, sempre dal guardare
+
+- **`--soc 45 --battery 60 --max-kw 150` erano i default di `cp.js`.** Il copione li faceva
+  riscrivere in ogni comando. Tolti: restano due numeri per comando, connettore e veicolo.
+- **La query SQL per leggere il veicolo era inutile**: `profile.jsp:18` stampa
+  `Vehicle #${account.vehicleId}`, ed è una pagina già aperta nel browser.
+- **`ErlangBridge.notifyUnsuspension(int)` non ha chiamanti** (già annotato in §7zk). Scritto
+  `demo/unsuspend.sh`, che fa i due passi nell'ordine giusto: prima la riga, poi l'`rpc` ai
+  tre coordinatori — al contrario la ripubblicazione del back office rimette la sospensione
+  entro 30 s.
+- **Il ping di M0 aveva un gemello**: tolto `PING_TARGET`, resta che il rumore periodico va
+  cercato ovunque prima di una presentazione, non solo dove dà fastidio per primo.
+
+### Verificato — girato davvero
+
+- `eunit_check.sh` **386, 0 failures** dopo la modifica al coordinatore; immagine
+  ricostruita e i tre coordinatori ricreati (condividono `voltshare-coord:local`, quindi un
+  solo `build`).
+- `claim GRANTED` / `claim REFUSED` visti nei log durante un P2 vero: `reserve.js` sul
+  connettore 3 di Pisa concesso, sul 5 di Livorno rifiutato con `already_held`.
+- Supervisione di `world.sh`: `cp.js` ucciso, rilanciato dopo 3 s, connettore risalito da
+  `out_of_service` a `charging`.
+- `--stay`: carica fino al 26%, `unplugged` a 0,805 kWh, `cable out — charge point stays
+  online, connector free again`, connettore **`free`** e processo ancora vivo.
+- Connettore 2 riportato in servizio attaccandogli una colonnina che non infila nessuna auto
+  (`--plug-after 9999 --stay`). Pisa: `1 charging, 2 free, 3 free, 4 free`.
+- Fatturazione end-to-end sulla sessione reale: 11,817 kWh → `cost_cents = 532`.
+
+### Non provato — e perché
+
+- **La demo intera in sequenza** non è ancora stata corsa: la giornata è stata di
+  diagnosi. Le singole battute sì.
+- **`not_your_reservation` e `unknown_vehicle` end-to-end**: i due rifiuti del canale
+  colonnina hanno test unitari ma nessuna corsa. Si producono in due comandi
+  (`cp.js --vehicle 88` per lo sconosciuto, un veicolo seminato diverso dal titolare per
+  l'altro) e coprirebbero due righe di `ws-chargepoint.md` §4.2 mai viste girare.
+- **`'global' … requested disconnect … to prevent overlapping partitions`**, comparso una
+  volta. Quasi certamente causato dai nodi effimeri di `coord-status.sh`, che entrano nel
+  cluster e muoiono subito. Innocuo, non indagato a fondo.
+
+---
+
 ## 9. Prossimo passo
 
 Tre milestone su quattro sono chiuse lato B (M1, M2, M3) e verificate in Docker. Il progetto ha
