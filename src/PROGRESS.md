@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 2 settembre 2026 — **tutte le milestone di codice sono chiuse sui due lati.** M0, M1, M2, M3 e M4, di A e di B, sono su `main` (`9ff8e63`). Lato A si sono chiuse **M3-A** (§7zd, §7ze, §7zj) e **M4-A** (§7zf, §7zg, §7zh, §7zi), e l'1/09 il giro intero è stato guardato **in un browser vero** (§7zk) — era l'ultima cosa che restava fuori dal M1. Del difetto grave **P18** la **metà di A è fatta e misurata** il 02/09 (§7zl, `a/p18-nodeup`): finestra di esposizione da **4,11 s a 0 ms**, suite da 386 a **392 test**, 0 fallimenti su tre giri con `eunit_check.sh`. La **metà di B resta aperta** ed è una decisione, non una correzione (§8, `src/contracts/nota-per-B-p18.md`). Poi la M5: prova generale, demo, relazione.
+**Ultimo aggiornamento:** 3 settembre 2026 — **tutte le milestone di codice sono chiuse sui due lati**, e **P18 è chiuso su tutti e due**. M0, M1, M2, M3 e M4, di A e di B, sono su `main`; l'1/09 il giro intero è stato guardato **in un browser vero** (§7zk), l'ultima cosa che restava fuori dal M1. Del difetto grave **P18** la metà di A è su `main` (§7zl, finestra da **4,11 s a 0 ms**) e la metà di B è in questo ramo: un rebuild vuoto con la tabella vuota **non promuove più a `serving`**, si resta in `rebuilding` finché non arriva un renew — è il compromesso disponibilità/correttezza, deciso in due e non da uno solo. Resta la **M5**: prova generale, demo, relazione.
 
 ---
 
@@ -54,7 +54,7 @@ Distinzione importante, perché non tutto è verificabile su questa macchina:
 | ③ Novanta secondi di inattività senza scollegarsi | ✅ **chiusa il 27/08** — **101 secondi** senza inviare nulla: socket sempre aperto, `["connecting","online"]` e nessuna riconnessione, 23 push di stato ricevuti. Il `pong` automatico tiene davvero fermo l'`idle_timeout` (60 s) di cowboy. Misurato con un client Node, che risponde ai ping esattamente come un browser |
 | ④ JWT in transito (B firma con `JwtUtil`, A verifica con `vs_jwt`) | ✅ **chiusa il 27/08** — registrato un utente vero da Tomcat, letto il `TOKEN` dalla pagina renderizzata (`sub:"1"`, `vehicle_id:1`, `iss:voltshare-backoffice`, 60 min) e usato per il `join`: accettato. È l'ultimo pezzo del confine fra le due metà, ed era l'unico mai provato |
 | **Suite completa dopo il merge di `a/m2-cp-touchups` (P11)** | ✅ **307 test** — misurati il 29/08 su `a/p11-suite-flake`: **stesso totale su 26 giri della suite completa**, e 0 fallimenti su 25 di quei 26 (l'unico rosso è il terzo difetto di §7zb, prima della sua correzione; dopo la correzione, 13 giri su 13 verdi). Da oggi il numero non è più una nota: `src/scripts/eunit_check.sh` lo confronta e fallisce se cambia (§7zb). **311 dal 29/08 con i quattro test di P10** (§7zc) |
-| **Suite completa oggi** | ✅ **392 test, 0 fallimenti** — `./src/scripts/eunit_check.sh`, tre giri consecutivi verdi, `EXPECTED_TESTS=392`. Erano **386** su `9ff8e63`: i sei nuovi sono i test della metà A di P18 (§7zl). Aggiornare quel numero fa parte dell'aggiungere test, e il conteggio è un'asserzione, non una speranza (§7zb) |
+| **Suite completa oggi** | ✅ **395 test, 0 fallimenti** — `./src/scripts/eunit_check.sh`, `EXPECTED_TESTS=395`. Erano **386** su `9ff8e63`, poi **392** con i test della metà A di P18 (§7zl), e **395** con i tre della metà di B. Aggiornare quel numero fa parte dell'aggiungere test, e il conteggio è un'asserzione, non una speranza (§7zb) |
 | **Il giro intero in un browser vero** | ✅ **1/09** (§7zk) — registrazione, griglia, countdown, `charging`, stop → `complete` istantaneo con la potenza che rientra nel pool, `complete` → `overstay` al tick, la riga in `/notifications` con l'ora locale giusta, e in `/history` la sessione a **1,58 kWh · overstay 10 min · € 5,71**, conto verificato al centesimo. È la riga che chiude il «non i pixel» di M1 |
 | **Partizione di rete vera sul *leader*** | ✅ **1/09** (§7zj) — `docker network disconnect` sul leader con due claim vivi e una ricarica in corso: `QUORUM LOST (1 of 3) … abdicating` a **2,12 s**, leader nuovo che serve con entrambi i claim a **2,29 s**, nodedown della distribuzione solo a **64,6 s**. Senza FIN si paga il tick — è ciò che `docker kill` non può mostrare |
 | **Redirect circolare prodotto nei container** | ✅ **1/09** (§7zj) — fino a quel giorno solo in eunit. Nella finestra in cui un leader appena eletto è `rebuilding`, un conducente ha ricevuto **undici `RETRY_LATER` di fila** invece di rimbalzare: un redirect solo, mai un giro, sul codice di produzione |
@@ -210,12 +210,12 @@ mvn test -Dtest=SampleTokenGenerator   # rigenera i token di contracts/sample-to
 # erlang — OTP 29.0.5, rebar3 3.27
 cd src/erlang
 rebar3 compile                         # quattro applicazioni, nessun warning
-rebar3 eunit                           # 392 test, 0 fallimenti (02/09, con la metà A di P18)
+rebar3 eunit                           # 395 test, 0 fallimenti (03/09, con le due metà di P18)
 #
 # Dal 29/08 il controllo vero prima di un push è lo script, non il comando nudo.
 # Si posiziona da sé, quindi gira da qualunque directory (qui dalla radice):
 #
-#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "392 tests, 0 failures"
+#   ./src/scripts/eunit_check.sh         # verde solo se exit 0 E "395 tests, 0 failures"
 #
 # Il numero atteso vive in EXPECTED_TESTS dentro lo script: chi aggiunge test lo
 # aggiorna nello stesso commit, altrimenti il guardiano diventa rosso a ragione.
@@ -513,10 +513,15 @@ Da verificare in quel momento, perché è il vero punto di contatto fra le due m
 - ~~**Overstay: chi sottrae la tolleranza**~~ **deciso e implementato** (§7zf): la sottrae **la stazione**, che è l'unico posto dove la tolleranza è configurata, e in `sessions` finisce `overstay_seconds` **netto**. Il back office lo prezza e basta. Era il tipo di errore che sarebbe stato invisibile: due sottrazioni o zero.
 - ~~La **potenza** (M2-A) non è ancora allocata: la fatturazione gira su righe inserite a mano~~ **chiuso** (§7q, §7s): l'auto carica, la stazione scrive la riga, il coordinatore sveglia Java, Java la prezza — misurato a **38 ms** dalla fine della sessione.
 
-### Aperti oggi (2 settembre)
+### Aperti oggi (3 settembre)
 
-- **P18 — GRAVE. Metà di A fatta e misurata il 02/09 (§7zl); metà di B aperta, ed è una
-  decisione, non una correzione.**
+- ~~**P18 — GRAVE.**~~ **Chiuso su tutte e due le metà.** Quella di A è su `main` il 02/09
+  (§7zl); quella di B è in questo ramo: `{rebuilt, []}` con la tabella vuota **non promuove più
+  a `serving`**, il coordinatore resta in `rebuilding` e ne esce al primo renew. Era una
+  decisione e non una correzione — costa disponibilità — e infatti è stata presa in due, con la
+  richiesta e il suo prezzo scritti prima in `nota-per-B-p18.md` e accettati in
+  `risposta-per-A-p18.md` §2. La scheda originale del difetto resta qui sotto perché la misura
+  che lo definisce serve alla relazione.
 
   *Il difetto.* Un coordinatore che rientra da una partizione più lunga del `net_ticktime`
   ricostruisce l'indice chiedendo alle stazioni, ma la sua lista di conoscenti è vuota
@@ -538,12 +543,12 @@ Da verificare in quel momento, perché è il vero punto di contatto fra le due m
   corsa, non una garanzia — se il coordinatore avesse cominciato a servire mezzo secondo prima,
   si sarebbe riaperta.
 
-  *Cosa resta, e va deciso insieme.* Lato B: **non passare a `serving` con zero risposte *e* zero
-  claim** finché non è arrivato almeno un renew. È l'unica delle due metà che chiude davvero la
-  finestra, e costa un po' di disponibilità: è il compromesso disponibilità/correttezza del
-  progetto, e nessuno dei due può sceglierlo da solo. I client trattano già `rebuilding` come
-  `RETRY_LATER` — misurato, §7zj ⑤ (undici di fila, nessun giro). La richiesta col suo costo
-  onesto è in **`src/contracts/nota-per-B-p18.md`**.
+  *Cosa ha fatto B, e perché è quella che chiude.* **Non si passa a `serving` con zero risposte
+  *e* zero claim**: si resta in `rebuilding` finché non arriva un renew. È l'unica delle due metà
+  che chiude davvero la finestra invece di accorciarla, perché non dipende da chi arriva primo. I
+  client trattano già `rebuilding` come `RETRY_LATER` — misurato, §7zj ⑤ (undici di fila, nessun
+  giro), quindi il costo è attesa, non errore. La richiesta col suo prezzo era in
+  **`nota-per-B-p18.md`**, la decisione in **`risposta-per-A-p18.md`** §2.
 - **P16 — BASSO, misurato il 29/08.** `vs_claim_client` parte con `leader = hd(COORD_NODES)` e
   non lo corregge finché non ha un motivo (concessione, renew riuscito, `who_do_you_hold`):
   la prima prenotazione dopo un boot paga sempre un **redirect §4.2 in più**. Nessuna azione
@@ -3368,7 +3373,136 @@ trovato un nodo che rifiuta, e ha restituito il rifiuto: è il flag `Followed` d
 
 ---
 
-## 7zk. Passata di review su tutto il progetto, e la demo resa lanciabile — 2 settembre
+## 7zk. Il giro intero guardato coi pixel, nel Chrome vero — 1 settembre
+
+L'ultima cosa che restava fuori dal M1-A, e ci è rimasta per settimane. Fino a oggi la logica
+del rendering era provata con un **DOM minimale in Node** (23 controlli, §1): dimostra che il
+codice reagisce ai frame giusti, **non** che una persona davanti a uno schermo vede la cosa
+giusta. Le due domande sono diverse, e la seconda non si risponde con un test.
+
+Perché ci è voluto tanto: il browser interno dell'assistente **non fa passare i WebSocket** verso
+un'origine diversa, quindi la pagina live non si può guardare da lì. Serve il Chrome vero, a
+mano, con lo stack su. E non esiste una credenziale di prova — `schema.sql` semina solo
+`stations` e `connectors` — quindi si entra da `/register.jsp`, che crea utente **e** veicolo e
+fa login da solo (ricetta in §7zj, «Non provato — e perché»).
+
+### Cosa è stato visto, in ordine
+
+Registrazione; griglia dei connettori; prenotazione con il **conto alla rovescia che scende da
+solo**; `charging`; **stop dal browser** → `complete` istantaneo, con la potenza che rientra nel
+pool e le altre auto che salgono; `complete` → **`overstay`** al tick successivo, col cavo ancora
+dentro; la riga comparsa in **`/notifications`**; e in **`/history`** la sessione chiusa a
+**1,58 kWh · overstay 10 min · € 5,71**.
+
+### Le due cose che solo i pixel potevano chiudere
+
+1. **Il fuso.** I timestamp in tabella sono UTC (scelta di progetto, §7s); la conversione la fa
+   `Times.java`. L'ora mostrata in `/notifications` e in `/history` è quella **locale**, non
+   quella del database: era l'ultima pendenza di M2-A, e non si poteva vedere altrove.
+2. **Il conto al centesimo.** € 5,71 lega la riga scritta dalla stazione — `energy_kwh` e
+   `overstay_seconds` **netto** — al prezzo calcolato da B. Verificato a mano: è il punto in cui
+   le due metà del progetto si toccano davvero, e un errore di tolleranza (sottratta due volte, o
+   mai) sarebbe comparso qui e in nessun test.
+
+### Non provato — e perché
+
+Osservazione **a mano, su una corsa sola**: non è una misura ripetibile e non pretende di esserlo.
+Restano **tre cose mai viste con gli occhi**, tutte per la prova generale di M5:
+
+- il **riparto 75 · 75 · 50** sotto scarsità — il meccanismo è misurato (§7q), i pixel no;
+- le **pagine del no-show**: profilo sospeso e notifiche con gli strike — misurati al database
+  (§7zg, §7z), mai guardati;
+- il **giro intero col cronometro**, cioè la demo dentro il tempo che ha.
+
+---
+
+
+---
+
+## 7zl. P18, la nostra metà: ripresentare all'evento invece che al prossimo giro — 2 settembre
+
+Branch `a/p18-nodeup`. La metà del difetto che è nostra, con la sua misura; la metà di B è una
+**decisione**, non una correzione, e gliela abbiamo chiesta con i numeri in mano
+(`src/contracts/nota-per-B-p18.md`).
+
+**Il difetto non era il meccanismo, era il momento.** La ripresentazione dei claim esisteva già
+ed era corretta — il `renew_tick` manda tutti i claim col `granted_at` originale, il redirect
+`not_serving` viene seguito, e il coordinatore adotta un claim che non conosce. Mancava
+*quando*: partiva al tick, fino a 10 s dopo, mentre la finestra pericolosa si apre ~2 s dopo il
+rientro del leader. Ora `net_kernel:monitor_nodes(true)` e due clausole **sopra** il catch-all:
+un coordinatore che torna → riannuncio e giro di renew immediato. Nessun messaggio nuovo, nessun
+contratto toccato, **nessuna riga sotto `vs_coord/`**, e il tick periodico intatto (il giro
+immediato è *in più*, non *invece*).
+
+### Le quattro verifiche fatte prima di scrivere una riga di codice
+
+| | risposta |
+|---|---|
+| il `nodeup` arriva alla stazione senza che sia lei a parlare per prima? | **sì**, a **959 ms** dal `docker network connect` — con la stazione a zero claim e leader ≠ coord3, cioè senza alcun motivo di rivolgersi a lui. È **342 ms dentro** la finestra di rebuild e **1,7 s prima** che il leader cominci a servire |
+| il `do_renew` di B con una stazione sconosciuta | **adotta** (`vs_coord_srv.erl:472-486`, e la clausola `error ->` di `renew_one/4` a `:524-538`); `unknown_station` sta solo in `check_can_grant/4` (`:432`), sul percorso `acquire`. Quindi l'annuncio prima del renew è **precedenza, non necessità** — ma serve lo stesso, perché l'adozione riempie `claims` e mai `stations` |
+| quanto rumore fa `monitor_nodes(true)` | rientro del solo leader: **1 `nodeup`**. Isolamento della stazione: **4 in 271 ms**, i tre coordinatori entro 11 ms. Il back office non compare (parla solo coi coordinatori); i nodi `-hidden` non generano eventi (misurato: 0 su cinque connessioni di sonda) |
+| la latenza era già misurata dal pair 2? | **no**: §1.2 di `REPORT_M3A_CODA` dà ~10 s con una sonda che campionava ogni 4 s — un tetto, e nel verso sbagliato. Andava rifatta |
+
+La terza ha deciso una cosa che sembrava stile: **il filtro sui `coord_nodes` va prima del
+debounce**, perché il primo `nodeup` della raffica è di una *stazione*, 260 ms davanti ai
+coordinatori — e un debounce segnato prima del filtro farebbe ingoiare proprio i tre che
+contano.
+
+### Verificato — girato davvero
+
+- **`beam_lib:md5` prima e dopo**: 17 moduli su 5 nodi identici all'albero host **prima** di
+  misurare (la precondizione che il pair 2 trovò falsa il 01/09, quindi rifatta e non ereditata);
+  e dopo la ricostruzione, `vs_claim_client` = `61c5adf7…` su host, station1 e station2, con
+  `vs_connector` e `vs_station_mgr` **invariati** — il perimetro chiuso verificato in binario;
+- **suite 386 → 392**, `EXPECTED_TESTS` aggiornato nello stesso commit, **tre giri consecutivi
+  verdi** (`392 tests, 0 failures` × 3);
+- **ogni test nuovo visto rosso senza il suo pezzo di fix**, con cinque mutazioni una per volta:
+  tolto il debounce → rosso il test della raffica; tolto il filtro → rosso quello del nodo
+  estraneo; tolto l'annuncio → rossi quattro; `nodedown` che svuota la tabella → rosso il suo;
+  tolto il `send_after` del tick → rosso il test dell'estrazione (e anche un test preesistente,
+  che è la conferma che il tick serviva davvero a qualcuno);
+- **le clausole nuove sopra il catch-all, provato spostandole sotto**: il compilatore emette
+  `this clause for handle_info/2 cannot match because a previous clause always matches` (due
+  volte) e **quattro** dei sei test diventano rossi. Sotto sarebbero codice morto e i test
+  sarebbero verdi per il motivo sbagliato;
+- **E2E, scena vera** (connettore 1 prenotato, connettore 3 in carica a 150 kW, partizione del
+  leader e rientro), predizione scritta prima e corse singole:
+
+| | finestra di esposizione | riga del coordinatore | `stations` all'inizio del servizio |
+|---|---|---|---|
+| prima | **4,11 s** | `serving with 0 adopted claim(s)` | `[]` per altri 19,7 s |
+| dopo | **0 ms** | `serving with 2 adopted claim(s)` | `[1,2]`, 1,74 s prima |
+
+  Lo zero è verificabile e non ottimistico: l'osservatore a 100 ms ha fotografato coord3 ancora
+  in `mode=rebuilding` con già `vehicles=[88,201]` e `stations=[1,2]`. E la riga del rebuild è
+  rimasta `asked 0 station node(s) … 0 station(s) answered`: **la strada di B non è cambiata**,
+  la finestra che lasciava vuota è stata riempita dal nostro renew.
+
+### Non provato — e perché
+
+- **La finestra non si chiude, e non pretendiamo che si chiuda.** Lo zero è l'esito di *questa*
+  corsa: il renew immediato deve vincere una gara col leader uscente, e il margine misurato su
+  quella gara è **265 ms**, non 1,74 s. Se il coordinatore serve a tabella vuota prima che
+  chiunque possa parlargli, nessuna prontezza della stazione arriva in tempo — per costruzione.
+  A chiudere è la metà di B, che è una scelta di disponibilità e non un bug fix.
+- **Una seconda corsa E2E «dopo»**: una sola, come la «prima». Le due si confrontano perché lo
+  scenario è identico, non perché siano una statistica.
+- **Il veicolo che ottiene la seconda prenotazione** non è stato riprovato: l'1/09 fu colto su
+  272 ms di margine, quindi riproducibile ma non deterministico, e non è la cosa che si misura.
+  Ciò che si misura è la finestra.
+- **`warnings_as_errors` non è in vigore su `apps/`** — trovato correndo le mutazioni e
+  **riprodotto a mano il 02/09** su un albero pulito: una funzione non esportata con dentro una
+  variabile mai usata, aggiunta a `apps/vs_common/src/vs_time.erl`, produce due warning e
+  `rebar3 compile` esce comunque **0**. La causa è la forma `{del, Options}` senza nome
+  applicazione in `rebar.config`, che vale per tutte le applicazioni e non solo per le
+  dipendenze. **Il comportamento non è corretto** — è una modifica al build di tutto l'albero e
+  vale un pair suo — ma **il commento che affermava il contrario sì**, perché era una riga falsa
+  in un file versionato, accanto alla riga che la smentiva. Il ragionamento in
+  `scelte_di_progetto.md` §27.7, con la correzione anche a §9.10, che diceva la stessa cosa
+  sbagliata dal 24/08. Conseguenza da sapere: la regola «`main` verde con `warnings_as_errors`»
+  non copre `src/` più di quanto copra i test — cioè non copre niente, e va detta a B, che nella
+  `risposta-per-A-review-pr5.md` §99 aspetta una pulizia sul presupposto opposto.
+## 7zm. Passata di review su tutto il progetto, e la demo resa lanciabile — 2 settembre
 
 Tre lavori nella stessa giornata: una review completa di `src/`, gli otto file che il runbook
 della demo dava per esistenti e non esistevano, e la caccia a un guasto dell'infrastruttura che
@@ -3530,7 +3664,7 @@ Annotato, non corretto.
 
 ---
 
-## 7zl. Provando la demo per davvero: quattro difetti, tutti trovati guardando — 3 settembre
+## 7zn. Provando la demo per davvero: quattro difetti, tutti trovati guardando — 3 settembre
 
 Nessuno di questi è emerso da un test. Sono emersi perché per la prima volta abbiamo
 **guardato girare la demo intera** invece dei pezzi. Vale la pena dirlo nella relazione: la
@@ -3614,7 +3748,7 @@ Aggiunto `--stay`: alla fine il processo non esce, tiene il socket e manda
   riscrivere in ogni comando. Tolti: restano due numeri per comando, connettore e veicolo.
 - **La query SQL per leggere il veicolo era inutile**: `profile.jsp:18` stampa
   `Vehicle #${account.vehicleId}`, ed è una pagina già aperta nel browser.
-- **`ErlangBridge.notifyUnsuspension(int)` non ha chiamanti** (già annotato in §7zk). Scritto
+- **`ErlangBridge.notifyUnsuspension(int)` non ha chiamanti** (già annotato in §7zm). Scritto
   `demo/unsuspend.sh`, che fa i due passi nell'ordine giusto: prima la riga, poi l'`rpc` ai
   tre coordinatori — al contrario la ripubblicazione del back office rimette la sospensione
   entro 30 s.
@@ -3835,27 +3969,26 @@ partizione c'è una finestra di riconnessione.
 **Le quattro milestone di codice sono chiuse su entrambi i lati** e verificate in Docker. Il
 progetto ha tutto ciò su cui viene giudicato: coordinazione, tolleranza ai guasti, la
 dimostrazione che P2 sopravvive a un failover, e — dall'1/09 — il giro intero visto in un
-browser vero (§7zk). Quello che resta non è più codice di milestone: è **un difetto**, la
-**demo** e la **relazione**.
+browser vero (§7zk). Quello che resta non è più codice: è la **demo** e la **relazione**.
 
-### 1. P18 — **la metà di A è fatta**, quella di B va decisa insieme
+### 1. P18 — **chiuso su tutte e due le metà**, e resta da rivedere in due
 
 Rompeva l'invariante di `SCOPE.md` §4 — un veicolo, una prenotazione in rete — per **13,65 s**
-misurati. La scheda è in §8, la misura originale in §7zj ③, il lavoro del 02/09 in §7zl.
+misurati. La scheda è in §8, la misura originale in §7zj ③, il lavoro di A in §7zl.
 
-- **la metà di A**, `monitor_nodes` + riannuncio e renew sul `nodeup`: **fatta e misurata**
-  (`a/p18-nodeup`). La finestra di esposizione è passata da **4,11 s** a **0 ms** sulla stessa
-  scena, con il coordinatore che comincia a servire dicendo `with 2 adopted claim(s)` invece di
-  `0`. **Accorcia**, e nel caso misurato ha chiuso — ma per aver vinto una gara, con **265 ms**
-  di margine;
-- **la metà di B**, non passare a `serving` con zero risposte *e* zero claim finché non è
-  arrivato almeno un renew: **da decidere**, al prezzo di un po' di disponibilità. La richiesta
-  con tutti i numeri è in `src/contracts/nota-per-B-p18.md`.
+- **la metà di A**, `monitor_nodes` + riannuncio e renew sul `nodeup`: su `main`. La finestra è
+  passata da **4,11 s** a **0 ms** sulla stessa scena — ma **accorciando**, e per aver vinto una
+  gara con **265 ms** di margine;
+- **la metà di B**, non passare a `serving` con zero risposte *e* zero claim: **fatta**, in
+  questo ramo. È quella che chiude, perché non dipende da chi arriva primo.
 
 Se il coordinatore serve a tabella vuota **prima** che chiunque possa parlargli, nessuna
-prontezza del lato stazione arriva in tempo: le due metà non sono alternative, la prima da sola
-non basta e non finge di bastare. I client trattano già `rebuilding` come `RETRY_LATER` —
-misurato, §7zj ⑤.
+prontezza del lato stazione arriva in tempo: le due metà non erano alternative, e la prima da
+sola non bastava. I client trattano già `rebuilding` come `RETRY_LATER` — misurato, §7zj ⑤.
+
+**Quello che resta è una verifica, non una decisione:** la scena di §7zj ③ non è stata rifatta
+nei container **dopo** la metà di B. I test coprono la transizione, la misura end-to-end no. Va
+messa nella prova generale.
 
 ### 2. La demo (M5)
 

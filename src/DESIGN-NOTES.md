@@ -274,7 +274,7 @@ OTP supervision is not decoration here; each strategy encodes a claim about depe
   same kind of process, one per connector, and a connector that terminates normally stays
   terminated.
 
-Two bugs found in review (PROGRESS §7zk) show that this only works if the code cooperates,
+Two bugs found in review (PROGRESS §7zm) show that this only works if the code cooperates,
 and both were failures of supervision rather than of logic:
 
 1. `vs_coord_rebuild:run/1` used `spawn_link` while `vs_coord_srv` does not trap exits, so

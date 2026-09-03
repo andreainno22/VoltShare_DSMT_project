@@ -198,7 +198,7 @@ handle_call({claim, ReqId, VehicleId, UserId, StationId, ConnId}, _From, State) 
 
 handle_call({renew, StationId, Claims}, _From, State) ->
     {Reply, State1} = do_renew(StationId, Claims, State),
-    {reply, Reply, State1};
+    {reply, Reply, promote_if_rebuilt(State1)};
 
 handle_call(stations, _From, State) ->
     {reply, station_tuples(State), State};
@@ -305,7 +305,19 @@ handle_cast(become_leader, State) ->
     %% before sending it left this coordinator refusing every claim in the
     %% network, for ever, with nothing in any log to say why.
     {_Pid, Ref} = vs_coord_rebuild:run(self()),
-    Timer = erlang:send_after(vs_coord_rebuild:deadline_ms(), self(), rebuild_deadline),
+    %% Tagged with the same `Ref' as the monitor, and for the same reason the
+    %% `DOWN' clause below compares it: a deadline that only matched on
+    %% `mode = rebuilding' would let a *stale* timer close a *later* rebuild.
+    %%
+    %% The sequence is not hypothetical, and A found it (risposta-per-B-review-
+    %% progetto.md §3): elected → `rebuilding' with a five-second timer →
+    %% deposed inside those five seconds → elected again → a second rebuild
+    %% starts. The first timer is still armed; it fires into the new
+    %% `rebuilding' and ends it early, serving with whatever has arrived so far,
+    %% which is usually nothing. Bully elections around a healing partition make
+    %% elected-deposed-elected in five seconds an ordinary thing.
+    Timer = erlang:send_after(vs_coord_rebuild:deadline_ms(), self(),
+                              {rebuild_deadline, Ref}),
     vs_coord_bo:announce_leader(),
     {noreply, State#state{mode = rebuilding, leader = node(),
                           rebuild_ref = Ref, rebuild_timer = Timer}};
@@ -318,8 +330,14 @@ handle_cast({become_follower, Leader}, State) ->
     %% about, and would carry that staleness into its own rebuild if it were
     %% later elected. The stations hold the authoritative copy; a follower that
     %% wins asks them again from scratch.
-    {noreply, State#state{mode = standby, leader = Leader,
-                          claims = #{}, by_id = #{}}};
+    %%
+    %% `clear_rebuild' for the same reason `suspend' below does it, and its
+    %% absence here was a real hole (found by A): being deposed mid-rebuild left
+    %% the monitor and the deadline timer armed, so a node that was elected
+    %% again seconds later ran a second rebuild while the first one's timer was
+    %% still coming. Leaving `rebuilding' by any door must leave nothing behind.
+    {noreply, (clear_rebuild(State))#state{mode = standby, leader = Leader,
+                                           claims = #{}, by_id = #{}}};
 
 handle_cast(suspend, State) ->
     vs_coord_bo:standing_by(),
@@ -370,6 +388,48 @@ handle_info(sweep, State) ->
 handle_info({nodedown, Node}, State) ->
     {noreply, forget_node(Node, State)};
 
+%% P18 — the one case where a finished rebuild must NOT start serving.
+%%
+%% `Holds' is empty *and* we hold nothing. That is not "the network is idle": it
+%% is the signature of a leader that elected itself before its connections to
+%% the stations were re-established, because `vs_coord_rebuild:station_nodes/0'
+%% filters `nodes()' — the nodes we happen to know right now — rather than an
+%% enrolment of stations. `asked 0 station node(s)' means the question never
+%% went out, not that nobody answered.
+%%
+%% Serving here is what breaks P2, measured rather than feared: on 1 September
+%% the same vehicle obtained a second reservation on a second station 272 ms
+%% after a rejoining leader began serving, and the invariant stayed broken for
+%% 13.65 s until the first renewal re-presented the older claim. The defence in
+%% `vs_coord_rebuild' waits COORD_REBUILD_TIMEOUT_MS (2 000 ms) counting on
+%% renewals that arrive every CLAIM_RENEW_INTERVAL_MS (10 000 ms): it covers a
+%% fifth of a cycle. **Neither number is wrong on its own** — 2 000 ms is tuned
+%% to failure detection, 10 000 ms to the cost of renewal traffic at rest — the
+%% defect is that the first is used to defend against the second.
+%%
+%% So we stay in `rebuilding' and wait for a renewal to tell us the world exists.
+%% Stations already treat `rebuilding' as RETRY_LATER, and A's half of the fix
+%% (`a/p18-nodeup') makes them re-present on `nodeup' rather than on the next
+%% tick, so in the measured scene the wait is milliseconds, not the ten seconds
+%% the interval suggests.
+%%
+%% The cost is stated rather than hidden: **a rejoining leader refuses new
+%% reservations until it has heard from one station.** That is the availability
+%% side of an availability/correctness trade, and it is the same instinct as the
+%% quorum — refusing to serve when the invariant cannot be guaranteed is not a
+%% failure mode, it is the design. Serving with an empty table is not
+%% availability; it is being wrong quickly.
+%%
+%% The deadline timer is deliberately NOT cleared: it is the ceiling on this
+%% wait. If no renewal arrives at all, the backstop above fires and serves with
+%% a warning, because a coordinator stuck for ever is worse than one that is
+%% briefly wrong.
+handle_info({rebuilt, []}, State = #state{mode = rebuilding, claims = Claims})
+  when map_size(Claims) =:= 0 ->
+    logger:notice("coordinator ~p: rebuild found no stations and no claims — "
+                  "holding in rebuilding until a renewal arrives (P18)", [node()]),
+    {noreply, State};
+
 %% The stations have answered the rebuild query (M3). Adopt what they hold and
 %% start serving.
 handle_info({rebuilt, Holds}, State = #state{mode = rebuilding}) ->
@@ -393,8 +453,10 @@ handle_info({'DOWN', Ref, process, _Pid, Reason},
     publish(State1),
     {noreply, State1#state{mode = serving}};
 
-%% Backstop for a worker that neither answers nor dies.
-handle_info(rebuild_deadline, State = #state{mode = rebuilding}) ->
+%% Backstop for a worker that neither answers nor dies. `Ref' is matched, so a
+%% timer left over from an earlier rebuild cannot end this one.
+handle_info({rebuild_deadline, Ref},
+            State = #state{mode = rebuilding, rebuild_ref = Ref}) ->
     logger:warning("coordinator ~p: no rebuild answer within the deadline — "
                    "serving on renewal adoption instead", [node()]),
     State1 = clear_rebuild(State),
@@ -403,10 +465,12 @@ handle_info(rebuild_deadline, State = #state{mode = rebuilding}) ->
 
 %% Both arrive out of season once we have left `rebuilding': a DOWN for the
 %% worker that has already replied, or a deadline for a rebuild that finished.
+%% The second clause also catches the stale timer of a *previous* rebuild while
+%% a newer one is running — the case that made tagging necessary.
 handle_info({'DOWN', _Ref, process, _Pid, _Reason}, State) ->
     {noreply, State};
 
-handle_info(rebuild_deadline, State) ->
+handle_info({rebuild_deadline, _Ref}, State) ->
     {noreply, State};
 
 %% Late or irrelevant: we lost quorum, or were deposed, while the query was in
@@ -529,6 +593,27 @@ is_suspended(UserId, State) ->
 %% Renewals are also how a leader adopts claims it never granted, so answering
 %% them while in standby would build a table this node has no right to hold —
 %% and, worse, would let the station believe its claims are safe here.
+%% The other half of the P18 hold above: a renewal is the proof that a station
+%% exists and is talking to us, so the reason for holding is gone.
+%%
+%% A renewal is the right signal and an announcement is not. `station_up' says a
+%% station is reachable; a renewal says **what it holds**, which is the thing the
+%% empty rebuild failed to learn. `do_renew' has already adopted those claims by
+%% the time this runs — it takes the general clause in `rebuilding', which is
+%% what makes adoption work at all during the window.
+%%
+%% A renewal carrying no claims still counts: a station that reports holding
+%% nothing has answered the question, and the table is empty because the network
+%% is idle rather than because we could not ask.
+promote_if_rebuilt(State = #state{mode = rebuilding}) ->
+    logger:notice("coordinator ~p: a renewal arrived during the P18 hold — "
+                  "serving with ~p claim(s)", [node(), map_size(State#state.claims)]),
+    State1 = clear_rebuild(State),
+    publish(State1),
+    State1#state{mode = serving};
+promote_if_rebuilt(State) ->
+    State.
+
 do_renew(_StationId, _Claims, State) when State#state.mode =:= standby ->
     {{not_serving, State#state.leader}, State};
 do_renew(_StationId, _Claims, State) when State#state.mode =:= suspended ->

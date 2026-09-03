@@ -89,7 +89,10 @@ rebuild_test_() ->
         fun preserves_the_original_timestamps/1,
         fun settles_a_conflict_by_oldest_wins/1,
         fun answer_is_ignored_when_not_rebuilding/1,
-        fun survives_a_malformed_entry/1
+        fun survives_a_malformed_entry/1,
+        fun p18_an_empty_rebuild_does_not_start_serving/1,
+        fun p18_a_renewal_releases_the_hold/1,
+        fun a_stale_deadline_cannot_end_a_later_rebuild/1
     ]).
 
 adopts_what_the_stations_report(_) ->
@@ -187,4 +190,59 @@ survives_a_malformed_entry(_) ->
         ?assertEqual(serving, sync()),
         ?assertEqual(1, length(vs_coord_srv:claims()),
                      "the good claim is kept, the bad one dropped")
+    end.
+
+%% P18. An empty answer is not "the network is idle": it is what a leader gets
+%% when it elected itself before its links to the stations came back, because
+%% `station_nodes/0' filters the nodes it happens to know rather than an
+%% enrolment. Serving on it is how the same vehicle got two reservations on two
+%% stations for 13.65 s in the run of 1 September.
+p18_an_empty_rebuild_does_not_start_serving(_) ->
+    fun() ->
+        vs_coord_srv:become_leader(),
+        ?assertEqual(rebuilding, sync()),
+
+        answer([]),
+
+        ?assertEqual(rebuilding, sync(),
+                     "nobody answered and we hold nothing: there is no table to serve from"),
+        ?assertMatch({error, <<"r-1">>, rebuilding},
+                     vs_coord_srv:claim(<<"r-1">>, ?VEHICLE, ?USER, ?STATION_1, 3),
+                     "and the refusal is what protects P2 during the hold")
+    end.
+
+%% The way out. A renewal is the right signal and an announcement would not be:
+%% `station_up' says a station is reachable, a renewal says *what it holds* —
+%% which is exactly what the empty rebuild failed to learn.
+p18_a_renewal_releases_the_hold(_) ->
+    fun() ->
+        vs_coord_srv:become_leader(),
+        answer([]),
+        ?assertEqual(rebuilding, sync()),
+
+        Now = vs_time:now_ms(),
+        {renewed, Ok, [], _} =
+            vs_coord_srv:renew(?STATION_1,
+                               [{<<"c-old">>, ?VEHICLE, 3, ?USER, Now - 60000}]),
+
+        ?assertEqual([<<"c-old">>], Ok),
+        ?assertEqual(serving, sync(),
+                     "one station has spoken, so the reason for holding is gone"),
+        ?assertEqual(1, length(vs_coord_srv:claims()),
+                     "and it is serving from the claim the renewal brought")
+    end.
+
+%% The timer is tagged with the same reference as the monitor, so a deadline
+%% armed by an earlier rebuild cannot end a later one. Without the tag the
+%% sequence elected → deposed → elected again, all inside the deadline, ends the
+%% second rebuild early and serves with whatever arrived — usually nothing.
+a_stale_deadline_cannot_end_a_later_rebuild(_) ->
+    fun() ->
+        vs_coord_srv:become_leader(),
+        ?assertEqual(rebuilding, sync()),
+
+        whereis(vs_coord_srv) ! {rebuild_deadline, make_ref()},
+
+        ?assertEqual(rebuilding, sync(),
+                     "a deadline from another rebuild is not this rebuild's deadline")
     end.
