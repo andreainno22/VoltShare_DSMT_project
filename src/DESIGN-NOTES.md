@@ -125,6 +125,212 @@ Two caveats to keep in mind, since they are what would break the argument:
 
 Worth stating plainly in the presentation: this feature adds domain credibility rather than a new class of distributed problem. Its contention is already covered by an invariant we have.
 
+## 4c. Fault tolerance as a whole: what can fail, how it is noticed, what happens next
+
+§4 covers the coordinator. This section covers the rest, because fault tolerance in this
+system is not one mechanism but **five different ones, chosen per failure**, and the
+interesting claim to defend is that each was picked for a specific reason rather than
+applied uniformly.
+
+The organising idea: **every component keeps only the state it owns, and every other
+component treats that state as recoverable from its owner.** Tolerance follows from
+ownership, not from replication.
+
+### The failure model
+
+We assume crash-stop and partition, not Byzantine behaviour. Concretely, five things can
+fail, and each gets a different answer:
+
+| What fails | How it is noticed | What happens | What is lost |
+|---|---|---|---|
+| a coordinator (crash) | `nodedown`, immediately | election; the new leader rebuilds from the stations | nothing; reservations refused for ~2 s |
+| a coordinator (partition) | heartbeat, 3 s | the minority suspends itself | new reservations, on the minority side only |
+| a station node (crash) | `monitor_node`, immediately | the coordinator drops that station's claims | sessions in progress there |
+| a station's uplink (partition) | `monitor_node`, on the tick | the coordinator drops the station; **the site keeps charging**, but can start nothing new | the operator's view of it |
+| a charge point | its socket closes; 30 s grace | session closed with the last measured energy; connector `out_of_service` | nothing measured |
+| the back office (JVM) | nothing — it is a hidden node | the cluster is unaffected; on restart it re-reads and re-pushes | nothing durable |
+| MySQL | connection errors | **not tolerated** — see §7 | writes, until it returns |
+
+### Two failure detectors, because there are two failures
+
+This is the design decision most worth defending, and it is documented at
+`vs_coord_membership`.
+
+Erlang gives us `net_kernel:monitor_nodes/1` for free, and it fires the instant a TCP
+connection breaks — which is exactly what a killed container looks like. It is immediate
+and costs nothing.
+
+But **a node that stops answering without closing its socket is invisible to it**. A
+network partition, a frozen VM, a host that is swapping: the connection is still open, so
+no `nodedown` is delivered until the distribution's own tick expires, and `net_ticktime`
+defaults to **60 seconds**. Sixty seconds of a minority leader still granting claims is
+precisely the failure the quorum exists to prevent.
+
+So liveness is decided by an **explicit heartbeat**: one announcement per second, three
+missed in a row and a peer is treated as gone. Three seconds instead of sixty.
+`monitor_nodes` is subscribed to as well, purely to react faster when it *does* fire — it
+can only ever confirm what the heartbeat would conclude later.
+
+Measured on 1 September, isolating the leader with `docker network disconnect`:
+
+- `QUORUM LOST (1 of 3) … abdicating` at **2.12 s**
+- a new leader serving with both claims at **2.29 s**
+- the distribution's own `nodedown` only at **64.6 s**
+
+That last number is the argument. Without the heartbeat the system would have been
+incorrect for a minute, and no test would have shown it, because `docker kill` — the
+obvious way to simulate a failure — closes the socket and therefore never exercises this
+path. **Two kinds of failure need two experiments**, which is why the demo shows both
+`kill` and `disconnect`.
+
+### A site keeps working while the operator goes blind
+
+The failure above is a station *dying*. The more interesting one — and the one with a
+meaning outside this room — is a station that is **alive and unreachable**: the car park is
+delivering power, and the operator cannot see it. `docker network disconnect
+voltshare_voltshare station2` produces it, and unlike `kill` it has a plain real-world
+reading: the site's uplink is down.
+
+Measured on 3 September, with the station isolated:
+
+- **the cars keep charging.** Energy climbing inside the isolated station across the
+  partition: 0.248 → 0.403 → 0.558 kWh on one connector, 14.069 → 14.139 → 14.208 on
+  another.
+- **the coordinator drops it**: `** Node vs@station2 not responding **` followed by
+  `node vs@station2 is down, dropping stations [2] and their claims`, and the leader down
+  to one known station.
+- **the lobby empties**, because the lobby is drawn from what the coordinator pushes.
+- on reconnect, the station re-announced, the leader was back to two, and neither session
+  was interrupted.
+
+Two details make the story sharper rather than weaker.
+
+**The published ports survive.** Port 9102 still answers `426 Upgrade Required` while the
+station is isolated, so a driver physically at the site can still open its page and use it.
+What is lost is the operator's view. That is the honest shape of this failure — everything
+works except the party that needs to know — and it is exactly why reservations expire on
+their own instead of depending on someone to cancel them.
+
+**But no new session can start.** Authorising a car means resolving vehicle → owner, and
+that is a MySQL query across the severed link. `vs_cp_proto` logs `no account for vehicle N`
+and opens nothing; charges already running are untouched, because they never touch the
+database. An isolated site therefore finishes what it started and accepts nobody new —
+which is what a real site controller does with an unknown card and no uplink, and is worth
+saying out loud rather than discovering on stage.
+
+*A note on how this was established, because the method matters more than the result.* The
+first attempt appeared to show the opposite: the isolated station reported `charging` while
+the energy sat frozen at 34.523 kWh. That reading produced a whole redesign — a second
+network per site, the emulators containerised onto it — on the theory that a published port
+could not survive the disconnect. It could. The frozen number was a reconnect window
+sampled three times in six seconds against a five-second meter tick. The redesign was
+reverted the same day; **what survived is the measurement, taken slowly.**
+
+### A station dies: the coordinator frees its vehicles
+
+`vs_coord_srv` takes an `erlang:monitor_node/2` on each station it has heard from, and on
+`nodedown` erases that station's claims.
+
+Doing nothing here would be the intuitive choice and would be wrong. A claim is a promise
+that a vehicle is committed *somewhere*; if the somewhere no longer exists, the promise
+locks the driver out of the entire network until the lease expires — up to fifteen minutes
+of being unable to reserve anywhere because of a failure they did not cause. Dropping the
+claims converts a station failure into a local one.
+
+The cost is stated rather than hidden: charging sessions on that station are lost, since
+the process that was metering them is gone. That is a partial failure, and §7 declares it.
+
+Note the asymmetry with the rebuild. Claims are recovered by **asking**, because the
+stations hold them; suspensions are recovered by **pushing**, because nobody in the cluster
+holds them — they live in MySQL, and the back office repeats them on every leader
+announcement. State is recovered from whoever owns it, in whichever direction that is.
+
+### A charge point dies: grace, then honesty
+
+The connector does not react to a lost socket immediately. A `DOWN` arms a 30 s grace
+timer, because a socket blip is not a broken charger and a car that is charging perfectly
+well should not be stopped by our own reconnection.
+
+If the grace expires mid-session, the session is closed **with the last measured energy**
+rather than discarded: the charge point is the only side that counted it, so its last
+report is the best available truth. The connector then becomes `out_of_service`, not
+`free` — an outlet with no hardware attached is not an outlet a driver can be offered, and
+saying otherwise would send someone to a socket that cannot work.
+
+It recovers by itself: a charge point that boots reporting `available` lifts the connector
+back to `free`. No operator action, no restart.
+
+### Supervision inside a node: three strategies, three reasons
+
+OTP supervision is not decoration here; each strategy encodes a claim about dependencies.
+
+- **`vs_coord_sup` — `rest_for_one`.** The children are in dependency order, so restarting
+  one restarts everything downstream of it. When the claim table dies, everything derived
+  from it must die too; a survivor holding references into a table that has been recreated
+  is worse than a clean restart.
+- **`vs_station_sup` — `one_for_one`.** The children are genuinely independent: the manager
+  crashing must not take down connectors that are delivering power to real cars.
+- **`vs_connector_sup` — `simple_one_for_one`, `restart => transient`.** Every child is the
+  same kind of process, one per connector, and a connector that terminates normally stays
+  terminated.
+
+Two bugs found in review (PROGRESS §7zk) show that this only works if the code cooperates,
+and both were failures of supervision rather than of logic:
+
+1. `vs_coord_rebuild:run/1` used `spawn_link` while `vs_coord_srv` does not trap exits, so
+   **any** exception in the rebuild worker — a malformed reply from any station — would
+   have killed the process holding every claim in the network, and `rest_for_one` would
+   have taken the whole subtree with it. Now `spawn_monitor`.
+2. The `rebuilding` state had no exit other than the success message. A worker that died
+   before sending it left the coordinator refusing every reservation in the network,
+   forever, silently. Now a `DOWN` handler and a deadline, both of which fall through to
+   `serving` with a warning — because renewals re-present the missing claims within ten
+   seconds, and staying stuck is strictly worse.
+
+The general lesson, worth stating in the presentation: **a supervision tree protects you
+from the failures you routed through it.** A linked process and a state with no timeout are
+both ways of routing a failure around the tree.
+
+### Three delivery guarantees on one wire, on purpose
+
+The coordinator→Java bridge carries three kinds of event, and they do **not** get the same
+guarantee, because the cost of a duplicate differs:
+
+- **The session row → at-least-once, over an idempotent write.** `BillingService` prices
+  with `UPDATE sessions SET cost_cents = ? WHERE id = ? AND cost_cents IS NULL`. A repeat
+  updates zero rows and is not an error: that is the idempotence working. At-least-once
+  over an idempotent write is the standard way to obtain effectively-once, and it is why
+  billing is also driven by a periodic sweep — the event only makes the sweep run sooner,
+  so a lost message costs promptness, never money.
+- **The no-show strike → at-most-once.** A counter cannot recognise a duplicate, so a
+  doubled strike would suspend an innocent driver. One send, no retry: a lost strike is a
+  smaller wrong than an invented one.
+- **The notification → at-most-once.** A duplicate is a row a person reads twice; a loss is
+  a row they never see. Neither is good, and we chose the quieter failure.
+
+Choosing the guarantee per message rather than per channel is the point. A single "reliable
+messaging" layer would have forced one answer onto three questions with different answers.
+
+### What tolerates nothing, and is declared
+
+- **MySQL is a single point of failure** for durable data. Replicating it was out of reach
+  here; the honest position is to choose which single points to keep and know what happens
+  when they fail. Note what does *not* depend on it: charging continues, power sharing
+  continues, and the coordinator keeps granting claims, because none of them reads the
+  database on the interactive path.
+- **Sessions on a dead station are lost.** The process that was metering them is gone.
+- **P18**: a coordinator that rejoins elects itself before the stations have reconnected,
+  rebuilds from zero stations, and serves with an empty table for up to one renewal cycle.
+  The defect is the ratio between two numbers: the rebuild window is 2 000 ms and the renew
+  cycle is 10 000 ms, so the leader starts granting long before the claims come back. In
+  the measured run a vehicle obtained a **second** reservation on another station 272 ms
+  after the new leader began serving, and P2 stayed broken for **13.65 s** until the first
+  renewal re-presented the older claim. Measured 1 September, written up in PROGRESS §7zj.
+  Not fixed; mitigated in the demo by a ten-second pause after any coordinator rejoins. It
+  is a real hole in P2 and is declared as one.
+
+---
+
 ## 5. Rejected alternatives, with the reasons
 
 Ready to be reused in the design-decisions section. Every one of these was considered and set aside deliberately.
@@ -160,7 +366,8 @@ To be declared explicitly in the document — an unstated assumption is a questi
 
 - P1 and P5 are solved by the actor model and by a single owning process: elegant, but **local** — they do not demonstrate distribution, and we should say so rather than oversell them.
 - MySQL is a single point of failure for durable data.
-- The rebuild window described in §4.
+- The rebuild window described in §4. **§4c is the full account**: what can fail, how each
+  failure is detected, what happens next, and the three things that tolerate nothing.
 - Billing is deliberately not contended, to avoid duplicating the connector-contention problem on a second object.
 - **The overstay notice only reaches a driver who is looking.** Charging completes, the driver is notified, and five minutes later the charge starts — but our notifications are pushed over the WebSocket and stored for later retrieval, with no native mobile push. A driver having lunch with the browser closed learns about it when they reopen the application. The grace period therefore assumes an attentive user, which a real deployment would fix with a mobile push notification, out of scope here. Worth stating: it is a limitation of the client channel, not of the coordination logic.
 - Site power is coordinated within a station only; sharing a budget across stations is future work.

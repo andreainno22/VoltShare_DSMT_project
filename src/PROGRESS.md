@@ -3368,135 +3368,467 @@ trovato un nodo che rifiuta, e ha restituito il rifiuto: è il flag `Followed` d
 
 ---
 
-## 7zk. Il giro intero guardato coi pixel, nel Chrome vero — 1 settembre
+## 7zk. Passata di review su tutto il progetto, e la demo resa lanciabile — 2 settembre
 
-L'ultima cosa che restava fuori dal M1-A, e ci è rimasta per settimane. Fino a oggi la logica
-del rendering era provata con un **DOM minimale in Node** (23 controlli, §1): dimostra che il
-codice reagisce ai frame giusti, **non** che una persona davanti a uno schermo vede la cosa
-giusta. Le due domande sono diverse, e la seconda non si risponde con un test.
+Tre lavori nella stessa giornata: una review completa di `src/`, gli otto file che il runbook
+della demo dava per esistenti e non esistevano, e la caccia a un guasto dell'infrastruttura che
+ha finito per scoprirne uno peggiore.
 
-Perché ci è voluto tanto: il browser interno dell'assistente **non fa passare i WebSocket** verso
-un'origine diversa, quindi la pagina live non si può guardare da lì. Serve il Chrome vero, a
-mano, con lo stack su. E non esiste una credenziale di prova — `schema.sql` semina solo
-`stations` e `connectors` — quindi si entra da `/register.jsp`, che crea utente **e** veicolo e
-fa login da solo (ricetta in §7zj, «Non provato — e perché»).
+### La review: tredici rilievi, sei miei
 
-### Cosa è stato visto, in ordine
+Non un diff — tutto `src/` a `78aa01c`, aprendo i file. **Sei erano miei e li ho corretti**;
+sette sono nel perimetro di A e stanno in `contracts/review-per-A-progetto.md`, **ancora da
+mandargli**.
 
-Registrazione; griglia dei connettori; prenotazione con il **conto alla rovescia che scende da
-solo**; `charging`; **stop dal browser** → `complete` istantaneo, con la potenza che rientra nel
-pool e le altre auto che salgono; `complete` → **`overstay`** al tick successivo, col cavo ancora
-dentro; la riga comparsa in **`/notifications`**; e in **`/history`** la sessione chiusa a
-**1,58 kWh · overstay 10 min · € 5,71**.
+I due miei che contano, e sono entrambi nel coordinatore:
 
-### Le due cose che solo i pixel potevano chiudere
+1. **`vs_coord_rebuild:run/1` faceva `spawn_link`**, e `vs_coord_srv` non fa `trap_exit`. Una
+   qualunque eccezione nel worker — per esempio un `{holds, …}` malformato da una stazione —
+   avrebbe ucciso **il processo che tiene tutti i claim della rete**, e `rest_for_one` avrebbe
+   portato giù l'intero sottoalbero. È lo stesso guasto che il catch-all in `renew_one/4`
+   esiste per prevenire, reintrodotto due milestone dopo **da una parola**. Ora è
+   `spawn_monitor`.
+2. **Lo stato `rebuilding` non aveva uscita.** L'unica via era il messaggio `{rebuilt, _}`: se
+   il worker moriva prima di mandarlo, il coordinatore rifiutava **ogni prenotazione della rete,
+   per sempre**, e nei log non c'era niente a dirlo. Ora ci sono il `DOWN` del monitor e una
+   deadline di sicurezza (`deadline_ms/0`); in entrambi i casi si passa a `serving` con un
+   warning, perché i rinnovi adottano comunque entro dieci secondi e restare bloccati è
+   strettamente peggio.
 
-1. **Il fuso.** I timestamp in tabella sono UTC (scelta di progetto, §7s); la conversione la fa
-   `Times.java`. L'ora mostrata in `/notifications` e in `/history` è quella **locale**, non
-   quella del database: era l'ultima pendenza di M2-A, e non si poteva vedere altrove.
-2. **Il conto al centesimo.** € 5,71 lega la riga scritta dalla stazione — `energy_kwh` e
-   `overstay_seconds` **netto** — al prezzo calcolato da B. Verificato a mano: è il punto in cui
-   le due metà del progetto si toccano davvero, e un errore di tolleranza (sottratta due volte, o
-   mai) sarebbe comparso qui e in nessun test.
+Gli altri quattro: **XSS stored** nello username reso senza `<c:out>` in `page.tag` — e quel
+tag rende su **ogni** pagina autenticata, mentre `validate` controlla solo la lunghezza 3-50,
+quindi `<img src=x onerror=…>` (32 caratteri) passava la registrazione; e tutto il percorso
+delle sospensioni che leggeva e scriveva con l'orologio della JVM mentre `sessions` è in UTC,
+ora unificato su UTC con `util/Times.java` per la resa in `APP_TIMEZONE`.
 
-### Non provato — e perché
+Vale la pena notarlo per l'orale: i primi due sono difetti di **supervisione**, non di logica.
+Il codice era corretto; sbagliato era cosa succede quando non lo è.
 
-Osservazione **a mano, su una corsa sola**: non è una misura ripetibile e non pretende di esserlo.
-Restano **tre cose mai viste con gli occhi**, tutte per la prova generale di M5:
+### Gli otto file della demo, e uno scritto da zero
 
-- il **riparto 75 · 75 · 50** sotto scarsità — il meccanismo è misurato (§7q), i pixel no;
-- le **pagine del no-show**: profilo sospeso e notifiche con gli strike — misurati al database
-  (§7zg, §7z), mai guardati;
-- il **giro intero col cronometro**, cioè la demo dentro il tempo che ha.
+`DEMO.md` dava per esistenti `.env.demo`, `seed-demo.sql` e sei script. Non c'erano. Creati
+tutti; due meritano una riga.
 
----
+**`emulator/demo/reserve.js`, scritto da zero.** A lo dava per esistente come
+`scena-pixel-driver.js`, che non è mai arrivato. Serve per una battuta sola: lasciare **una
+prenotazione in piedi** prima del failover. Non si può usare `driver.js --scenario
+one-vehicle`, che alla fine cancella deliberatamente la prenotazione superstite, né un walk-in
+via `cp.js`, che non crea nessun claim (`vs_connector:free/3` adotta la sessione con `claim_id
+= undefined`). Senza, la battuta del failover mostrerebbe il nuovo leader che ricostruisce una
+tabella vuota: il coordinatore che funziona perfettamente e non dimostra niente.
 
+**`emulator/demo/coord-status.sh`, riscritto.** La versione dell'appendice usava `erl -remsh`
+col comando su stdin e **non stampava niente**: la shell remota legge l'EOF e termina prima di
+emettere il risultato, si vede solo `*** Shell process terminated! Read EOF ***`. Ora avvia un
+nodo effimero che fa una `rpc:call` e chiude — nessuna shell di mezzo, nessun EOF da cui
+dipendere — e riporta anche le sospensioni.
 
----
+### Il container zombie che erano dieci, e il guasto peggiore che ci stava sotto
 
-## 7zl. P18, la nostra metà: ripresentare all'evento invece che al prossimo giro — 2 settembre
+Sintomo: la lobby diceva «no station is reporting» con `mysql` e `backoffice` regolarmente su.
+`docker ps -a`: **cinque container `Exited (137)`** (coord1/2/3, station1/2) e **cinque in
+`Created`** con nomi prefissati da un hash. Causa: un `up -d --build` interrotto a metà. Compose
+rinomina il vecchio container con un prefisso, crea il nuovo, poi rimuove il vecchio; fermarlo
+nel mezzo lascia i vecchi uccisi e i nuovi mai partiti.
 
-Branch `a/p18-nodeup`. La metà del difetto che è nostra, con la sua misura; la metà di B è una
-**decisione**, non una correzione, e gliela abbiamo chiesta con i numeri in mano
-(`src/contracts/nota-per-B-p18.md`).
+**Ripulito con `down --remove-orphans`, che ha funzionato e ha cancellato il database.** Il
+servizio `mysql` non aveva un volume nominato: l'unico `volumes:` era il bind di sola lettura
+di `schema.sql`, quindi i dati stavano nel layer scrivibile del container. Persi utenti,
+sessioni e notifiche, compreso l'account del presentatore. Errore mio: andava detto **prima** di
+lanciare il comando, non dopo.
 
-**Il difetto non era il meccanismo, era il momento.** La ripresentazione dei claim esisteva già
-ed era corretta — il `renew_tick` manda tutti i claim col `granted_at` originale, il redirect
-`not_serving` viene seguito, e il coordinatore adotta un claim che non conosce. Mancava
-*quando*: partiva al tick, fino a 10 s dopo, mentre la finestra pericolosa si apre ~2 s dopo il
-rientro del leader. Ora `net_kernel:monitor_nodes(true)` e due clausole **sopra** il catch-all:
-un coordinatore che torna → riannuncio e giro di renew immediato. Nessun messaggio nuovo, nessun
-contratto toccato, **nessuna riga sotto `vs_coord/`**, e il tick periodico intatto (il giro
-immediato è *in più*, non *invece*).
+Il danno è stato nullo perché erano dati di prova, ma ha reso visibile una cosa che il giorno
+della demo sarebbe costata cara, e ne ha portata a galla una seconda: il primo boot su database
+vuoto ha impiegato **oltre sei minuti**, e la healthcheck (20 tentativi × 5 s) è scaduta molto
+prima — quindi stazioni e back office si sono rifiutati di partire contro un database che era
+soltanto lento. Sembrava tutto rotto mentre MySQL stava solo nascendo.
 
-### Le quattro verifiche fatte prima di scrivere una riga di codice
+**Correzione, in `docker-compose.yml`:** volume nominato `mysql-data` su `/var/lib/mysql`,
+`retries` da 20 a 60 e `start_period: 30s`. Da ora `down` è innocuo e `down -v` è l'unico modo
+di perdere i dati — un atto deliberato invece di un effetto collaterale.
 
-| | risposta |
-|---|---|
-| il `nodeup` arriva alla stazione senza che sia lei a parlare per prima? | **sì**, a **959 ms** dal `docker network connect` — con la stazione a zero claim e leader ≠ coord3, cioè senza alcun motivo di rivolgersi a lui. È **342 ms dentro** la finestra di rebuild e **1,7 s prima** che il leader cominci a servire |
-| il `do_renew` di B con una stazione sconosciuta | **adotta** (`vs_coord_srv.erl:472-486`, e la clausola `error ->` di `renew_one/4` a `:524-538`); `unknown_station` sta solo in `check_can_grant/4` (`:432`), sul percorso `acquire`. Quindi l'annuncio prima del renew è **precedenza, non necessità** — ma serve lo stesso, perché l'adozione riempie `claims` e mai `stations` |
-| quanto rumore fa `monitor_nodes(true)` | rientro del solo leader: **1 `nodeup`**. Isolamento della stazione: **4 in 271 ms**, i tre coordinatori entro 11 ms. Il back office non compare (parla solo coi coordinatori); i nodi `-hidden` non generano eventi (misurato: 0 su cinque connessioni di sonda) |
-| la latenza era già misurata dal pair 2? | **no**: §1.2 di `REPORT_M3A_CODA` dà ~10 s con una sonda che campionava ogni 4 s — un tetto, e nel verso sbagliato. Andava rifatta |
+Una trappola trovata verificando: **la healthcheck può passare sul server sbagliato.** L'entrypoint
+di MySQL alza un server temporaneo per eseguire gli script di init, e `mysqladmin ping -h
+localhost` passa dal socket, quindi risponde già lì; il mio primo caricamento del seed è finito
+proprio nella finestra fra la chiusura di quello temporaneo e l'apertura di quello vero
+(`Can't connect … through socket`). Chi semina subito dopo un boot pulito deve aspettare le
+**tabelle**, non il ping.
 
-La terza ha deciso una cosa che sembrava stile: **il filtro sui `coord_nodes` va prima del
-debounce**, perché il primo `nodeup` della raffica è di una *stazione*, 260 ms davanti ai
-coordinatori — e un debounce segnato prima del filtro farebbe ingoiare proprio i tre che
-contano.
+### Il ping di M0, acceso da quattro milestone
+
+Provando i pannelli della demo, il log della stazione era **illeggibile**: due righe ogni tre
+secondi, per stazione, di `ping vs@station2 -> pong from vs@station2`. È `vs_ping`, la sonda
+di connettività di M0, sostituita in M1 da `COORD_NODES` e dal claim client vero e lasciata
+accesa per abitudine — `vs_station_sup` la descrive già come *«retired when the real claim
+client arrived»*, ma `PING_TARGET` era ancora nel compose.
+
+Il filtro che `DEMO.md` suggeriva, `grep -v ping`, **non funziona** e questo è il dettaglio
+che vale la pena ricordare: il logger di Erlang stampa due righe per messaggio, una
+intestazione `=NOTICE REPORT==== <timestamp> ===` e il testo. Togliendo la riga col ping
+restano le intestazioni orfane, cioè il pannello continua a scorrere mostrando **solo**
+timestamp. Sembrava che la stazione non stesse loggando niente; stava loggando solo rumore
+a cui era stata tolta la metà riconoscibile.
+
+Tolto `PING_TARGET` dai due servizi. Nessuna modifica al codice e nessuna ricostruzione:
+`vs_ping:init/1` senza target non arma il tick e si limita a rispondere, e lo dichiara nel
+log — `vs_ping ready on vs@station1 (answering only)`. Per sondare a mano resta
+`PING_TARGET=vs@station2 docker compose up -d station1`.
+
+**Effetto collaterale utile**: ricreare le due stazioni ha staccato le due auto di sfondo, e
+si sono **riagganciate da sole al primo giro** — il backoff di `cp.js` provato senza volerlo.
+
+### La catena delle penalità si è dimostrata da sé, dal vivo
+
+Mentre spiegavo la logica del no-show, l'account del presentatore si è **sospeso da solo**:
+due prenotazioni fatte dal browser e mai onorate, a 90 s di lease. Le due notifiche in
+tabella, con l'ora:
+
+```
+15:37:22  reservation_expired  "… 1 of 2 — reaching 2 suspends reservations for 1 day(s)."
+15:39:02  suspended            "Reservations are suspended until 03/09/2026 17:39 …"
+```
+
+È il beat marcato 🔴 nella checklist di `DEMO.md` — *«meccanismo misurato al database il
+31/08; queste sono le pagine, mai viste»*. Ha girato tutto: stazione che segnala, coordinatore
+che inoltra, Java che conta, scrive la sospensione, azzera il contatore e la **spinge al
+leader** (`coord3 suspensions=1`). E c'è la prova del fuso in una riga sola: `15:39:02` in
+tabella (UTC), **17:39** nel testo della notifica, cioè l'ora di Roma — `util/Times.java`
+scritto stamattina.
+
+**Una cosa trovata sbloccando l'account**: `ErlangBridge.notifyUnsuspension(int)` esiste, e
+`vs_coord_srv` ha la clausola `{user_unsuspended, UserId}` che la riceve, ma **nessuno in Java
+la chiama**. Non è un difetto di comportamento — `is_suspended/2` confronta `Until >
+erlang:system_time(second)`, quindi la sospensione decade da sola all'ora giusta — ma sono un
+metodo morto e una voce che resta nella mappa del coordinatore per sempre. Per togliere una
+sospensione in anticipo (come oggi) bisogna scrivere sul database **e** mandare il messaggio a
+mano via `rpc`, altrimenti la ripubblicazione del back office la rimette entro 30 secondi.
+Annotato, non corretto.
 
 ### Verificato — girato davvero
 
-- **`beam_lib:md5` prima e dopo**: 17 moduli su 5 nodi identici all'albero host **prima** di
-  misurare (la precondizione che il pair 2 trovò falsa il 01/09, quindi rifatta e non ereditata);
-  e dopo la ricostruzione, `vs_claim_client` = `61c5adf7…` su host, station1 e station2, con
-  `vs_connector` e `vs_station_mgr` **invariati** — il perimetro chiuso verificato in binario;
-- **suite 386 → 392**, `EXPECTED_TESTS` aggiornato nello stesso commit, **tre giri consecutivi
-  verdi** (`392 tests, 0 failures` × 3);
-- **ogni test nuovo visto rosso senza il suo pezzo di fix**, con cinque mutazioni una per volta:
-  tolto il debounce → rosso il test della raffica; tolto il filtro → rosso quello del nodo
-  estraneo; tolto l'annuncio → rossi quattro; `nodedown` che svuota la tabella → rosso il suo;
-  tolto il `send_after` del tick → rosso il test dell'estrazione (e anche un test preesistente,
-  che è la conferma che il tick serviva davvero a qualcuno);
-- **le clausole nuove sopra il catch-all, provato spostandole sotto**: il compilatore emette
-  `this clause for handle_info/2 cannot match because a previous clause always matches` (due
-  volte) e **quattro** dei sei test diventano rossi. Sotto sarebbero codice morto e i test
-  sarebbero verdi per il motivo sbagliato;
-- **E2E, scena vera** (connettore 1 prenotato, connettore 3 in carica a 150 kW, partizione del
-  leader e rientro), predizione scritta prima e corse singole:
-
-| | finestra di esposizione | riga del coordinatore | `stations` all'inizio del servizio |
-|---|---|---|---|
-| prima | **4,11 s** | `serving with 0 adopted claim(s)` | `[]` per altri 19,7 s |
-| dopo | **0 ms** | `serving with 2 adopted claim(s)` | `[1,2]`, 1,74 s prima |
-
-  Lo zero è verificabile e non ottimistico: l'osservatore a 100 ms ha fotografato coord3 ancora
-  in `mode=rebuilding` con già `vehicles=[88,201]` e `stations=[1,2]`. E la riga del rebuild è
-  rimasta `asked 0 station node(s) … 0 station(s) answered`: **la strada di B non è cambiata**,
-  la finestra che lasciava vuota è stata riempita dal nostro renew.
+- **Il volume regge un `down`**: riga marcatore inserita in `users`, `docker compose down`
+  completo (container e rete rimossi), `up -d`, riga **ritrovata al primo tentativo**,
+  `utenti=7`. Marcatore poi cancellato, `utenti=6`. `docker volume ls` mostra
+  `voltshare_mysql-data`.
+- **Nessuna reinizializzazione al secondo boot**: sul volume già popolato MySQL ha risposto al
+  primo colpo, contro i >6 minuti del primo. È la misura che giustifica la modifica.
+- **Stack completo risalito**: 7 container su, `mysql healthy`, `GET /` → `302` (redirect al
+  login, cioè `AuthFilter` vivo), `coord3 mode=serving` con coord1 e coord2 in `standby` —
+  l'ordine bully atteso, il rango più alto vince.
+- **Seed ricaricato**: 6 utenti, 6 veicoli, 2 stazioni, 7 connettori.
+- `eunit_check.sh` verde a **386**, Java 14 test verdi (dalla passata di review).
 
 ### Non provato — e perché
 
-- **La finestra non si chiude, e non pretendiamo che si chiuda.** Lo zero è l'esito di *questa*
-  corsa: il renew immediato deve vincere una gara col leader uscente, e il margine misurato su
-  quella gara è **265 ms**, non 1,74 s. Se il coordinatore serve a tabella vuota prima che
-  chiunque possa parlargli, nessuna prontezza della stazione arriva in tempo — per costruzione.
-  A chiudere è la metà di B, che è una scelta di disponibilità e non un bug fix.
-- **Una seconda corsa E2E «dopo»**: una sola, come la «prima». Le due si confrontano perché lo
-  scenario è identico, non perché siano una statistica.
-- **Il veicolo che ottiene la seconda prenotazione** non è stato riprovato: l'1/09 fu colto su
-  272 ms di margine, quindi riproducibile ma non deterministico, e non è la cosa che si misura.
-  Ciò che si misura è la finestra.
-- **`warnings_as_errors` non è in vigore su `apps/`** — trovato correndo le mutazioni e
-  **riprodotto a mano il 02/09** su un albero pulito: una funzione non esportata con dentro una
-  variabile mai usata, aggiunta a `apps/vs_common/src/vs_time.erl`, produce due warning e
-  `rebar3 compile` esce comunque **0**. La causa è la forma `{del, Options}` senza nome
-  applicazione in `rebar.config`, che vale per tutte le applicazioni e non solo per le
-  dipendenze. **Il comportamento non è corretto** — è una modifica al build di tutto l'albero e
-  vale un pair suo — ma **il commento che affermava il contrario sì**, perché era una riga falsa
-  in un file versionato, accanto alla riga che la smentiva. Il ragionamento in
-  `scelte_di_progetto.md` §27.7, con la correzione anche a §9.10, che diceva la stessa cosa
-  sbagliata dal 24/08. Conseguenza da sapere: la regola «`main` verde con `warnings_as_errors`»
-  non copre `src/` più di quanto copra i test — cioè non copre niente, e va detta a B, che nella
-  `risposta-per-A-review-pr5.md` §99 aspetta una pulizia sul presupposto opposto.
+- **La demo non è ancora stata corsa per intero.** Lo stack è sano e seminato, ma l'account del
+  presentatore è morto col database e va **ri-registrato da `/register`** prima di cominciare,
+  rileggendo `$PV`.
+- **I sette rilievi ad A non gli sono ancora arrivati.** `review-per-A-progetto.md` è scritto e
+  committato; il più concreto è il clamp mancante su `idle_timeout` in `vs_cp_ws`, che con
+  `CP_HEARTBEAT_MISSED=1` dà `0` e chiude ogni socket colonnina appena inattivo.
+- **Il PR di `b/review-progetto` non è aperto**, quindi niente di questo è su `main`.
+
+---
+
+## 7zl. Provando la demo per davvero: quattro difetti, tutti trovati guardando — 3 settembre
+
+Nessuno di questi è emerso da un test. Sono emersi perché per la prima volta abbiamo
+**guardato girare la demo intera** invece dei pezzi. Vale la pena dirlo nella relazione: la
+suite era verde a 386 mentre tutti e quattro erano lì.
+
+### ① Il coordinatore era muto sulla decisione che lo definisce
+
+`vs_coord_srv` ha **ventitré** chiamate al logger. Nessuna su `do_claim/6`. Concedere o
+rifiutare un claim — l'atto che l'intero cluster esiste per compiere — non lasciava traccia
+da nessuna parte, e il **rifiuto** non era loggato nemmeno dalla stazione: `NO_CLAIM`
+esisteva solo come frame in un browser.
+
+In scena significa che la battuta centrale («nessuna delle due stazioni può decidere da
+sola, decide il coordinatore») non aveva niente a supporto sui log. Aggiunte due
+`logger:notice`, sui due rami:
+
+```
+coord3  claim GRANTED to vehicle 103 (user 103) on station 1 connector 3 — c-67C6BC73
+coord3  claim REFUSED to vehicle 103 (user 103) on station 2 connector 5 — already_held
+```
+
+`notice` e non `info` deliberatamente: una corsa di contesa che stampa quindici rifiuti e
+una concessione è **il quadro più chiaro di P2 che il sistema sappia produrre**, non
+rumore.
+
+### ② Quattro pannelli erano un errore di impostazione
+
+Il §5 di `DEMO.md` prescriveva un riquadro per servizio. Provandolo: ingestibile, e
+sbagliato in linea di principio — **la storia è una sola** (browser → coordinatore →
+stazione → Java) e su quattro riquadri è a pezzi.
+
+Scritto `demo/logs.sh`: i sette servizi in una colonna, ordinati nel tempo, con l'ora e il
+nodo colorato. Tre cose lo rendono leggibile e senza di esse non lo sarebbe: il timestamp
+di Docker (`-t`) ridotto a `HH:MM:SS`; le intestazioni `=NOTICE REPORT==== … ===` buttate
+via (**il logger di Erlang stampa due righe per messaggio** e la prima non dice niente); e
+il colore per nodo, che è l'unica cosa che permette di seguire un attore senza rileggere.
+
+Il rumore tolto è solo periodico: la ripubblicazione del leader ogni 30 s, il ciclo di vita
+di Tomcat, e il ping di M0 se qualcuno lo riaccende. `VERBOSE=1` rimette tutto.
+
+### ③ `world.sh` non sorvegliava le sue auto
+
+Lanciava i due `cp.js` con `&` e poi `wait`. Se **una** moriva, `wait` restava sull'altra e
+la morta **non ripartiva mai**. La conseguenza non è "manca un'auto": trenta secondi dopo
+la stazione dichiara quel connettore `out_of_service`, perché una presa senza
+apparecchiatura non è una presa libera. Lo sfondo si spegneva a metà demo senza che si
+capisse perché.
+
+Ora ogni auto gira in un ciclo che la rilancia, con una pausa di 3 s. Distingue due casi,
+come farebbe un supervisore OTP: uscita 1 o segnale = incidente, si rilancia; **uscita 2**
+(`die()`: connettore inesistente, 4404, o 4409) = errore di configurazione, non si
+rilancia, perché si ripeterebbe identico e verrebbe nascosto.
+
+Verificato uccidendo un `cp.js` con `taskkill`: `world: conn 6 uscito (codice 1), rilancio
+fra 3s`, e il connettore è tornato **da `out_of_service` a `charging` da solo**.
+
+### ④ `cp.js` diceva di essere la colonnina ma viveva quanto l'auto
+
+Il difetto più interessante dei quattro, perché è di **modellazione**, non di codice.
+
+`unplug()` finiva sempre in `process.exit(0)`. Ma una colonnina è avvitata al muro e resta
+collegata al back end per anni mentre le auto vanno e vengono; questo processo sosteneva di
+esserne una e durava quanto una singola macchina. Quindi **ogni sessione completata
+lasciava la presa incustodita**, e trenta secondi dopo la stazione — correttamente, non
+avendo modo di distinguere "hardware sparito" da "hardware rotto" — la dichiarava
+`out_of_service`.
+
+Misurato dal vivo: `session 2 written: connector 2, user 108, 11.817 kWh` (fatturata,
+`cost_cents = 532`), poi `charge point socket gone in free (normal)`, poi
+`no charge point for 30000 ms - out of service`. Due battute e mezza stazione sarebbe stata
+spenta.
+
+Aggiunto `--stay`: alla fine il processo non esce, tiene il socket e manda
+`status: available` — che è anche ciò che **solleva** un connettore da `out_of_service`
+(`vs_connector`: *"out_of_service ──charge point boots available──▶ free"*). Passato da
+`presenter-cp.sh` e `world.sh`, quindi i comandi in scena non cambiano.
+
+### Il contorno, sempre dal guardare
+
+- **`--soc 45 --battery 60 --max-kw 150` erano i default di `cp.js`.** Il copione li faceva
+  riscrivere in ogni comando. Tolti: restano due numeri per comando, connettore e veicolo.
+- **La query SQL per leggere il veicolo era inutile**: `profile.jsp:18` stampa
+  `Vehicle #${account.vehicleId}`, ed è una pagina già aperta nel browser.
+- **`ErlangBridge.notifyUnsuspension(int)` non ha chiamanti** (già annotato in §7zk). Scritto
+  `demo/unsuspend.sh`, che fa i due passi nell'ordine giusto: prima la riga, poi l'`rpc` ai
+  tre coordinatori — al contrario la ripubblicazione del back office rimette la sospensione
+  entro 30 s.
+- **Il ping di M0 aveva un gemello**: tolto `PING_TARGET`, resta che il rumore periodico va
+  cercato ovunque prima di una presentazione, non solo dove dà fastidio per primo.
+
+### Verificato — girato davvero
+
+- `eunit_check.sh` **386, 0 failures** dopo la modifica al coordinatore; immagine
+  ricostruita e i tre coordinatori ricreati (condividono `voltshare-coord:local`, quindi un
+  solo `build`).
+- `claim GRANTED` / `claim REFUSED` visti nei log durante un P2 vero: `reserve.js` sul
+  connettore 3 di Pisa concesso, sul 5 di Livorno rifiutato con `already_held`.
+- Supervisione di `world.sh`: `cp.js` ucciso, rilanciato dopo 3 s, connettore risalito da
+  `out_of_service` a `charging`.
+- `--stay`: carica fino al 26%, `unplugged` a 0,805 kWh, `cable out — charge point stays
+  online, connector free again`, connettore **`free`** e processo ancora vivo.
+- Connettore 2 riportato in servizio attaccandogli una colonnina che non infila nessuna auto
+  (`--plug-after 9999 --stay`). Pisa: `1 charging, 2 free, 3 free, 4 free`.
+- Fatturazione end-to-end sulla sessione reale: 11,817 kWh → `cost_cents = 532`.
+
+### La tolleranza ai guasti, finalmente scritta in un posto solo
+
+`DESIGN-NOTES` §4 copriva il coordinatore — elezione, quorum, ricostruzione — e basta. Tutto
+il resto era **nei commenti del codice**, che è il posto giusto per implementarlo e quello
+sbagliato per difenderlo all'orale. Scritta `DESIGN-NOTES` §4c, in inglese come il resto del
+documento.
+
+La tesi che tiene insieme la sezione, e che vale la pena dire con queste parole: **la
+tolleranza discende dalla proprietà dello stato, non dalla replicazione.** Ogni componente
+tiene solo ciò che possiede, e ogni altro tratta quello stato come recuperabile dal suo
+proprietario. Da lì discendono cose che sembrano scelte separate e non lo sono: perché non
+serve un log replicato, perché i claim si recuperano *chiedendo* e le sospensioni
+*spingendo*, perché una stazione morta libera i suoi veicoli.
+
+Contenuto: il modello di guasto in tabella (cosa fallisce, come si accorge, cosa succede,
+cosa si perde); **i due rilevatori e perché ce ne vogliono due** — con le tre misure
+dell'1/09, e l'osservazione che `docker kill` non esercita affatto quel percorso, perché
+chiude il socket; la stazione che muore e perché il coordinatore le scarta i claim invece di
+aspettare il lease; la colonnina che muore, i 30 s di grazia e la sessione chiusa con
+l'ultima energia misurata; **le tre strategie di supervisione e cosa afferma ciascuna**, con
+i due difetti di review che erano guasti di supervisione e non di logica; e le **tre
+garanzie di consegna diverse sullo stesso filo**, scelte per messaggio invece che per
+canale.
+
+E la parte che conta di più per il voto: **cosa non tollera niente**, dichiarato — MySQL,
+le sessioni sulla stazione morta, e P18 con i suoi numeri.
+
+**Una correzione in `SCOPE.md` §5.** P4 sosteneva che *"sessions in progress are reconciled
+for billing on restart"*. **È falso**: la riga in `sessions` la scrive la stazione alla
+chiusura, quindi se il nodo muore a metà sessione non viene scritto niente, e al riavvio i
+connettori ripartono senza memoria. Ciò che davvero sopravvive è la **misura**, e non per
+merito nostro: la colonnina è l'unico lato che conta l'energia e la riporta nel `plugged`
+che rimanda alla riconnessione. Riscritto per dire quello che succede. Aggiunto anche un
+paragrafo sui due rilevatori, perché condiziona ciò che P2b e P4 possono promettere.
+
+**Due file citati da PROGRESS non esistono nel repository**: `PROBLEMI_TROVATI.md` e
+`REPORT_M3A_CODA.md`, entrambi di A, mai committati. I riferimenti in §7zj restano perché
+sono la sua cronaca; ma dove servivano a sostenere un'affermazione — P18 in `DESIGN-NOTES`
+§4c — ho messo i numeri per esteso invece del rimando, così la frase regge da sola.
+
+### ⚠️ La sezione qui sotto è sbagliata nella diagnosi, e la correzione sta dopo
+
+Quello che segue è stato scritto e committato (`3840cc8`) sulla base di una misura letta
+male, e **la modifica è stata annullata lo stesso giorno**. Lo lascio perché la conclusione
+finale non si capisce senza, e perché l'errore è più istruttivo del risultato: vedi *«La
+misura rifatta piano»* più sotto.
+
+### La partizione di una stazione, che dichiaravamo e non sapevamo mostrare
+
+Il guasto più raccontabile del progetto — **il sito funziona, le auto caricano, l'operatore
+non lo vede più** — era indimostrabile, e per un motivo che non stava nel codice.
+
+`SCOPE` §6 dice da sempre che la stazione è un *site controller* e *«must keep working when
+the connection to the operator's cloud is down»*. Ma gli emulatori `cp.js` giravano sul
+portatile e raggiungevano la stazione attraverso una porta pubblicata sul bridge del
+cluster: `docker network disconnect station2` tagliava l'uplink **e i cavi** insieme.
+
+E il sintomo era abbastanza sottile da essere creduto: la stazione isolata continuava a
+dire `charging`, con l'energia **ferma a 34,523 kWh su tre letture consecutive**. Non
+un'auto che carica: l'ultima misura prima che il cavo ammutolisse. Una demo costruita lì
+sopra avrebbe affermato una cosa falsa.
+
+**La correzione è topologica, non algoritmica.** Nessuna riga di Erlang toccata.
+
+- `Dockerfile.emulator`: `node:22-alpine` più `src/emulator`. Nessuna dipendenza da
+  installare — `cp.js` usa WebSocket e crypto nativi di Node 22 — e il build fa
+  `node --check`, così un errore di sintassi non arriva a run time dentro un container che
+  compose riavvierebbe all'infinito.
+- Due reti nuove, `site1` e `site2`: le LAN dei siti, cavi in un parcheggio. Non c'è sopra
+  nessun coordinatore e nessun back office, perché in un impianto vero non ci sarebbero.
+- Ogni stazione su **due** reti; le colonnine di Livorno (`cp6`, `cp7`) solo su `site2`, con
+  `restart: unless-stopped` — l'equivalente compose del ciclo di supervisione di `world.sh`.
+
+Sono su Livorno e non su Pisa apposta: i connettori di Pisa sono del presentatore, e una
+colonnina permanente lì risponderebbe `4409` a `presenter-cp.sh`.
+
+**Misurato dopo la modifica**, con l'uplink tagliato:
+
+- energia che **sale** dentro la stazione isolata: 0,875 → 0,944 → 1,014 kWh, e i numeri
+  della stazione coincidono con quelli che `cp6` scrive nel suo log;
+- il leader sceso a **una** stazione conosciuta, dopo `** Node vs@station2 not responding **`
+  e `dropping stations [2] and their claims`;
+- alla riconnessione, due stazioni note dopo undici giri di controllo e **nessuna
+  interruzione** delle due ricariche (1,014 → 1,569 kWh attraverso tutto l'episodio).
+
+**Una scoperta che rende la storia migliore, non peggiore**: le porte pubblicate
+**sopravvivono** alla partizione. La 9102 risponde `426` a stazione isolata, quindi un
+conducente fisicamente lì potrebbe ancora aprire la pagina. Quello che si perde è la
+**lobby**, perché la lobby la disegna il coordinatore. È la forma onesta di questo guasto —
+funziona tutto tranne chi deve saperlo — ed è precisamente il motivo per cui le
+prenotazioni scadono da sole invece di dipendere da qualcuno che le cancelli.
+
+**Due affermazioni false corrette in `SCOPE`**, entrambe trovate cercando dove scrivere
+questa: §6 diceva che il deploy è *«demonstrated on more than one host»* — non lo è, gira su
+una macchina sola, e la frase giusta è che i **nodi** sono sette e che la partizione vera si
+ottiene con `disconnect`, non con più host (BlackNet, il progetto da 30 e lode, non l'ha
+fatto). E §5 P4 sosteneva la riconciliazione al riavvio, già corretta nel commit
+precedente.
+
+**Conseguenza sulla demo**: `world.sh` non serve più a T+0, il layout scende da tre riquadri
+a due, e il beat di P4 diventa `network disconnect` invece di `kill`. Il `kill` resta come
+caso duro — sessioni perse, verificato con `sessions` ferma a 3 prima e dopo — ma se il
+tempo stringe si tiene il `disconnect`, che è quello che si racconta senza dover spiegare
+cosa sia un container.
+
+### La misura rifatta piano, e la modifica buttata
+
+La sezione precedente poggiava su un numero: **34,523 kWh fermo su tre letture** a stazione
+isolata. Da lì la conclusione «la porta pubblicata non sopravvive al `disconnect`, quindi il
+cavo è tagliato insieme all'uplink», e da lì una riprogettazione del deploy — reti per sito,
+emulatori containerizzati.
+
+**La conclusione era falsa.** Ecco l'esperimento che l'ha smontata, fatto perché A ha
+obiettato che due colonnine in container e cinque no non è un progetto ma una modifica
+lasciata a metà.
+
+Con `station2` isolata, una `cp.js` **lanciata dall'host** si collega senza problemi:
+
+```
+10:38:44  conn5 connecting to ws://localhost:9202/ws/cp
+10:38:44  conn5 connected
+10:38:44  conn5 boot accepted
+```
+
+E, con un'auto già in carica, l'energia **sale attraverso la partizione**, fianco a fianco
+con una containerizzata:
+
+```
+conn 5  (host)        0,248 → 0,403 → 0,558
+conn 6  (container)  14,069 → 14,139 → 14,208
+```
+
+Identiche. **I container non servivano.** Il numero congelato di stamattina era la finestra
+di riconnessione, campionata tre volte in sei secondi contro un tick di cinque. È il terzo
+errore dello stesso tipo in una giornata: due volte ho letto un contatore troppo in fretta e
+ho concluso che si fosse fermato.
+
+Annullato: via `cp6`, `cp7`, le reti `site1`/`site2` e `Dockerfile.emulator`. Torna
+`world.sh` per tutte e sette le prese, un modello solo. Il beat della partizione funziona
+come prima — anzi, ora si sa che funziona, invece di crederlo.
+
+**Cosa sopravvive della giornata, ed è la parte che vale**: le misure, che valgono comunque
+di dove girino gli emulatori.
+
+1. **Una stazione isolata continua a erogare** e il coordinatore la scarta:
+   `** Node vs@station2 not responding **` → `dropping stations [2] and their claims`, leader
+   sceso a una stazione, lobby svuotata. Alla riconnessione, due stazioni e nessuna
+   interruzione.
+2. **Le porte pubblicate sopravvivono**: la 9102 risponde `426` a stazione isolata, quindi
+   chi è fisicamente lì può ancora aprire la pagina. Si perde la *vista* dell'operatore,
+   non il servizio. È la forma onesta di questo guasto.
+3. **Ma una sessione nuova non parte.** Autorizzare un'auto significa risalire dal veicolo
+   al proprietario, cioè MySQL, che sta oltre il taglio: `no account for vehicle 104` e
+   nessuna sessione aperta. Le ricariche già in corso non se ne accorgono, perché non
+   toccano il database. Realistico — è ciò che fa una colonnina vera con una tessera
+   sconosciuta e nessuna linea — e mai scritto prima.
+4. **Un difetto vero, nel perimetro di A.** `vs_station_db` si riprende dopo la partizione,
+   ma non all'istante; e un `plugged` che arriva in quella finestra viene **perso in
+   silenzio**. `vs_cp_proto:with_account/4` logga `no account for vehicle N`, ritorna
+   `{[], Session}` — nessuna risposta sul canale, nessun ritardo, nessun tentativo — e la
+   colonnina continua a misurare nel vuoto per sempre. Visto dal vivo: `limit 0 kW`, dodici
+   `meter` a `0 kW, 0 kWh` di fila. Serve almeno un tentativo, o un rifiuto esplicito.
+   **Da mettere nella nota per A.**
+
+### La lezione, che vale più della modifica
+
+Un contatore che non si muove **non è la prova che il sistema sia fermo**: è la prova che
+non hai aspettato abbastanza. Tre volte oggi ho scambiato la seconda cosa per la prima, e
+la terza mi è costata una riprogettazione del deploy e quaranta minuti.
+
+Nel runbook è finita come regola operativa: davanti a un'energia che non sale, guardare per
+**almeno mezzo minuto** prima di concludere — il tick è di cinque secondi e dopo una
+partizione c'è una finestra di riconnessione.
+
+### Non provato — e perché
+
+- **La demo intera in sequenza** non è ancora stata corsa: la giornata è stata di
+  diagnosi. Le singole battute sì.
+- **La partizione di `station1`** non è stata provata, solo quella di `station2`. Ora che si
+  sa che gli emulatori sull'host reggono, non c'è motivo perché dia un risultato diverso —
+  ma è una deduzione, non una misura.
+- **Il difetto n. 4 non è stato riprodotto una seconda volta**: colto una volta sola, nella
+  finestra di ripresa del database. Riproducibile fermando MySQL per qualche secondo, non
+  provato.
+- **`not_your_reservation` e `unknown_vehicle` end-to-end**: i due rifiuti del canale
+  colonnina hanno test unitari ma nessuna corsa. Si producono in due comandi
+  (`cp.js --vehicle 88` per lo sconosciuto, un veicolo seminato diverso dal titolare per
+  l'altro) e coprirebbero due righe di `ws-chargepoint.md` §4.2 mai viste girare.
+- **`'global' … requested disconnect … to prevent overlapping partitions`**, comparso una
+  volta. Quasi certamente causato dai nodi effimeri di `coord-status.sh`, che entrano nel
+  cluster e muoiono subito. Innocuo, non indagato a fondo.
+
+---
 
 ## 9. Prossimo passo
 

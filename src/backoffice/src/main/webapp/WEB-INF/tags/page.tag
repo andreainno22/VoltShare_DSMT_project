@@ -30,7 +30,14 @@
                href="${pageContext.request.contextPath}/profile">Profile</a>
         </nav>
         <div class="who">
-            <span>${sessionScope.user.username}</span>
+            <%-- The username is chosen by whoever registered, so it goes through
+                 <c:out> like every other user-supplied value. It did not, and this tag
+                 renders on EVERY authenticated page: a username of
+                 `<img src=x onerror=…>` — 32 characters, well inside the 3-50 the
+                 servlet allows — was stored at registration and executed on the
+                 station page, the history, the profile. Stored XSS, reachable by
+                 anyone who can reach the registration form. --%>
+            <span><c:out value="${sessionScope.user.username}"/></span>
             <a href="${pageContext.request.contextPath}/logout">Log out</a>
         </div>
     </c:if>

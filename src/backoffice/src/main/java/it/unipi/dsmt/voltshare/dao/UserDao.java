@@ -10,7 +10,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
-import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -205,14 +205,13 @@ public class UserDao {
                      // truncation fix, but not covered by it.
                      "SELECT id, suspended_until FROM users "
                              + "WHERE suspended_until IS NOT NULL AND suspended_until > ?")) {
-            ps.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
+            ps.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now(ZoneOffset.UTC)));
             try (ResultSet rs = ps.executeQuery()) {
                 List<long[]> out = new ArrayList<>();
                 while (rs.next()) {
                     long epochSeconds = rs.getTimestamp("suspended_until")
                             .toLocalDateTime()
-                            .atZone(ZoneId.systemDefault())
-                            .toEpochSecond();
+                            .toEpochSecond(ZoneOffset.UTC);
                     // long, not int: an epoch in seconds outgrows an int in 2038, and a
                     // silent truncation there would lift every suspension at once.
                     out.add(new long[]{rs.getLong("id"), epochSeconds});

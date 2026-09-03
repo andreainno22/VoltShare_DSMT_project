@@ -68,6 +68,10 @@
                 by_id     = #{}     :: #{binary() => pos_integer()},
                 stations  = #{}     :: #{pos_integer() => #station{}},
                 suspended = #{}     :: #{pos_integer() => non_neg_integer()},
+                %% The rebuild in flight, if any: the monitor on its worker and
+                %% the deadline that guarantees `rebuilding' always ends.
+                rebuild_ref         :: reference() | undefined,
+                rebuild_timer       :: reference() | undefined,
                 grace_s             :: non_neg_integer()}).
 
 %%%===================================================================
@@ -296,9 +300,15 @@ handle_cast(Msg, State) when element(1, Msg) =:= no_show;
 
 handle_cast(become_leader, State) ->
     logger:notice("coordinator ~p elected: rebuilding before serving", [node()]),
-    _ = vs_coord_rebuild:run(self()),
+    %% Monitored, not linked, and with a deadline. `rebuilding' used to have
+    %% exactly one way out — the {rebuilt, _} message — so a worker that died
+    %% before sending it left this coordinator refusing every claim in the
+    %% network, for ever, with nothing in any log to say why.
+    {_Pid, Ref} = vs_coord_rebuild:run(self()),
+    Timer = erlang:send_after(vs_coord_rebuild:deadline_ms(), self(), rebuild_deadline),
     vs_coord_bo:announce_leader(),
-    {noreply, State#state{mode = rebuilding, leader = node()}};
+    {noreply, State#state{mode = rebuilding, leader = node(),
+                          rebuild_ref = Ref, rebuild_timer = Timer}};
 
 handle_cast({become_follower, Leader}, State) ->
     logger:notice("coordinator ~p standing by, leader is ~p", [node(), Leader]),
@@ -313,8 +323,8 @@ handle_cast({become_follower, Leader}, State) ->
 
 handle_cast(suspend, State) ->
     vs_coord_bo:standing_by(),
-    {noreply, State#state{mode = suspended, leader = undefined,
-                          claims = #{}, by_id = #{}}};
+    {noreply, (clear_rebuild(State))#state{mode = suspended, leader = undefined,
+                                           claims = #{}, by_id = #{}}};
 
 handle_cast(Unknown, State) ->
     logger:warning("coordinator: unexpected cast ~p", [Unknown]),
@@ -363,11 +373,41 @@ handle_info({nodedown, Node}, State) ->
 %% The stations have answered the rebuild query (M3). Adopt what they hold and
 %% start serving.
 handle_info({rebuilt, Holds}, State = #state{mode = rebuilding}) ->
-    State1 = lists:foldl(fun adopt_station/2, State, Holds),
+    State1 = lists:foldl(fun adopt_station/2, clear_rebuild(State), Holds),
     Count = maps:size(State1#state.claims),
     logger:notice("coordinator ~p serving with ~p adopted claim(s)", [node(), Count]),
     publish(State1),
     {noreply, State1#state{mode = serving}};
+
+%% The rebuild worker died without answering. Serve anyway, and say so loudly.
+%%
+%% Staying in `rebuilding' would refuse every reservation in the network until
+%% somebody forced another election — strictly worse than serving with what we
+%% have, because the renewals arriving every ten seconds adopt the claims we
+%% missed. The window is the same one the "asked nobody" case already accepts.
+handle_info({'DOWN', Ref, process, _Pid, Reason},
+            State = #state{mode = rebuilding, rebuild_ref = Ref}) ->
+    logger:warning("coordinator ~p: the rebuild worker died (~p) — serving on "
+                   "renewal adoption instead", [node(), Reason]),
+    State1 = clear_rebuild(State),
+    publish(State1),
+    {noreply, State1#state{mode = serving}};
+
+%% Backstop for a worker that neither answers nor dies.
+handle_info(rebuild_deadline, State = #state{mode = rebuilding}) ->
+    logger:warning("coordinator ~p: no rebuild answer within the deadline — "
+                   "serving on renewal adoption instead", [node()]),
+    State1 = clear_rebuild(State),
+    publish(State1),
+    {noreply, State1#state{mode = serving}};
+
+%% Both arrive out of season once we have left `rebuilding': a DOWN for the
+%% worker that has already replied, or a deadline for a rebuild that finished.
+handle_info({'DOWN', _Ref, process, _Pid, _Reason}, State) ->
+    {noreply, State};
+
+handle_info(rebuild_deadline, State) ->
+    {noreply, State};
 
 %% Late or irrelevant: we lost quorum, or were deposed, while the query was in
 %% flight. Adopting now would rebuild a table we have no right to serve from.
@@ -402,9 +442,29 @@ do_claim(ReqId, VehicleId, UserId, StationId, ConnId, State) ->
             %% station stores it and echoes it in every renew, so that ordering
             %% is decided by one clock — this one — instead of comparing
             %% timestamps produced by machines that were never synchronised.
+            %% The decision, said out loud. Until 3/09 this whole function was
+            %% silent: the module has twenty-three logger calls and not one of
+            %% them on the path that grants or refuses, so the single most
+            %% important act in the system — deciding that a vehicle may hold
+            %% this connector and no other — left no trace anywhere. The
+            %% refusal was worse: neither side logged it, so "your vehicle
+            %% already holds a reservation elsewhere" existed only as a frame
+            %% in somebody's browser.
+            %%
+            %% `notice' and not `info': this is the outcome of the invariant the
+            %% whole cluster exists to keep, and a contention run printing one
+            %% line per driver is the point, not noise — fifteen refusals and
+            %% one grant is the clearest picture of P2 the system can produce.
+            logger:notice("claim GRANTED to vehicle ~p (user ~p) on station ~p "
+                          "connector ~p — ~s",
+                          [VehicleId, UserId, StationId, ConnId,
+                           Claim#claim.claim_id]),
             {{ok, ReqId, Claim#claim.claim_id, Claim#claim.granted_at, Claim#claim.expires_at},
              store(Claim, State)};
         {error, Reason} ->
+            logger:notice("claim REFUSED to vehicle ~p (user ~p) on station ~p "
+                          "connector ~p — ~p",
+                          [VehicleId, UserId, StationId, ConnId, Reason]),
             {{error, ReqId, Reason}, State};
         {not_serving, Leader} ->
             %% Note the shape: `not_serving' carries no ReqId, because it is
@@ -571,6 +631,19 @@ relay_penalty(Event, State) ->
             gen_server:cast({?SERVER, Leader}, {forwarded, Event})
     end,
     State.
+
+%% Forget the rebuild in flight: stop watching the worker and disarm the
+%% deadline, so neither can fire into a coordinator that has moved on.
+clear_rebuild(State) ->
+    case State#state.rebuild_ref of
+        undefined -> ok;
+        Ref -> erlang:demonitor(Ref, [flush])
+    end,
+    case State#state.rebuild_timer of
+        undefined -> ok;
+        Timer -> _ = erlang:cancel_timer(Timer), ok
+    end,
+    State#state{rebuild_ref = undefined, rebuild_timer = undefined}.
 
 %% The two announcement casts, applied to our own table. Separated out so that
 %% a forwarded copy takes exactly the same path as a direct one.

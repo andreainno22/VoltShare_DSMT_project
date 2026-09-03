@@ -24,15 +24,34 @@ services:
       MYSQL_PASSWORD: voltshare
     # schema.sql lives in contracts/ because it is a shared contract; it is
     # mounted here rather than copied, so there is only one copy to change.
+    #
+    # The named volume is what makes the data outlive the container. Without it
+    # everything sat in the container's writable layer, so a single
+    # `docker compose down` destroyed the accounts, the sessions and the
+    # notifications — including the presenter's account on the morning of the
+    # demo. It also means the two-phase initialisation (temporary server →
+    # init scripts → real server) happens once instead of on every `down`.
+    #
+    # To start genuinely clean — a fresh schema, no rows — the volume has to go
+    # too: `docker compose down -v`. That is now a deliberate act rather than a
+    # side effect of stopping the stack.
     volumes:
+      - mysql-data:/var/lib/mysql
       - ../contracts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     ports:
       - "3306:3306"
+    # 60 retries at 5 s = five minutes. Generous on purpose: the first boot on a
+    # cold volume measured over six minutes on a developer laptop — InnoDB alone
+    # took forty seconds — and with the previous twenty retries the check gave up
+    # first, so the stations and the back office refused to start against a
+    # database that was merely slow. Every later boot answers in seconds, so the
+    # ceiling costs nothing once the volume exists.
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pvoltshare"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 60
+      start_period: 30s
     networks: [voltshare]
 
   station1:
@@ -52,10 +71,18 @@ services:
       ERL_APP: vs_station
       ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
       STATION_ID: 1
-      # M0 only: probe the other station. In M1 this is replaced by
-      # COORD_NODES and the real claim client.
-      PING_TARGET: vs@station2
-      PING_INTERVAL_MS: 3000
+      # PING_TARGET is deliberately unset. It was the M0 connectivity probe,
+      # replaced in M1 by COORD_NODES and the real claim client, and left
+      # switched on afterwards out of habit: two log lines every three seconds,
+      # per station, for a fact nothing reads. That is what buried the station
+      # pane during the demo rehearsal — the interesting lines were there, under
+      # a thousand pings, and `grep -v ping` only removed the message and left
+      # the orphan `=NOTICE REPORT====` headers behind it.
+      #
+      # `vs_ping` stays in the supervision tree and still answers `ping` calls;
+      # without a target it simply never initiates (vs_ping:init/1). To probe
+      # connectivity by hand: `PING_TARGET=vs@station2 docker compose up -d
+      # station1`, or from a shell `vs_ping:ping('vs@station2')`.
       # M1+
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
@@ -72,7 +99,10 @@ services:
       VOLTSHARE_JWT_SECRET: ${VOLTSHARE_JWT_SECRET:-dev-secret-change-me-0123456789ab}
       # Must mirror the seed rows of contracts/schema.sql for this station:
       # connector ids are globally unique (station 1 owns 1..4).
-      SITE_POWER_KW: 350
+      # Parametrico solo qui, e solo per la demo: `.env.demo` lo porta a 200 kW così
+      # che due auto bastino a rendere visibile il riparto della potenza. Il default
+      # resta 350, cioè il sito reale descritto in SCOPE §3.
+      SITE_POWER_KW: ${STATION1_SITE_POWER_KW:-350}
       CONNECTORS: "1:150,2:150,3:150,4:50"
       STATION_NAME: "Pisa Centro"
       WS_URL: "ws://localhost:9101/ws/driver"
@@ -83,6 +113,23 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    # One network, and it is enough — including for the failure that seemed to
+    # need two.
+    #
+    # A second `site1` network, with the charge point emulators containerised on
+    # it, was added on 3/09 and removed the same day. The premise was that
+    # `docker network disconnect voltshare_voltshare station1` severed the
+    # station's uplink *and* its chargers at once, because the emulators run on
+    # the developer's machine and reach the station through a published port.
+    # The premise was wrong, and measuring properly is what showed it: a
+    # published port keeps working while the container is off the bridge, and a
+    # host emulator goes on charging right through the partition — 0.248 → 0.403
+    # → 0.558 kWh, side by side with a containerised one at 14.069 → 14.139 →
+    # 14.208.
+    #
+    # What had looked like proof of the opposite was a reconnect window sampled
+    # too fast: the meter tick is five seconds and the readings were three in
+    # six. The station partition is demonstrable exactly as it always was.
     networks: [voltshare]
 
   station2:
@@ -97,8 +144,7 @@ services:
       ERL_APP: vs_station
       ERLANG_COOKIE: ${ERLANG_COOKIE:-voltshare}
       STATION_ID: 2
-      PING_TARGET: vs@station1
-      PING_INTERVAL_MS: 3000
+      # Unset, same as station1 above.
       COORD_NODES: vs@coord1,vs@coord2,vs@coord3
       MYSQL_HOST: mysql
       LEASE_SECONDS: ${LEASE_SECONDS:-900}
@@ -118,6 +164,17 @@ services:
         condition: service_healthy
     networks: [voltshare]
 
+  # The charge points are NOT here, and that is deliberate.
+  #
+  # They are emulated hardware, not part of the system (SCOPE §7), and they run
+  # from the host with `emulator/demo/world.sh` — one model for all seven
+  # connectors rather than two containerised and five not.
+  #
+  # Two of them lived here briefly on 3/09, to put them on a per-site network so
+  # that a station partition would not cut the cables along with the uplink.
+  # Measuring properly showed the cables were never cut: see the note on
+  # station1's `networks`.
+  #
   # ------------------------------------------------------- coordinators (M3)
   #
   # Three replicas of the same image and the same configuration. They differ
@@ -228,5 +285,14 @@ services:
     networks: [voltshare]
 
 networks:
+  # One network. `docker network disconnect voltshare_voltshare <container>` on
+  # it produces a real partition — the node stays up, believes itself alive, and
+  # sends no FIN — which is the failure `docker kill` cannot show and the reason
+  # the coordinators run a heartbeat instead of trusting `nodedown`.
   voltshare:
     driver: bridge
+
+volumes:
+  # The database survives `docker compose down`. Removing it is `down -v`, and
+  # then the next boot replays contracts/schema.sql from scratch.
+  mysql-data:

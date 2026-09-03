@@ -25,7 +25,16 @@ const USAGE = `
 usage: node cp.js --url ws://host:port/ws/cp --station <id> --connector <id>
                   --vehicle <id> --soc <pct> --battery <kwh> --max-kw <kw>
                   [--plug-after <s>] [--unplug-at-soc <pct>]
-                  [--limit-apply <s>] [--linger <s>] [--quiet]
+                  [--limit-apply <s>] [--linger <s>] [--stay] [--quiet]
+
+  --stay        the charge point outlives the car. When the cable comes
+                out this process keeps the socket open and reports itself
+                available instead of exiting, so the connector goes back
+                to free and can be used again. Without it, every completed
+                session leaves the connector out of service thirty seconds
+                later, because from the station's side an emulator that
+                exited is indistinguishable from hardware that died. Use
+                it for anything that runs a whole demo.
 
   --linger <s>  after a soft stop (driver_stopped, target_reached,
                 claim_revoked) keep the cable in for <s> seconds before
@@ -46,6 +55,11 @@ const DEFAULTS = {
   'max-kw': 150,
   'plug-after': 2,
   'unplug-at-soc': null,
+  // Whether the *charge point* outlives the car. false — exit when the cable
+  // comes out — is the default only because every script written before 3/09
+  // waits for this process to end. For anything that runs a whole demo, `--stay`
+  // is the honest model: see stayOrFinish().
+  stay: false,
   // ws-chargepoint.md §10: the window within which a new limit must be
   // honoured. The station does not hand it over at boot — it is the
   // station's own tolerance — so it is a flag with the contract's default.
@@ -76,7 +90,10 @@ function parseArgs(argv) {
     if (!arg.startsWith('--')) die(`unexpected argument ${arg}${USAGE}`);
     const key = arg.slice(2);
     if (!(key in DEFAULTS)) die(`unknown option --${key}${USAGE}`);
-    if (key === 'quiet') { out.quiet = true; continue; }
+    // The two flags that take no value. Without this line `--stay` would eat
+    // the next argument, so `--stay --linger 60` would silently set stay to
+    // "--linger" and then complain about 60.
+    if (key === 'quiet' || key === 'stay') { out[key] = true; continue; }
     const value = argv[++i];
     if (value === undefined) die(`--${key} needs a value`);
     out[key] = typeof DEFAULTS[key] === 'number' || DEFAULTS[key] === null
@@ -451,7 +468,7 @@ function onStop(reason) {
 function unplug(why) {
   if (lingerTimer !== null) { clearTimeout(lingerTimer); lingerTimer = null; }
   car.lingering = false;
-  if (!car.plugged) return finish(0, why);
+  if (!car.plugged) return stayOrFinish(why);
   car.plugged = false;
   car.delivering = false;
   // The cable is out: the next one starts a new transaction, and a new timer.
@@ -460,7 +477,41 @@ function unplug(why) {
   const id = send('unplugged', { energy_kwh: round3(car.energyKwh) });
   log(`unplugged (${id}): ${round3(car.energyKwh)} kWh — ${why}`);
   // A beat for the frame to leave before the socket does.
-  setTimeout(() => finish(0, why), 200);
+  setTimeout(() => stayOrFinish(why), 200);
+}
+
+// The cable is out. Whether the *charge point* also goes away is a separate
+// question, and until 3/09 this emulator answered it wrongly: it exited.
+//
+// That conflates two things with very different lifetimes. A charge point is
+// bolted to the wall and stays connected to the back end for years while cars
+// come and go; this process claimed to be one, but lived exactly as long as a
+// single car. So every completed session left the socket unattended, and thirty
+// seconds later the station — correctly, having no way to tell "hardware gone"
+// from "hardware broken" — declared the connector `out_of_service`
+// (`vs_connector`: "gone past the grace ──▶ out_of_service").
+//
+// In a demo that is fatal: two charges and half the station is dark, with the
+// lobby offering fewer connectors after every beat.
+//
+// With `--stay` the socket is kept open and the heartbeat keeps beating, so the
+// connector returns to `free` and is immediately usable again — which is what a
+// real site does. Exiting stays the default, because every script written before
+// this flag waits for this process to end.
+function stayOrFinish(why) {
+  if (!cfg.stay) return finish(0, why);
+  log(`cable out (${why}) — charge point stays online, connector free again`);
+  // The next car starts from the configured state, not from where the last one
+  // finished: this process is the socket, and the battery belonged to the car
+  // that just left.
+  car.socPct = cfg.soc;
+  car.energyKwh = 0;
+  // §3.2 — `available' is what tells the station the hardware is healthy and
+  // idle. It is also what lifts a connector out of `out_of_service'
+  // (`vs_connector`: "out_of_service ──charge point boots `available'──▶ free"),
+  // so sending it here is what makes a reconnect after a grace-period lapse heal
+  // the socket instead of merely re-occupying it.
+  send('status', { status: 'available' });
 }
 
 function finish(code, why) {
