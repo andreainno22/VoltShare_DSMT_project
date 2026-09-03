@@ -1,0 +1,337 @@
+\section{Fault Tolerance and Recovery}
+\label{sec:fault-tolerance}
+
+Fault tolerance in this system is not one mechanism. It is five, chosen per
+failure, and the claim worth defending is that each was picked for a specific
+reason. None of them was applied across the board.
+
+One idea organises them. Every component keeps only the state it owns, and every
+other component treats that state as recoverable from its owner. Tolerance
+follows from ownership rather than from replication, which is why there is no
+consensus protocol anywhere in this project. Its absence was decided, and
+\cref{sec:rebuild} gives the argument.
+
+\subsection{The failure model}
+\label{sec:failure-model}
+
+We assume crash-stop and network partition. Byzantine behaviour is out of scope:
+a node that answers, answers truthfully. \Cref{tab:failures} lists what can fail
+and what the system does about it.
+
+\begin{table}[t]
+\centering\small
+\renewcommand{\arraystretch}{1.2}
+\caption{What can fail, how it is noticed, and what it costs.}
+\label{tab:failures}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}
+                               >{\raggedright\arraybackslash}p{2.9cm}
+                               X
+                               >{\raggedright\arraybackslash}p{2.9cm}@{}}
+\toprule
+What fails & How it is noticed & What happens & What is lost \\
+\midrule
+Coordinator, crash & \texttt{nodedown}, at once &
+  election; the new leader rebuilds from the stations &
+  nothing \\
+Coordinator, partition & heartbeat, 3~s &
+  the minority suspends itself &
+  new reservations, minority side \\
+Station node, crash & \texttt{monitor\_node}, at once &
+  the coordinator drops that station's claims &
+  sessions running there \\
+Station uplink, partition & \texttt{monitor\_node}, on the tick &
+  the site keeps charging, starts nothing new &
+  the operator's view \\
+Charge point & socket closes, then 30~s grace &
+  session closed with the last measured energy &
+  nothing measured \\
+Back office & nothing, it is a hidden node &
+  the cluster is unaffected; it re-reads on restart &
+  nothing durable \\
+MySQL & connection errors &
+  not tolerated, see \cref{sec:no-tolerance} &
+  writes, until it returns \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Two failure detectors, because there are two failures}
+\label{sec:detectors}
+
+This is the design decision in this section most worth defending.
+
+Erlang gives us \texttt{net\_kernel:monitor\_nodes/1} for free, and it fires the
+instant a TCP connection breaks. That is exactly what a killed container looks
+like. It is immediate and it costs nothing.
+
+But a node that stops answering \emph{without} closing its socket is invisible to
+it. A network partition, a frozen virtual machine, a host that has started
+swapping: the connection is still open, so no \texttt{nodedown} is delivered
+until the distribution's own tick expires, and \texttt{net\_ticktime} defaults to
+sixty seconds. Sixty seconds of a minority leader still granting claims is
+precisely the failure the quorum of \cref{sec:p2b} exists to prevent.
+
+Liveness is therefore decided by an explicit heartbeat, implemented in
+\texttt{vs\_coord\_membership}. Each coordinator announces itself to its peers
+once a second, and a peer that misses three announcements in a row is treated as
+gone. Three seconds to detect a partition instead of sixty.
+\texttt{monitor\_nodes} is subscribed to as well, but only to react faster when
+it does fire: it can never conclude anything the heartbeat would not have
+concluded a moment later.
+
+Two details of the implementation are worth a sentence each. The heartbeat is
+sent with a plain asynchronous send to a registered name, which never blocks and
+never fails on an unreachable node, so no dead peer can slow down the tick that
+is supposed to notice it. And the state starts optimistic, with every peer
+assumed alive: starting pessimistic would mean that after a cluster-wide restart
+every node believes itself alone for three seconds, and three coordinators would
+elect themselves at the same moment.
+
+Measured on 1 September, isolating the leader with
+\texttt{docker network disconnect}:
+
+\begin{itemize}
+  \item \texttt{QUORUM LOST (1 of 3) \ldots{} abdicating} at \textbf{2.12~s};
+  \item a new leader serving with both claims at \textbf{2.29~s};
+  \item the distribution's own \texttt{nodedown} at \textbf{64.6~s}.
+\end{itemize}
+
+That last number is the argument. Without the heartbeat the system would have
+been incorrect for a full minute, and no test would have revealed it, because
+\texttt{docker kill}, the obvious way to simulate a failure, closes the socket
+and never exercises this path at all. Two kinds of failure need two experiments,
+which is why the demonstration shows both \texttt{kill} and \texttt{disconnect}.
+
+\subsection{A station dies, and a station goes silent}
+\label{sec:station-failures}
+
+There are two distinct failures here, and conflating them is the most visible
+mistake available in this part of the system.
+
+\paragraph{The node dies.} \texttt{vs\_coord\_srv} takes an
+\texttt{erlang:monitor\_node/2} on every station it has heard from, and on
+\texttt{nodedown} it erases that station's claims.
+
+Doing nothing here would be the intuitive choice and it would be wrong. A claim
+is a promise that a vehicle is committed \emph{somewhere}. If the somewhere no
+longer exists, the promise locks the driver out of the whole network until the
+lease expires: up to fifteen minutes of being unable to reserve anywhere, because
+of a failure they did not cause. Dropping the claims turns a station failure into
+a local one.
+
+We state the cost. Charging sessions on that station are lost, because the process
+that was metering them is gone and no row was written. A \emph{restart} does
+preserve the energy figure, because the charge point is the side that counts it
+and brings its running total back in the message it re-sends on reconnect. What
+comes back is the measurement. The session itself is over.
+
+\paragraph{The uplink is cut.} The more interesting failure, and the one with a
+plain meaning outside a classroom, is a station that is alive and unreachable.
+The car park is delivering power and the operator cannot see it.
+
+Measured on 3 September, with \texttt{station2} isolated by
+\texttt{docker network disconnect}. The cars kept charging: energy climbed inside
+the isolated station from 0.248 to 0.403 to 0.558~kWh on one connector, and from
+14.069 to 14.208~kWh on another. The coordinator logged
+\texttt{Node vs@station2 not responding}, dropped that station and its claims,
+and the lobby emptied, because the lobby is drawn from what the coordinator
+pushes. On reconnection the station announced itself again and neither session
+had been interrupted.
+
+Two details sharpen the picture. The published ports survive, so
+port 9102 still answered \texttt{426 Upgrade Required} throughout: a driver
+physically at the site could still open its page and use it. What is lost is the
+operator's view, which is the honest shape of this failure and is exactly why
+reservations expire on their own instead of waiting for somebody to cancel them.
+
+But no new session can start. Authorising a car means resolving vehicle to owner,
+and that is a MySQL query across the severed link. \texttt{vs\_cp\_proto} logs
+\texttt{no account for vehicle N} and opens nothing, while charges already
+running are untouched, because they never touch the database. An isolated site
+finishes what it started and accepts nobody new. A real site controller with an
+unknown card and no uplink behaves the same way.
+
+\subsection{Rebuilding the claim table after a failover}
+\label{sec:rebuild}
+
+A new leader inherits nothing. The claims were granted by its predecessor and
+lived in that process's memory, which died with it, so before granting anything
+it has to find out which vehicles are already held.
+
+It does so by asking. The coordinator sends \texttt{who\_do\_you\_hold} to every
+connected node that is not a coordinator, and each station walks its connectors
+and replies with those in \texttt{held} or \texttt{charging}, from memory. The
+leader switches from \texttt{rebuilding} to \texttt{serving} once the answers are
+in. Requests received in the meantime are refused with a retry indication, which
+the stations map onto a temporary refusal. The driver waits a second and then
+gets their connector.
+
+\paragraph{Why asking is enough.} This is the decision the whole failover story
+rests on. \textbf{The coordinator does not own the state it holds; it is an index
+over it.} The authoritative copy of ``connector 3 is held for vehicle 88 until
+15:42'' lives on the station, which is also the only party that can act on it.
+The coordinator holds a derived view whose only purpose is to make the uniqueness
+check of \cref{sec:p2} a local lookup, and a derived view can be rebuilt from its
+sources.
+
+That is why there is no replicated log, no consensus on a state machine, and no
+persistence at the coordinator. Replicating the claims would mean maintaining a
+second copy of something the stations already hold authoritatively: more
+machinery, more ways for two copies to disagree, and nothing gained. If the
+coordinator held information derivable from nowhere else, a replicated log would
+be unavoidable. It was designed so that it does not, and that is worth stating as
+a choice, because it was one.
+
+\paragraph{Two paths converge.} The explicit query is the fast path. There is a
+slower one that works even when the query reaches nobody: renewals arrive every
+ten seconds carrying the claim identifier and its original grant timestamp, and a
+renewal for an unknown claim is adopted rather than refused. The system would
+converge on its own within one renewal interval. The query makes recovery take a
+second instead of ten.
+
+\paragraph{A hole we measured, and closed.} The two paths were not enough on
+their own, and the defect is instructive because neither number involved was
+wrong by itself.
+
+A coordinator that rejoins after a partition elects itself before its connections
+to the stations have been re-established. Its rebuild then asks nobody, receives
+nothing, and concludes in a microsecond that the network holds no claims. On
+1~September a vehicle obtained a \emph{second} reservation at another station
+272~ms after such a leader began serving, and the invariant stayed broken for
+13.65~s until the first renewal re-presented the older claim. The defence in
+place waited 2000~ms for stations to speak, while renewals arrive every 10000~ms:
+it covered a fifth of a cycle. The rebuild window is tuned to failure detection
+and the renewal interval is tuned to the cost of traffic at rest. The defect was
+that the first was being used to defend against the second.
+
+The fix has two halves, one on each side of the system. Stations now re-announce
+and renew immediately on \texttt{nodeup} instead of waiting for their next tick,
+which puts their claims in flight within a second of the network coming back. And
+a rebuild that returns \emph{no stations} while the table is \emph{also empty} no
+longer starts serving. That combination does not describe an idle network: it is
+the signature of a leader that could not ask. The coordinator stays in
+\texttt{rebuilding} until a renewal tells it that the world exists.
+
+The residual cost is declared. A rejoining leader refuses new reservations until
+it has heard from one station, which with the immediate renewal is a matter of
+milliseconds. The deadline timer is deliberately not cleared during that wait: it
+is the ceiling. If no renewal ever arrives, the backstop fires and the
+coordinator serves with a warning, because one that is stuck for ever is worse
+than one that is briefly wrong.
+
+\subsection{A charge point dies: grace, then honesty}
+\label{sec:cp-failure}
+
+The connector does not react to a lost socket immediately. A socket blip is not a
+broken charger, and a car charging perfectly well should not be stopped by our
+own reconnection logic. The \texttt{DOWN} arms a grace timer instead.
+
+The window is one budget of ninety seconds, split in two: sixty seconds as the
+socket's idle timeout, which is two missed heartbeats at the thirty-second
+interval the charge-point protocol specifies, and the last thirty seconds as the
+connector's own grace. Splitting one budget in two places is a source of bugs and
+was one: an earlier version let both sides start a full window, so three missed
+heartbeats became six, and a charge point that had gone quiet stayed reservable
+for three minutes.
+
+If the grace expires mid-session, the session is closed with the last energy the
+charge point reported. That figure is kept because the charge point was the only
+side counting, so its last report is the best available truth. The connector then
+becomes \texttt{out\_of\_service}. It does not go back to \texttt{free}: an outlet
+with no hardware attached cannot serve anyone, and offering it would send a driver
+to a socket that will do nothing when they arrive.
+
+Recovery needs no operator. A charge point that boots and reports itself
+available lifts the connector back to \texttt{free}.
+
+\subsection{Supervision inside a node}
+\label{sec:supervision}
+
+Each supervision strategy encodes a claim about dependencies between processes,
+and the three supervisors in this system make three different claims. Choosing
+between them is a design decision of the same kind as the ones above.
+
+\begin{itemize}
+  \item \texttt{vs\_coord\_sup} uses \texttt{rest\_for\_one}. The children are
+        started in dependency order, so restarting one restarts everything
+        downstream of it. When the process holding the claim table dies,
+        everything derived from it must die too: a survivor holding references
+        into a table that has been recreated is worse than a clean restart.
+  \item \texttt{vs\_station\_sup} uses \texttt{one\_for\_one}, because its
+        children are genuinely independent. The station manager crashing must
+        not take down connectors that are delivering power to real cars.
+  \item \texttt{vs\_connector\_sup} uses \texttt{simple\_one\_for\_one} with
+        \texttt{restart => transient}. Every child is the same kind of process,
+        one per connector, and a connector that terminates normally stays
+        terminated.
+\end{itemize}
+
+Two defects found while reviewing this code show that supervision only works if
+the rest of the code cooperates, and both were failures of supervision rather
+than of logic. The rebuild worker was started with \texttt{spawn\_link} while the
+coordinator does not trap exits, so any exception inside it, including a
+malformed reply from any station on the network, would have killed the process
+holding every claim, and \texttt{rest\_for\_one} would then have taken the whole
+subtree down with it. It is now \texttt{spawn\_monitor}, which delivers the same
+news without the lethality. Separately, the \texttt{rebuilding} state had exactly
+one exit, the success message: a worker that died before sending it left the
+coordinator refusing every reservation in the network, for ever, in silence.
+There is now a \texttt{DOWN} handler and a deadline, and both fall through to
+\texttt{serving} with a warning.
+
+The general lesson is worth stating, because it applies well beyond this project.
+A supervision tree protects you from the failures you routed through it. A linked
+process and a state with no timeout are both ways of routing a failure around the
+tree.
+
+\subsection{Three delivery guarantees on one wire}
+\label{sec:guarantees}
+
+The bridge from the coordinator to the back office carries three kinds of event,
+and they deliberately do not get the same guarantee, because the cost of a
+duplicate is different for each.
+
+\begin{itemize}
+  \item \textbf{The session row: at-least-once over an idempotent write.} The
+        back office prices a session with
+        \texttt{UPDATE sessions SET cost\_cents = ? WHERE id = ? AND cost\_cents
+        IS NULL}. A repeat updates zero rows and is not an error. At-least-once
+        over an idempotent write is the standard way of obtaining
+        effectively-once, and billing is also driven by a periodic sweep, so a
+        lost message delays the invoice without changing what it says.
+  \item \textbf{The no-show strike: at-most-once.} A counter cannot recognise a
+        duplicate, and a doubled strike would suspend an innocent driver. One
+        send, no retry. A lost strike is a smaller wrong than an invented one.
+  \item \textbf{The notification: at-most-once.} A duplicate is a row somebody
+        reads twice; a loss is a row they never see. Neither is good, and we
+        chose the quieter failure.
+\end{itemize}
+
+Choosing the guarantee per message rather than per channel is the point. A single
+reliable-messaging layer would have forced one answer onto three questions that
+have different answers.
+
+\subsection{What tolerates nothing, and is declared}
+\label{sec:no-tolerance}
+
+Three things in this system have no recovery path, and we prefer to name them
+than to let them be discovered.
+
+\textbf{MySQL is a single point of failure} for durable data. Replicating it was
+out of reach for this project. The honest position is not that every single point
+of failure has been eliminated, which is not true of any system this size, but
+that we chose which ones to keep and know what happens when they fail. Note what
+does \emph{not} depend on the database: charging continues, power sharing
+continues, and the coordinator keeps granting claims, because none of them reads
+MySQL on the interactive path.
+
+\textbf{Sessions on a dead station are lost}, as \cref{sec:station-failures}
+describes. The process that was metering them is gone.
+
+\textbf{The rebuild can still miss a station that is unreachable at exactly the
+wrong moment.} Its claims are absent from the new leader's table, so in principle
+one of its vehicles could obtain a second claim elsewhere before the conflict is
+noticed. In practice a car plugged in at that station is not in another city, and
+the conflict is resolved when the station returns and re-presents the older
+claim, which wins. The window is narrow and it is real, and it is declared here
+instead of being left for somebody to find.

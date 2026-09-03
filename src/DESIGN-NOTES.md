@@ -319,15 +319,29 @@ messaging" layer would have forced one answer onto three questions with differen
   continues, and the coordinator keeps granting claims, because none of them reads the
   database on the interactive path.
 - **Sessions on a dead station are lost.** The process that was metering them is gone.
-- **P18**: a coordinator that rejoins elects itself before the stations have reconnected,
+- **P18 — fixed on 3 September, kept here because the residual window is still declared.**
+  The defect: a coordinator that rejoins elects itself before the stations have reconnected,
   rebuilds from zero stations, and serves with an empty table for up to one renewal cycle.
-  The defect is the ratio between two numbers: the rebuild window is 2 000 ms and the renew
-  cycle is 10 000 ms, so the leader starts granting long before the claims come back. In
+  It was the ratio between two numbers, neither wrong on its own: the rebuild window is
+  2 000 ms, tuned to failure detection, and the renew cycle is 10 000 ms, tuned to the cost
+  of renewal traffic at rest, so the first was being used to defend against the second. In
   the measured run a vehicle obtained a **second** reservation on another station 272 ms
   after the new leader began serving, and P2 stayed broken for **13.65 s** until the first
   renewal re-presented the older claim. Measured 1 September, written up in PROGRESS §7zj.
-  Not fixed; mitigated in the demo by a ten-second pause after any coordinator rejoins. It
-  is a real hole in P2 and is declared as one.
+
+  The fix has two halves, one per side. Stations re-announce and renew on `nodeup` instead
+  of waiting for the next tick (A's `a/p18-nodeup`), so their claims are in flight within a
+  second of the network returning. And a rebuild that returns *no stations* while the table
+  is *also empty* no longer promotes to `serving`: that combination is the signature of a
+  leader that could not ask, so the coordinator holds in `rebuilding` until a renewal
+  arrives (`vs_coord_srv.erl:427-431`). `vs_coord_rebuild:deadline_ms/0` is the ceiling on
+  that wait, deliberately not reset, so a network where nobody holds anything still serves
+  eventually, with a warning.
+
+  What remains declared: a rejoining leader refuses new reservations until it has heard from
+  one station, which with the immediate renewal is milliseconds; and a station unreachable
+  at exactly the wrong moment is still missing from the rebuilt table until it returns and
+  its older claim wins by `granted_at`.
 
 ---
 

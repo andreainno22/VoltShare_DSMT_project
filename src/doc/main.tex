@@ -1,0 +1,103 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+\usepackage{microtype}
+
+\usepackage[a4paper,margin=2.7cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+\usepackage{cleveref}
+
+\setlist{itemsep=2pt, parsep=0pt, topsep=4pt}
+
+\definecolor{codebg}{gray}{0.96}
+\definecolor{codekw}{RGB}{0,80,140}
+\definecolor{codecm}{RGB}{100,110,100}
+\definecolor{stubgray}{gray}{0.45}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  stringstyle=\color{black!70},
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  frame=single,
+  framerule=0pt,
+  xleftmargin=8pt,
+  aboveskip=8pt, belowskip=8pt,
+  captionpos=b,
+}
+
+\lstdefinelanguage{json}{
+  morestring=[b]",
+  morecomment=[l]{//},
+  literate=
+    *{:}{{{\color{codekw}:}}}{1}
+     {,}{{{\color{codekw},}}}{1}
+     {\{}{{{\color{codekw}\{}}}{1}
+     {\}}{{{\color{codekw}\}}}}{1}
+     {[}{{{\color{codekw}[}}}{1}
+     {]}{{{\color{codekw}]}}}{1},
+}
+
+% Marca una sezione non ancora scritta. Va tolto il comando, non solo le
+% occorrenze, prima della consegna: se \stub non esiste piu', un residuo
+% non compila invece di passare inosservato.
+\newcommand{\stub}[1]{%
+  \par\medskip\noindent{\color{stubgray}\itshape [to be written --- #1]}\par\medskip}
+
+\title{VoltShare}
+\author{}
+\date{}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+{\large University of Pisa\par}
+{\large Master's Degree in Computer Engineering\par}
+{\large Distributed Systems and Middleware Technologies\par}
+\vspace{3.5cm}
+{\Huge\bfseries VoltShare\par}
+\vspace{0.6cm}
+{\Large Project Documentation\par}
+\vspace{0.4cm}
+{\large A distributed coordination system for electric-vehicle charging stations\par}
+\vfill
+{\large Group members:\par}
+\vspace{0.2cm}
+% TODO: nomi e cognomi dei due membri del gruppo
+{\large Nome Cognome\par Nome Cognome\par}
+\vspace{1.2cm}
+{\large Academic Year 2025/2026\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\input{sections/01-introduction}
+\input{sections/02-requirements}
+\input{sections/03-domain-rules}
+\input{sections/04-architecture}
+\input{sections/05-coordination-problems}
+\input{sections/06-protocols}
+\input{sections/07-addressing-problems}
+\input{sections/08-fault-tolerance}
+\input{sections/09-api-specification}
+\input{sections/10-deployment}
+\input{sections/11-testing}
+\input{sections/12-future-works}
+
+\end{document}

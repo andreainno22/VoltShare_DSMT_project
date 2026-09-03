@@ -1,0 +1,260 @@
+\section{Addressing the Problems}
+\label{sec:addressing}
+
+\Cref{sec:problems} listed the problems. This section describes the mechanism
+chosen for each one, the alternatives that were set aside, and what each choice
+costs. Failures have a section of their own (\cref{sec:fault-tolerance}), because
+there are five different mechanisms answering them, one per failure.
+
+Two of the problems are settled inside a single station and two of them are not,
+and the difference decides everything else. A connector belongs to exactly one
+station, always. No other node can grant it, so no remote agreement is needed and
+the station can decide alone. A vehicle is the only entity that can appear at two
+stations at the same time: the driver opens two browser tabs and presses
+\emph{reserve} on both. Each station checks its own connector, finds it free, and
+grants. Both are locally correct, both respected the exclusivity of their own
+outlet, and the network-wide invariant is broken. Neither station can detect this
+by itself, because the missing fact is held by neither of them.
+
+\subsection{Mutual exclusion on a connector (P1)}
+\label{sec:p1}
+
+Each physical connector is owned by one Erlang process, a \texttt{gen\_statem}
+implemented in \texttt{vs\_connector}. Every request that touches that outlet
+becomes a message in that process's mailbox, and messages are handled one at a
+time. Two drivers reserving the same connector in the same millisecond are
+therefore serialised by the runtime, and the second one finds the connector
+already in state \texttt{held}.
+
+There is no lock in the station code, and none is needed. This is the actor model
+applied to its textbook case: a resource paired with the process that guards it,
+so that mutual exclusion becomes a property of the mailbox instead of a
+discipline the programmer has to keep.
+
+The state machine carries a second guarantee that is easy to overlook. A session
+cannot start on a connector held by somebody else, and no check anywhere in the
+code is what prevents it: \texttt{charging} is simply unreachable from
+\texttt{held} with the wrong vehicle. There is no branch to forget. Events that
+do not apply to the current state fail to match, and the connector answers with a
+refusal that costs one clause. Enforcement of this kind fails loudly during
+development, where a missing clause is a crash and therefore cheap.
+
+\subsection{One reservation per vehicle, network-wide (P2)}
+\label{sec:p2}
+
+This is the guarantee the architecture is built around, and the mechanism is a
+\emph{claim}: a permission, granted by the coordinator, recording that a given
+vehicle is now committed and to which station.
+
+The two words matter throughout this document. A \textbf{reservation} is what the
+driver sees: connector~3 at this station, held for me until 18:07, owned by the
+connector process. A \textbf{claim} is what made it possible: an entry at the
+coordinator, about a vehicle, valid across the whole network. The reservation is
+local and concerns an outlet; the claim is global and concerns a car.
+
+\subsubsection{Claim first, commit after}
+
+A station obtains the claim \emph{before} it creates the reservation, never the
+other way round. The order is the whole mechanism, and it is worth stating why.
+
+In the wrong order, a crash between the two steps leaves a reservation that no
+other node knows about. The vehicle can then obtain a second reservation
+elsewhere, and the invariant is broken silently, with nothing in the system aware
+of it. In the right order, the same crash leaves a claim that was granted and
+never used. Nobody can reserve for that vehicle for a few minutes, and then the
+claim expires on its own. The system errs towards refusing rather than towards
+granting twice.
+
+This is the reasoning behind a write-ahead log, applied to a permission instead
+of to a balance: record the commitment before acting on it, so that the recovery
+path only ever has to undo an intention.
+
+\subsubsection{Why a central arbiter}
+
+The coordinator is a single process, \texttt{vs\_coord\_srv}, holding the claim
+table in its own memory. Concurrent requests from different stations queue in one
+mailbox and are decided one at a time, which is what makes the decision
+serialisable at all. In the vocabulary of the course this is centralised
+distributed mutual exclusion, with the difference that the critical section is
+not one: there is one per vehicle, and they are independent.
+
+That last point decided the algorithm. We considered four designs.
+
+\paragraph{One coordinator, unreplicated.} The simplest, and its failure
+is only partial: the coordinator sits outside the path that delivers power, so
+sessions in progress survive it. We rejected it because it leaves an avoidable
+single point of failure on the one guarantee the system exists to provide.
+
+\paragraph{A \texttt{UNIQUE} constraint in MySQL.} A uniqueness constraint on the
+vehicle would enforce P2 correctly and cost almost nothing to write. Two reasons
+against it. The coordinator has to exist anyway, for the cluster map and for node
+monitoring, so this option removes no component. And a claim that
+\emph{expires by itself} is a timer inside a process, whereas in the database it
+becomes either a cleanup job or a filter on every read, which is polling: the
+one thing this architecture avoids on every other edge. It also moves the single
+point of failure onto the database instead of removing it.
+
+\paragraph{Direct coordination between stations (Ricart-Agrawala).} No central
+authority by construction, which is attractive. It costs $2(n-1)$ messages per
+reservation, needs careful handling of nodes that die holding a token, and,
+decisively, it serialises access to \emph{one} critical section. Here every
+vehicle is an independent one, and two reservations for two different vehicles
+have no reason to wait for each other.
+
+\paragraph{Partitioning the vehicle space across coordinators.} Technically the
+cleanest of the four: the node responsible for $hash(vehicle)$ decides, no node
+sees all the traffic, and a failure blocks one shard instead of the network. We
+set it aside because every node must agree on the same partition map, the map
+must be rebalanced when membership changes, and each shard still needs its own
+failover. It adds to the chosen design rather than replacing it, and it is
+recorded as future work in \cref{sec:future}.
+
+\subsubsection{Ordering decided by one clock}
+
+When a claim is granted, the coordinator stamps it with \texttt{granted\_at} and
+sends that timestamp back with the grant. The station stores it and echoes it in
+every renewal.
+
+The purpose is conflict resolution after a failover. If two claims for the same
+vehicle ever meet in the table, the older one wins, and the comparison is between
+two timestamps produced by the \emph{same} process. No two machines with
+unsynchronised clocks are ever compared. We did not need logical clocks to get this:
+the coordinator already serialises the decisions that matter, so a single
+physical clock, used at one place only, is sufficient and simpler to defend.
+
+\subsection{Leases, and commands that arrive twice (P3, P7)}
+\label{sec:p3}
+
+A driver who reserves and never arrives is not a failure of the system, and it
+cannot be solved by asking the client to be well behaved. The answer is a lease:
+every reservation is granted with an expiry, and when the expiry passes the
+connector returns to \texttt{free} with no operator action and no cooperation
+from the party that disappeared.
+
+There are two nested expiries, and they protect against two different absent
+parties:
+
+\begin{itemize}
+  \item the \textbf{reservation lease} protects against the driver who never
+        shows up. It is the timer the connector process holds;
+  \item the \textbf{claim expiry} protects against the station that dies without
+        releasing what it holds. Without it, a crashed node would lock its
+        vehicles out of the entire network until somebody intervened.
+\end{itemize}
+
+The claim outlives the reservation on purpose, by
+\texttt{CLAIM\_GRACE\_SECONDS}, so that a station renewing slightly late does not
+lose a claim for a car that is charging. Stations refresh what they hold every
+\texttt{CLAIM\_RENEW\_INTERVAL\_MS}, ten seconds by default. The default lease is
+fifteen minutes; the demonstration profile in \texttt{.env.demo} shortens it to
+90 seconds so that a no-show can be watched from beginning to end without waiting
+a quarter of an hour. No clock is scaled: only the parameters change.
+
+This is the leasing pattern of the course material, the same mechanism used by
+distributed garbage collectors to decide that a remote reference has gone away.
+The property that makes it work here is that the resource is released by the
+passage of time and not by a message, so no participant can hold it hostage by
+falling silent.
+
+\paragraph{At-most-once for driver commands.} A driver on a mobile connection
+sends \texttt{reserve}, sees nothing happen, and presses the button again. If
+both messages arrive, the naive outcome is two reservations, or a session started
+twice.
+
+Every driver command therefore carries a mandatory \texttt{request\_id}, and
+\texttt{vs\_driver\_proto} keeps a small cache of recent identifiers with the
+frames that answered them. A repeated identifier is answered with the stored
+reply and is never dispatched a second time. The retry is invisible to the
+connector, which is the point: the deduplication belongs at the edge, where the
+duplicate is created. The state machine never has to reason about it.
+
+\subsection{Coordinator replication: election and quorum (P2b)}
+\label{sec:p2b}
+
+Making the coordinator authoritative creates the problem of the coordinator
+itself failing. Three coordinator nodes run; one is the leader and is the only
+node that grants or refuses claims. A station that addresses one of the other two
+is redirected to the leader.
+
+\paragraph{Election.} When the leader stops responding, the survivors elect a new
+one with the bully algorithm over their fixed node identifiers: the highest live
+identifier wins. A node that notices the leader is gone sends \texttt{ELECTION}
+to the nodes above it. Silence means it is the most senior node alive and it
+announces \texttt{LEADER} downwards; an answer means somebody more senior is
+handling it, and it waits. With three nodes this settles in two rounds of
+messages. Detection is by timeout, which means we assume a \emph{synchronous}
+system, an upper bound on response time. That assumption is stated here because
+the correctness of the detection depends on it, and it is the kind of thing an
+examiner is right to ask about.
+
+\paragraph{Quorum.} Bully alone does not prevent split brain. In a partition each
+side happily elects its own local maximum, and two authorities granting claims
+break precisely the invariant the coordinator exists to protect. So a coordinator
+serves only while it can see a majority of the configured coordinator cluster,
+itself included: two out of three. A node in the minority suspends itself and
+refuses everything, leader or not.
+
+This is why the cluster has three members and not two. With an even number, a
+partition can produce two halves that each consider themselves entitled to grant.
+
+The cost is real, and we state it: during a partition, the minority side refuses
+\emph{new reservations}. Charging sessions already running
+are untouched, because the coordinator is not on the path that delivers power. It
+only decides who may hold a vehicle. Refusing to serve when the invariant cannot
+be guaranteed is deliberate, and it is the same instinct that runs through the
+lease and the claim expiry: when in doubt, withhold.
+
+\paragraph{State after a failover.} A new leader inherits nothing, and it does
+not inherit a replicated log either. It asks the stations what they hold and
+rebuilds the claim table from their answers. The reason this is possible, and the
+reason it is a design decision rather than a shortcut, is developed in
+\cref{sec:rebuild}: the coordinator was built as an index over state that lives
+somewhere else.
+
+\subsection{Sharing the site power (P5)}
+\label{sec:p5}
+
+The last problem is a different species from the others, and putting it next to
+them is deliberate. A connector is exclusive, so it is granted to one holder. The
+electrical capacity of a site is divisible, so it is not granted at all: it is
+apportioned, and the apportionment changes every time a car arrives, leaves, or
+changes what it can absorb. Mutual exclusion and permits are two separate
+chapters of the course, and this system needs both, inside the same node.
+
+The site budget is lower than the sum of the nominal ratings of the connectors,
+which is true of real installations and is what makes the problem exist.
+\texttt{vs\_power} recomputes the split on every arrival, every departure, and on
+a periodic tick that follows the charging curve as batteries fill.
+
+The policy is max-min fair share with hand-back. Every active session starts from
+$budget/N$. A session that cannot absorb its share, either because the car is
+small or because it is tapering near full, takes only what it asks for and hands
+the surplus back, which is then split again among the others. The loop repeats
+until nobody hands anything back or the budget is exhausted.
+
+We chose it over the two alternatives named in the requirements for what it
+yields and for how it can be defended. Proportional-to-demand does not deliver
+more energy: it saturates the same budget and only changes who receives what, so
+it has to be argued as a political choice about which cars matter more.
+Reservation-holders-first would starve a walk-in session down to suspension,
+which contradicts the rule that a no-show costs a driver the right to book while
+leaving them free to charge. Fair share with hand-back is one sentence long, and no kilowatt
+sits unused while somebody could absorb it.
+
+\paragraph{The floor.} Below a minimum viable power a session is suspended rather
+than starved, which the requirements ask for and which \texttt{vs\_power}
+implements by allocating exactly $0.0$~kW: the session stays open and draws
+nothing. The condition has two halves. A session is suspended when its share is
+under \texttt{MIN\_CHARGE\_KW} \emph{and} under what it asked for. The floor
+exists to answer scarcity, so a car that receives exactly what it requested is
+not being starved by anybody, and taking it to zero would free nothing for
+anybody else.
+
+When the budget really is short, the session suspended is the most recent
+arrival, ordered by \texttt{started\_at} with the connector identifier breaking a
+tie. That rule is stable by construction, because \texttt{started\_at} never
+changes. An earlier version ranked sessions by how far they were from their
+demand instead, and produced a two-tick oscillation: suspending a session zeroed
+its limit, a zero limit made it look demand-bound, and the next tick reversed the
+decision. The lesson generalises beyond this project. A control rule must not
+take as input a quantity that the rule itself sets.

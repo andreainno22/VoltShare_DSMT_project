@@ -1,0 +1,22 @@
+\section{System Architecture}
+\label{sec:architecture}
+
+\subsection{Key design decisions}
+\label{sec:design-decisions}
+
+\stub{3 pages. One subsection per decision, each with choice, mechanism, discarded
+alternative and reason. The decisions: server-side rendering instead of an SPA;
+why middleware rather than plain TCP sockets (distributed Erlang, JInterface,
+WebSocket), which the course requires to be argued; coordinators separate from
+stations, and the site controller living at the station; volatile state in Erlang
+memory against durable state in MySQL; the charge-point emulator and the OCPP
+1.6-J subset that fixes the system boundary. Sources: SCOPE §6, §7, §9,
+DESIGN-NOTES §1, §5.}
+
+\subsection{Architectural components}
+\label{sec:components}
+
+\stub{2 pages. The seven nodes: back office (Java/Tomcat), three coordinators
+(Erlang/OTP), two station controllers (Erlang/OTP + Cowboy), MySQL. Technology,
+responsibility and runtime behaviour for each. The deployment figure goes here.
+Sources: SCOPE §6, deploy/docker-compose.yml.}

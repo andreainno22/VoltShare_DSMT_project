@@ -3,6 +3,11 @@
 !/.gitattributes
 !/src/
 
+# le skill di scrittura della relazione: condivise, il resto di .claude no
+!/.claude/
+/.claude/*
+!/.claude/skills/
+
 # build artefacts inside the versioned tree
 src/erlang/_build/
 src/backoffice/target/
@@ -10,3 +15,13 @@ src/emulator/node_modules/
 *.beam
 *.dump
 .env
+
+# LaTeX: il PDF si consegna, gli ausiliari no
+src/doc/*.aux
+src/doc/*.log
+src/doc/*.out
+src/doc/*.toc
+src/doc/*.fls
+src/doc/*.fdb_latexmk
+src/doc/*.synctex.gz
+src/doc/sections/*.aux
