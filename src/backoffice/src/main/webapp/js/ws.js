@@ -24,7 +24,44 @@
 'use strict';
 
 /**
- * @param {{url: string, station: number, token: string}} config
+ * The three values contracts/jwt.md §2 promises every live page, read from the
+ * `vs-live-config' element the JSP renders.
+ *
+ * They used to arrive as three `const' declarations in a <script> block, which
+ * meant the page built JavaScript source out of EL.  `station.wsUrl' is not a
+ * page constant: it comes from a station node's WS_URL, travels through the
+ * `station_up' announcement, the coordinator and StationDirectory, so a station
+ * announcing itself with a quote in its URL would have run script on every
+ * driver's page (review A7).  An attribute rendered through <c:out> cannot
+ * become code, whatever it contains, because it never enters a JS parser.
+ *
+ * The reading lives here rather than in station.js and session.js because the
+ * two pages differ in what they draw, not in how they are configured: one
+ * element id, in the same file that owns the shape of `config'.
+ *
+ * `station' stays a string.  Its only use is endpoint(), which encodes it into
+ * the query; nothing compares it to a number.
+ *
+ * @returns {{url: string, station: string, token: string}}
+ */
+function driverChannelConfig() {
+    var el = document.getElementById('vs-live-config');
+    /* Not an optional element: without it there is no endpoint and no token.
+     * Failing here says which contract was not honoured, instead of failing
+     * three steps later inside the handshake with a message about the token. */
+    if (!el) {
+        throw new Error('vs-live-config missing: the page did not render the ' +
+                        'three values of jwt.md §2');
+    }
+    return {
+        url:     el.dataset.wsUrl,
+        station: el.dataset.stationId,
+        token:   el.dataset.token
+    };
+}
+
+/**
+ * @param {{url: string, station: string, token: string}} config
  * @returns a channel with connect(), send(action, payload) -> Promise,
  *          and the onState / onNotification / onStatusChange callbacks.
  */

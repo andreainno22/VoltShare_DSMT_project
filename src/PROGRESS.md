@@ -3,7 +3,7 @@
 Registro di cosa esiste, cosa è stato verificato e cosa manca. Si aggiorna a ogni pezzo consegnato.
 Il piano di riferimento è [piano.md](piano.md); le specifiche sono in [SCOPE.md](SCOPE.md) e [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
-**Ultimo aggiornamento:** 3 settembre 2026 — **tutte le milestone di codice sono chiuse sui due lati**, e **P18 è chiuso su tutti e due**. M0, M1, M2, M3 e M4, di A e di B, sono su `main`; l'1/09 il giro intero è stato guardato **in un browser vero** (§7zk), l'ultima cosa che restava fuori dal M1. Del difetto grave **P18** la metà di A è su `main` (§7zl, finestra da **4,11 s a 0 ms**) e la metà di B è in questo ramo: un rebuild vuoto con la tabella vuota **non promuove più a `serving`**, si resta in `rebuilding` finché non arriva un renew — è il compromesso disponibilità/correttezza, deciso in due e non da uno solo. Resta la **M5**: prova generale, demo, relazione.
+**Ultimo aggiornamento:** 3 settembre 2026 — **tutte le milestone di codice sono chiuse sui due lati**, e **P18 è chiuso su tutti e due**. M0, M1, M2, M3 e M4, di A e di B, sono su `main`; l'1/09 il giro intero è stato guardato **in un browser vero** (§7zk), l'ultima cosa che restava fuori dal M1. Del difetto grave **P18** la metà di A è su `main` (§7zl, finestra da **4,11 s a 0 ms**) e la metà di B è in questo ramo: un rebuild vuoto con la tabella vuota **non promuove più a `serving`**, si resta in `rebuilding` finché non arriva un renew — è il compromesso disponibilità/correttezza, deciso in due e non da uno solo. Chiuso anche **A7**, l'ultimo rilievo della review: i tre valori delle pagine live escono dallo `<script>` e diventano attributi `data-` passati per `<c:out>` (§7zo). Resta la **M5**: prova generale, demo, relazione.
 
 ---
 
@@ -3961,6 +3961,98 @@ partizione c'è una finestra di riconnessione.
 - **`'global' … requested disconnect … to prevent overlapping partitions`**, comparso una
   volta. Quasi certamente causato dai nodi effimeri di `coord-status.sh`, che entrano nel
   cluster e muoiono subito. Innocuo, non indagato a fondo.
+
+---
+
+## 7zo. A7: le tre costanti escono dallo `<script>`, e la pagina smette di essere sorgente JS — 3 settembre
+
+Chiusura dell'ultimo rilievo della review che era rimasto senza padrone. L'avevo scritto io in
+`review-per-A-progetto.md` come A7 offrendomi di non toccare la pagina di A; A ha risposto
+**«cambialo tu, tutto — la pagina *e* il client, in un commit solo»**, e il motivo è quello
+giusto: in due PR separate la pagina resta rotta nel mezzo.
+
+### Il difetto
+
+`station.jsp` e `session.jsp` costruivano **sorgente JavaScript** con EL:
+
+```jsp
+const WS_URL = '${station.wsUrl}';
+```
+
+`station.wsUrl` non è una costante di pagina: nasce nella variabile d'ambiente `WS_URL` di un
+nodo stazione, passa per l'annuncio `station_up`, il coordinatore e `StationDirectory`. Una
+stazione che si annunciasse come `ws://h/ws/driver';alert(document.cookie);//` chiudeva la
+stringa ed eseguiva script nella pagina di **ogni** conducente. La stessa JSP passava
+`station.name` per `<c:out>` poche righe più sotto: era solo dentro lo `<script>` che l'EL
+usciva crudo.
+
+**Severità reale bassa** — per sfruttarlo bisogna già controllare la configurazione di un nodo
+del cluster, cioè essere dentro. Ma il rimedio toglie la **classe** invece dell'istanza.
+
+### Il rimedio, e le due decisioni dentro
+
+I tre valori sono attributi `data-` su un elemento `hidden`, ciascuno reso da `<c:out>`: un
+attributo non può diventare codice, qualunque cosa contenga, perché non entra mai in un parser
+JavaScript.
+
+**La lettura sta in `ws.js`, non nei due consumatori.** `driverChannelConfig()` restituisce
+`{url, station, token}` e `station.js`/`session.js` chiamano `createDriverChannel(driverChannelConfig())`.
+Le due pagine differiscono in **cosa disegnano**, non in come sono configurate: l'id
+dell'elemento vive in un posto solo, nello stesso file che possiede già la forma di `config`.
+
+**`station_id` è ora una stringa**, non un numero: un attributo non ha tipi. Non morde, perché
+il suo unico uso è `endpoint()`, che lo percent-encoda nella query — e la query è testo comunque.
+Nessuno lo confronta con un numero. La jsdoc lo dichiara invece di lasciarlo scoprire.
+
+Se l'elemento manca, `driverChannelConfig()` **lancia** invece di restituire `undefined`: senza
+di esso non c'è né endpoint né token, e fallire lì dice quale contratto non è stato onorato,
+invece di fallire tre passi dopo nell'handshake con un messaggio che parla del token.
+
+`jwt.md` §2 è aggiornato — è il contratto che prometteva il blocco `<script>`, quindi cambiare
+il codice e lasciare lì la vecchia forma avrebbe spostato la bugia da una parte all'altra.
+
+### Verificato — e cosa no
+
+- `node --check` sui tre file, e nessuna occorrenza residua di `TOKEN`/`WS_URL`/`STATION` fuori
+  dai commenti che spiegano il difetto.
+- `eunit_check.sh` **395, 0 failures** — la modifica non tocca Erlang, ma il ramo non era mai
+  stato verificato dopo il merge di `main`.
+- Gli `<script>` sono in fondo a entrambe le pagine, dopo l'elemento: quando `station.js` gira,
+  il `div` è nel DOM. Verificato leggendo, non serve altro.
+- **Non riprovato nel browser.** Il giro coi pixel è quello di A del 1/09 (§7zk) e non l'ho
+  rifatto dopo questa modifica: va rifatto alla prova generale, ed è la prima cosa da guardare
+  perché tocca l'unica riga che apre il socket.
+
+### Un rosso che non era un rosso, e va saputo prima della demo
+
+Il **primo** giro di `eunit_check.sh` dopo il merge è finito così:
+
+```
+184 tests, 0 failures, 6 cancelled
+```
+
+Non un difetto: `_build` era freddo e
+`vs_cp_proto_tests:the_socket_timeout_and_the_grace_add_up_to_three_heartbeats_test` ha superato
+i **5 secondi** di timeout di default di eunit mentre era dentro `code:ensure_loaded` per
+`cowboy_req` — lo stacktrace lo dice riga per riga. Morto quel test, eunit ha abbandonato il
+resto del gruppo: da qui i 184 invece dei 395. Il giro successivo, a cache calda, **395, 0
+failures**.
+
+Il test è quello che legge il timeout *attraverso il suo unico chiamante* (`vs_cp_ws:init/2`)
+invece di ricopiare la formula — scelta giusta, che però fa entrare cowboy in un test altrimenti
+puro. Su questa macchina, con i sorgenti su OneDrive, il primo caricamento può costare più del
+budget di eunit. **Non l'ho cambiato**: è un rischio di ambiente, non di logica, e sarebbe la
+terza volta (§7zb) che si tara un test sulla macchina invece che sul contratto. Ma è da sapere
+prima della prova generale: **il primo `eunit_check.sh` dopo un `_build` pulito va rilanciato una
+volta prima di crederci.**
+
+### Il merge di `main`, e la rinumerazione
+
+`main` (`0b31f3e`, con `a/p18-nodeup`) è dentro questo ramo. Le mie due sezioni si sono
+spostate — la review 2/09 da §7zk a **§7zm**, le prove 3/09 da §7zl a **§7zn** — perché A aveva
+già preso §7zk (il giro coi pixel) e §7zl (la sua metà di P18). `DESIGN-NOTES` §4c puntava al
+vecchio §7zk e ora punta a §7zm: la rinumerazione l'avevo dichiarata ad A come «riferimenti
+interni aggiornati», e quello era l'unico esterno — trovato cercandolo, non per caso.
 
 ---
 

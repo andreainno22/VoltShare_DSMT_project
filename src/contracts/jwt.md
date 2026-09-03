@@ -44,19 +44,25 @@ There is no refresh token. The login session lives in Tomcat's `HttpSession`; wh
 
 ## 2. How the token reaches the browser
 
-It never passes through JavaScript storage. The servlet puts it in the session, the JSP prints it into the page, the WebSocket code reads the constant:
+It never passes through JavaScript storage. The servlet puts it in the session, the JSP renders it into a hidden element, the WebSocket code reads it from there:
 
 ```jsp
 <%-- station.jsp, prepared by StationPageServlet --%>
-<script>
-  const TOKEN   = '${sessionScope.jwt}';
-  const WS_URL  = '${station.wsUrl}';
-  const STATION = ${station.id};
-</script>
+<div id="vs-live-config" hidden
+     data-token="<c:out value='${sessionScope.jwt}'/>"
+     data-ws-url="<c:out value='${station.wsUrl}'/>"
+     data-station-id="<c:out value='${station.id}'/>"></div>
+<script src="js/ws.js"></script>
 <script src="js/station.js"></script>
 ```
 
-`StationPageServlet` (B) guarantees these three variables are always present and non-empty when the page renders. `station.js` and `session.js` (A) may rely on them and on nothing else.
+```js
+var channel = createDriverChannel(driverChannelConfig());   // ws.js
+```
+
+`StationPageServlet` (B) guarantees these three attributes are always present and non-empty when the page renders. `station.js` and `session.js` (A) may rely on them and on nothing else.
+
+**Attributes, not `const` declarations in a `<script>` block.** That was the original shape, and it made the JSP build JavaScript source out of EL. Only `sessionScope.jwt` is the back office's own: `station.wsUrl` comes from a station node's `WS_URL`, through the `station_up` announcement, the coordinator and `StationDirectory`. A station announcing itself as `ws://h/ws/driver';alert(document.cookie);//` would have closed the string and run script on every driver's page. An attribute rendered through `<c:out>` cannot become code, whatever it contains, because it never reaches a JavaScript parser. `data-station-id` therefore arrives as a **string**; its only use is the `station_id` query parameter, which is text anyway.
 
 ---
 

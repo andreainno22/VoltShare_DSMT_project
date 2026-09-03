@@ -7,23 +7,52 @@
   OWNED BY A.  This is the skeleton B guarantees, not the finished page.
 
   StationPageServlet (B) always provides exactly these three values, as fixed in
-  contracts/jwt.md §2. A may rely on them and on nothing else from the back office:
+  contracts/jwt.md §2, on the `vs-live-config' element below. A may rely on them
+  and on nothing else from the back office:
 
-      TOKEN    the JWT the station verifies on `join`
-      WS_URL   the driver endpoint, as the coordinator advertised it
-      STATION  the station id
+      data-token        the JWT the station verifies on `join`
+      data-ws-url       the driver endpoint, as the coordinator advertised it
+      data-station-id   the station id
 
-  Everything below the script block is A's to replace: connector grid, reserve
+  They are read once by driverChannelConfig() in js/ws.js.
+
+  Everything below that element is A's to replace: connector grid, reserve
   buttons, lease countdown, live state from the WebSocket.
   ============================================================================
 --%>
 <t:page title="${station.name}" active="stations">
 
-    <script>
-        const TOKEN   = '${sessionScope.jwt}';
-        const WS_URL  = '${station.wsUrl}';
-        const STATION = ${station.id};
-    </script>
+    <%--
+      The three values jwt.md §2 promises this page, handed over as data
+      attributes rather than interpolated into a <script> block.
+
+      The block they replace built JavaScript source out of EL:
+
+          const WS_URL = '${station.wsUrl}';
+
+      and `station.wsUrl` is not a page constant. It comes from a station node's
+      WS_URL environment variable, travels through the `station_up' announcement,
+      the coordinator and StationDirectory before arriving here — so a station
+      that announced itself as
+
+          ws://h/ws/driver';alert(document.cookie);//
+
+      would have closed the string and run script on every driver's page. The
+      same file already escaped `station.name' with <c:out> a few lines below;
+      it was only inside the script that EL went out raw.
+
+      Severity was low — exploiting it means already controlling a cluster
+      node's configuration — but the fix removes the *class* rather than the
+      instance: an attribute rendered through <c:out> cannot become code,
+      whatever it contains, because it never enters a JavaScript parser.
+
+      `hidden`, not `display:none` in CSS: the element carries no presentation
+      and nothing should have to remember to hide it.
+    --%>
+    <div id="vs-live-config" hidden
+         data-token="<c:out value='${sessionScope.jwt}'/>"
+         data-ws-url="<c:out value='${station.wsUrl}'/>"
+         data-station-id="<c:out value='${station.id}'/>"></div>
 
     <%--
       The connector boxes are a feature of A's page, so their styles live here

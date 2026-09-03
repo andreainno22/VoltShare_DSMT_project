@@ -7,11 +7,12 @@
   OWNED BY A.  Same skeleton as station.jsp, and the same three values.
 
   This page needs a servlet of B's that does for /session what StationPageServlet
-  does for /station — nothing more than the contract of contracts/jwt.md §2:
+  does for /station — nothing more than the contract of contracts/jwt.md §2, on
+  the `vs-live-config' element below:
 
-      TOKEN    the JWT the station verifies on `join`
-      WS_URL   the driver endpoint, as the coordinator advertised it
-      STATION  the station id
+      data-token        the JWT the station verifies on `join`
+      data-ws-url       the driver endpoint, as the coordinator advertised it
+      data-station-id   the station id
 
   It is the same driver socket station.jsp opens; only what the page listens to
   differs (§5.2 `session` instead of §5.1 `state`).  Until that servlet exists
@@ -19,16 +20,18 @@
   the request is in contracts/nota-per-B-m2a.md §4, and when it lands there is
   nothing left to write on this side.
 
-  Everything below the script block is A's.
+  Everything below that element is A's.
   ============================================================================
 --%>
 <t:page title="Your session" active="stations">
 
-    <script>
-        const TOKEN   = '${sessionScope.jwt}';
-        const WS_URL  = '${station.wsUrl}';
-        const STATION = ${station.id};
-    </script>
+    <%-- Same three values, same reason, same shape as station.jsp: see the note
+         there. `station.wsUrl' comes from a station node's environment by way of
+         the coordinator, so it is not ours to trust as JavaScript source. --%>
+    <div id="vs-live-config" hidden
+         data-token="<c:out value='${sessionScope.jwt}'/>"
+         data-ws-url="<c:out value='${station.wsUrl}'/>"
+         data-station-id="<c:out value='${station.id}'/>"></div>
 
     <%--
       The styles of this view live here rather than in css/app.css, which

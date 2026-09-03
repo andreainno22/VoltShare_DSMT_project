@@ -36,11 +36,9 @@
     var pill    = document.getElementById('conn-status');
     var notices = new Map();   // connector_id -> {message, until}
 
-    var channel = createDriverChannel({
-        url: WS_URL,           // from the JSP, jwt.md §2
-        station: STATION,
-        token: TOKEN
-    });
+    /* From the JSP, jwt.md §2 — through the data attributes of
+     * `vs-live-config', not through three globals.  See ws.js. */
+    var channel = createDriverChannel(driverChannelConfig());
 
     /* ── status pill ───────────────────────────────────────────────────── */
 
