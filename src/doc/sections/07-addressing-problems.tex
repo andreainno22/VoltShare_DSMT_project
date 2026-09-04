@@ -258,3 +258,26 @@ demand instead, and produced a two-tick oscillation: suspending a session zeroed
 its limit, a zero limit made it look demand-bound, and the next tick reversed the
 decision. The lesson generalises beyond this project. A control rule must not
 take as input a quantity that the rule itself sets.
+
+\subsection{One source of truth for every client (P6)}
+\label{sec:p6}
+
+Several parties look at the same connector: the driver who holds it, other
+drivers deciding where to go, the charge point reporting from the hardware, and
+the operator's back office. They must agree, and the cheapest way to make them
+agree is to give them nothing to compute.
+
+The station holds the authoritative state and pushes a \emph{complete} snapshot
+of it, built by \texttt{vs\_connector:build\_snapshot/2}. A client never derives
+a new state from an event it received: it replaces what it is displaying with
+what has just arrived. A page that misses a message is therefore wrong only
+until the next push, and a page that reconnects is correct immediately, with no
+replay and no reconciliation. Snapshots go out on every change and on a periodic
+tick, so a browser that was asleep converges without asking.
+
+This is also why the at-most-once cache of \cref{sec:p3} deliberately excludes
+one message. A repeated command must be answered with its stored reply, but the
+station snapshot must never be replayed from a cache: by the time a duplicate
+arrives, the stored snapshot describes a connector that has moved on, and
+answering with it would put a stale state on a page that had the current one.
+The duplicate is answered, and the state comes from the live push.

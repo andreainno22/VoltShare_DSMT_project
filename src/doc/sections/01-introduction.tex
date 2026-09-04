@@ -1,9 +1,79 @@
 \section{Introduction}
 \label{sec:introduction}
 
-\stub{1.5 pages. What the system does, for whom, and which distributed problems it
-solves. Must answer within the first page why this domain has genuine contention:
-the connector is a physically exclusive resource, held for a long and imprecisely
-known time, and drivers are autonomous agents the operator can only arbitrate.
-Sources: SCOPE §1, DESIGN-NOTES §1. Close on a short list of the problems the
-project sets out to solve, as BlackNet does.}
+VoltShare coordinates a network of electric-vehicle charging stations. Drivers find a
+station, reserve a connector, plug in and are billed; the operator sees the network from a
+back office. Underneath, the system decides three things: which vehicle gets which connector,
+how the limited electrical capacity of a site is shared among the cars charging at it, and
+what happens to both when a node fails.
+
+\subsection{Why this domain has real contention}
+
+A distributed systems project needs contention that belongs to the problem itself, and never
+one manufactured for the exercise. This one has it, and the argument is worth making at the
+start, because everything in the design follows from it.
+
+\paragraph{The operator has no authority over the agents.} A delivery platform can assign a
+courier to an order. Couriers are workers, the system knows where they are, and the dispatch
+becomes an optimisation problem in which contention disappears. The driver of a private car
+cannot be assigned anywhere: they have their own destination and can ignore any suggestion.
+The system can only \emph{arbitrate the requests that drivers make}, and centralising the
+decision does not remove the contention, because the central decider has no power to decide
+in the drivers' place.
+
+\paragraph{The exclusivity is physical.} One outlet, one vehicle, for thirty or forty
+minutes. This is not a lock that a cleverer assignment could avoid, and the long occupancy,
+whose end nobody knows in advance, is what makes the contention observable. A resource held
+for two seconds produces queueing that disappears into the noise; one held for half an hour
+produces a driver waiting in a car park.
+
+\paragraph{The distribution is not a didactic device.} Charging sites are in different
+places, and dynamic load management is normally performed by a controller installed at the
+site, because it has to react quickly and has to keep working when the link to the
+operator's cloud is down. Our station node is that controller. The requirement that a site
+keeps charging while cut off from the network, which \cref{sec:station-failures} tests with a
+real partition, comes from the deployment being shaped like a real one.
+
+\subsection{The problems this project solves}
+
+Four of them, in the order they cost us work:
+
+\begin{itemize}
+  \item \textbf{Exclusive access to a physical resource.} Several drivers ask for the same
+        connector at the same instant, and the outlet must end up promised to one of them.
+  \item \textbf{One reservation per vehicle across the whole network.} This is the hard one.
+        Two stations can each be locally correct and still break the guarantee together, so
+        it needs an authority, which then needs replication, election and a quorum to
+        survive its own failure.
+  \item \textbf{Sharing a divisible resource.} A site cannot deliver the sum of what its
+        connectors are rated for, so the available power is apportioned among active
+        sessions and renegotiated whenever a car arrives, leaves or fills up.
+  \item \textbf{Failures that must not take resources with them.} A node can crash or be cut
+        off, and the two look alike from a distance while behaving differently. Nothing may
+        stay reserved for a party that has gone away.
+\end{itemize}
+
+\Cref{sec:problems} states all seven problems precisely, \cref{sec:addressing} gives the
+mechanism chosen for each, and \cref{sec:fault-tolerance} covers the failures.
+
+\subsection{What is built and what is emulated}
+
+The system under development is the coordination backend together with its clients, which in
+industry terms is a charging-station management system and its site controllers. The
+hardware cannot be present in a university project: the outlet, its contactor, its meter and
+the car. That part is an emulator speaking a reduced message set modelled on OCPP 1.6-J, the
+protocol real charge points use, so the boundary falls where a real interface already exists.
+\Cref{sec:boundary} makes the split explicit, item by item.
+
+The deployment is seven nodes running as containers on one host: three coordinators, two
+station controllers, a Tomcat back office and MySQL. \Cref{sec:deployment} explains what a
+single host can and cannot demonstrate, and how a genuine network partition is produced
+without a second machine.
+
+\subsection{A note on the numbers in this document}
+
+Measurements quoted here were taken from running deployments and are reported with their date
+and their conditions, because a figure without either is not evidence. Where something was
+not measured, the text says so. The same applies to the limits: several of them are declared
+in \cref{sec:no-tolerance} rather than left to be discovered, including one hole in the
+central guarantee that we found by measuring, and closed.

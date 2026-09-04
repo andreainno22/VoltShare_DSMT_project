@@ -1,11 +1,279 @@
 \section{API and Protocol Specification}
 \label{sec:api}
 
-\stub{4 pages. One message table per channel: name, direction, payload, effect,
-errors. A table beats a listing here, it fits in less space and can be consulted.
-9.1 HTTP endpoints of the back office, with the JWT note (contracts/jwt.md);
-9.2 driver WebSocket (contracts/ws-driver.md); 9.3 charge-point WebSocket
-(contracts/ws-chargepoint.md), declaring which OCPP 1.6-J messages are
-implemented and which are not; 9.4 claim protocol (contracts/claim.md);
-9.5 JInterface bridge (contracts/erlang-java.md). One sequence figure for the
-reservation with claim, including the refusal path.}
+Five channels carry everything in this system, and \cref{sec:protocols} said which runs where
+and why. This section specifies what travels on each one.
+
+The three channels between our own components were written as contracts before either side
+was implemented, and they live in the repository as \texttt{contracts/*.md}. Two of them are
+marked \emph{frozen}: changing one requires a review by both developers, because each side is
+written by a different person against the text and not against the other's code.
+
+\subsection{HTTP: browser to back office}
+\label{sec:api-http}
+
+Nine servlets, mapped with \texttt{@WebServlet} annotations and no deployment descriptor.
+Everything is rendered server-side and forwarded to a JSP; there is no JSON API on this
+channel, because the browser receives pages.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{HTTP endpoints of the back office. The last column marks the ones behind
+\texttt{AuthFilter}.}
+\label{tab:http}
+\begin{tabularx}{\textwidth}{@{}l l X c@{}}
+\toprule
+Path & Method & Effect & Auth \\
+\midrule
+\texttt{/register} & POST & creates the account and its vehicle profile & \\
+\texttt{/login} & POST & authenticates, opens the \texttt{HttpSession}, mints the JWT & \\
+\texttt{/logout} & GET & invalidates the session & \\
+\texttt{/stations} & GET & the directory, read from \texttt{StationDirectory} in memory &
+  $\bullet$ \\
+\texttt{/station} & GET & one station's page, with the JWT and the WebSocket URL &
+  $\bullet$ \\
+\texttt{/session} & GET & the live session page for a connector & $\bullet$ \\
+\texttt{/profile} & GET & account and vehicle & $\bullet$ \\
+\texttt{/history} & GET & past sessions with their invoices & $\bullet$ \\
+\texttt{/notifications} & GET & notifications stored for this driver & $\bullet$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection{The token the station will trust}
+\label{sec:api-jwt}
+
+A station has to recognise a driver without asking the back office. That is what keeps a
+site working while Tomcat is down, and what keeps driver traffic off the Java container. The
+token is the only thing the two sides share.
+
+It is a JWT signed with \textbf{HS256} using a symmetric secret, passed to both sides in the
+environment as \texttt{VOLTSHARE\_JWT\_SECRET} and at least 32 characters long, because
+HS256 needs 256 bits of key material and the Java library refuses to sign with less. It
+lives 60 minutes. Java signs with \texttt{jjwt}, Erlang verifies with \texttt{jose}.
+
+\begin{lstlisting}[language=json, caption={The claims, plus the standard \texttt{iat}.},
+                   label={lst:jwt}]
+{ "sub": "12", "username": "andrea", "vehicle_id": 88,
+  "iss": "voltshare-backoffice", "exp": 1755792000 }
+\end{lstlisting}
+
+\texttt{sub} is the user id as a string, which the JWT specification requires, and
+\texttt{vehicle\_id} is a number. The station needs both: the first attributes the session
+to an account, the second matches the claim, which is per vehicle.
+
+On the first frame of the WebSocket, which must arrive within five seconds of the connection
+opening, the station verifies the signature, checks that \texttt{iss} is exactly
+\texttt{voltshare-backoffice}, checks that \texttt{exp} is in the future, and extracts the
+two identifiers. A failure closes the socket with \texttt{4401}, an expired token with
+\texttt{4408}. The station never calls the back office about a token, whether it accepts one
+or throws it out.
+
+There is a trap here that the library invites, and \texttt{contracts/sample-tokens.md}
+records it: \texttt{jose\_jwt:verify/2} checks \emph{only the signature}. Issuer and expiry
+are ordinary claims, so a token that verifies is not yet a token to accept, and both checks
+are written out explicitly on the station side.
+
+\paragraph{How the token reaches the browser.} It never passes through JavaScript storage.
+The servlet puts it in the session, the JSP renders it into a hidden element as a
+\texttt{data-} attribute through \texttt{<c:out>}, and the WebSocket code reads it from
+there.
+
+The shape matters for a reason that is not obvious. An earlier version declared these values
+as JavaScript constants inside a \texttt{<script>} block, which meant the JSP was building
+JavaScript source out of EL. Only the token is the back office's own: the WebSocket URL
+comes from a station node, travels in its \texttt{station\_up} announcement through the
+coordinator, and is republished by \texttt{StationDirectory}. A station announcing itself
+with a URL containing a quote and a semicolon would have closed the string and run its own
+script on every driver's page. An attribute rendered through \texttt{<c:out>} cannot become
+code, whatever it contains, because it never reaches a JavaScript parser.
+
+\subsection{WebSocket: driver to station}
+\label{sec:api-ws-driver}
+
+\stub{1 page, from contracts/ws-driver.md. The handshake and the mandatory request\_id, then
+one table of client-to-server actions (join, reserve, cancel\_reservation, stop\_session)
+and one of server-to-client frames (the station snapshot of 5.1, the live session of 5.2,
+errors, the final closed). Say which frames are cacheable for the at-most-once replay and
+which are never replayed, and why: \cref{sec:p6} gives the reason.}
+
+\subsection{WebSocket: charge point to station}
+\label{sec:api-ws-cp}
+
+\stub{1 page, from contracts/ws-chargepoint.md. The reduced OCPP 1.6-J message set: boot,
+status notification, meter values, the power-limit command. State which OCPP messages are
+implemented and which are deliberately absent, and give the heartbeat interval and the
+missed-beat budget, since \cref{sec:cp-failure} depends on those numbers.}
+
+\subsection{Claims: station to coordinator}
+\label{sec:api-claim}
+
+Distributed Erlang, with the coordinator a \texttt{gen\_server} registered locally as
+\texttt{vs\_coord\_srv} on each coordinator node and addressed as
+\texttt{\{vs\_coord\_srv, Node\}}. Calls carry a 2000~ms timeout, and a timeout is treated
+exactly like an unreachable node.
+
+\begin{table}[t]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{The claim protocol. \texttt{ReqId} is generated by the station and echoed back.}
+\label{tab:claim}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.3cm} l X@{}}
+\toprule
+Message & Direction & Purpose \\
+\midrule
+\texttt{claim} & station $\to$ coord & ask before committing a reservation \\
+\texttt{renew} & station $\to$ coord & re-present every claim held, every 10~s \\
+\texttt{release} & station $\to$ coord & fire and forget, on cancel, expiry or completion \\
+\texttt{who\_do\_you\_hold} & coord $\to$ station & the rebuild query of \cref{sec:rebuild} \\
+\texttt{station\_up} & station $\to$ coord & announcement, at start-up and every 30~s \\
+\texttt{station\_stats} & station $\to$ coord & free, held and charging counters \\
+\texttt{session\_closed} & station $\to$ coord & a session row was written, relay it to Java \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection{Acquire}
+
+\begin{lstlisting}[language=Erlang, caption={Request and the four possible replies.},
+                   label={lst:claim}]
+{claim, ReqId, VehicleId, UserId, StationId, ConnId}
+
+{ok, ReqId, ClaimId, GrantedAt, ExpiresAt}
+{error, ReqId, already_held | suspended | rebuilding | unknown_station}
+{not_serving, LeaderNode | undefined}
+\end{lstlisting}
+
+Each refusal means something different to the driver, so the station maps them apart:
+\texttt{already\_held} says this car is committed at another station,
+\texttt{suspended} says the account is serving a no-show penalty, and
+\texttt{rebuilding} is temporary and produces a retry rather than an error on screen.
+\texttt{unknown\_station} means the coordinator has not heard the announcement yet, so the
+station re-announces itself and tries once more.
+
+Two properties of the reply are load-bearing elsewhere in this document.
+\texttt{ExpiresAt} is always longer than the reservation lease, by
+\texttt{CLAIM\_GRACE\_SECONDS}, so a claim never expires underneath a reservation that is
+still alive. And \texttt{GrantedAt} is issued by the coordinator, never by the station, for
+the reason given in \cref{sec:p2}: the station stores it and echoes it back, so that
+\emph{oldest wins} always compares two timestamps that came from the same clock.
+
+\subsubsection{Renew, and why it carries more than it seems}
+
+A station renews all its claims in one message every ten seconds, and the reply names those
+still valid and those revoked.
+
+\begin{lstlisting}[language=Erlang]
+{renew, StationId, [{ClaimId, VehicleId, ConnId, UserId, GrantedAt}]}
+{renewed, Ok, Revoked, NewExpiresAt}
+\end{lstlisting}
+
+Every renewal carries \texttt{GrantedAt} and \texttt{UserId}, including the hundredth one
+for a claim nothing has disturbed. The reason is recovery: a renewal is how a newly elected
+leader learns about claims it never granted. A claim it has never seen is \textbf{accepted} and adopted with the timestamp
+the station reports, which is what makes \cref{sec:rebuild} converge even when the rebuild
+query reaches nobody. Carrying \texttt{UserId} lets that leader enforce a suspension
+immediately, instead of holding a claim it cannot attribute to an account.
+
+A revoked claim is not an error to be logged. The station must cancel the reservation or
+stop the session, free the connector, and tell the driver why. Revocation is how the system
+converges after a conflict, and the station obeys it even when it believes its claim is
+valid.
+
+\subsubsection{Finding the leader}
+
+The station keeps its idea of the current leader in \texttt{vs\_claim\_client}, starting
+from the first entry of \texttt{COORD\_NODES}. A \texttt{not\_serving} carrying a node
+updates it and the call is retried once. A \texttt{not\_serving} without one, a timeout or a
+\texttt{noproc} makes it walk the configured list round-robin, for at most one full pass.
+
+If the pass fails, the station gives up and refuses the reservation. It does not queue the
+request and it never blocks the connector process, which is the rule that keeps a
+coordination outage from touching cars that are already charging: no claim means no new
+reservation, and walk-in charging on a free connector needs no claim at all.
+
+\subsubsection{Behavioural rules}
+
+Binding on both implementations, and each one is a guarantee something else in this document
+depends on:
+
+\begin{enumerate}[itemsep=1pt]
+  \item \textbf{Claim first, commit after.} A connector never moves to \texttt{held} before
+        the \texttt{ok} arrives.
+  \item \textbf{No claim, no reservation.} An unreachable coordinator means refusals.
+  \item \textbf{The coordinator serves only as leader and in quorum.} In any other state it
+        answers \texttt{not\_serving} or \texttt{rebuilding}, never a grant.
+  \item \textbf{Revocation is authoritative.}
+  \item \textbf{Oldest wins}, by \texttt{GrantedAt}.
+  \item \textbf{Releases are best-effort.} Correctness never depends on one arriving, because
+        expiry is the backstop.
+\end{enumerate}
+
+\subsection{The JInterface bridge: coordinator to back office}
+\label{sec:api-bridge}
+
+The back office does not poll the cluster. It joins it. Java opens an \texttt{OtpNode} named
+\texttt{voltshare\_bo}, registers a mailbox called \texttt{backoffice}, and receives Erlang
+terms as the coordinator produces them. Every page that lists stations then reads from
+memory.
+
+Java is a \textbf{hidden node}: it takes part in the distribution protocol and is addressable
+by name, but it does not appear in \texttt{nodes()} and takes no part in the quorum. That is
+the correct arrangement, because the back office must never influence who is elected leader.
+The bridge runs on its own daemon thread and reconnects every three seconds, so a
+coordinator restart never requires restarting Tomcat.
+
+\paragraph{A detail that cost a day.} The \texttt{jinterface} artifact published on Maven
+Central is version 1.6.1, from 2011, and it cannot complete the distribution handshake with
+an OTP 29 node: \texttt{OtpNode.ping} returns false with no exception to point at the cause.
+The jar we ship is built from the sources of the OTP release we run, and it has to move
+whenever the OTP version in \texttt{Dockerfile.erlang} moves.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{Messages on the bridge.}
+\label{tab:bridge}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.3cm} l X@{}}
+\toprule
+Message & Direction & Purpose \\
+\midrule
+\texttt{stations\_update} & coord $\to$ Java & the complete station list, on change and
+  every 30~s \\
+\texttt{leader} & coord $\to$ Java & who is serving now \\
+\texttt{session\_closed} & coord $\to$ Java & a session was written; price it now \\
+\texttt{no\_show}, \texttt{show\_up} & coord $\to$ Java & penalty accounting \\
+\texttt{notify} & coord $\to$ Java & something to tell a driver next time they look \\
+\texttt{get\_stations} & Java $\to$ coord & asked once on connect, so no page starts empty \\
+\texttt{user\_suspended} & Java $\to$ coord & a no-show counter tripped \\
+\texttt{user\_unsuspended} & Java $\to$ coord & the penalty expired \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\texttt{stations\_update} is always a complete snapshot. \texttt{StationDirectory} replaces
+its whole list atomically, because a partial update would leave a station on the page after
+its node had gone down. The WebSocket URL inside it is produced by the coordinator and never
+assembled by Java: the back office does not know the deployment topology, and publishing a
+reachable address is the cluster's job. A malformed entry is logged and skipped, so one
+broken station cannot blank the directory.
+
+\paragraph{Suspensions recover by pushing.} The suspended set lives in the coordinator's
+memory while the counter behind it lives in MySQL, so a coordinator that has just started
+serving knows nothing about it. It cannot ask the stations either, because no station holds
+a suspension. The back office therefore repeats every running suspension on each
+\texttt{leader} announcement it hears, and the serving coordinator republishes that
+announcement every 30 seconds. A coordinator that restarts and wins again converges without
+anyone asking a question.
+
+This is the asymmetry worth noticing, and \cref{sec:station-failures} states it in one line:
+claims are recovered by \emph{asking}, because the stations own them, and suspensions by
+\emph{pushing}, because nobody in the cluster does. State is recovered from whoever owns it,
+in whichever direction that turns out to be.
+
+\paragraph{What happens when the bridge fails.} No coordinator reachable at start-up means
+retries every three seconds, and pages that show an empty list with a warning: a stale list
+presented as current would be worse than none. A coordinator dying while Tomcat runs leaves
+the last snapshot in memory, marked stale after 90 seconds. Tomcat dying leaves the cluster
+untouched, because the back office sits on the path of no reservation and no session.
