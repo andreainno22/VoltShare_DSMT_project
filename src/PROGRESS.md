@@ -4056,6 +4056,30 @@ interni aggiornati», e quello era l'unico esterno — trovato cercandolo, non p
 
 ---
 
+## 7zp. §8: i due alberi di supervisione disegnati, e il criterio dietro le tre strategie — 4 settembre
+
+`sec:supervision` elencava i tre supervisori con la loro strategia, ma non li **mostrava**: dal
+solo elenco non si vede che la stazione ne annida due (`vs_connector_sup` è figlio di
+`vs_station_sup`) mentre il coordinatore ne ha uno solo, e non si vede che l'ordine di
+dichiarazione dei figli di `vs_coord_sup` *è* l'ordine delle dipendenze. Aggiunto un listato coi
+due alberi affiancati (`lst:suptrees`).
+
+Aggiunto anche il criterio che sta sotto la scelta delle tre strategie, implicito nei tre casi ma
+mai enunciato: **riparte con te chi ha memorizzato un riferimento al tuo stato**. `vs_coord_bo`
+pubblica quello che tiene `vs_coord_srv`, quindi un server riavviato lo lascia con in mano una
+tabella che non c'è più; i connettori non memorizzano niente del manager, lo trovano per nome
+registrato e il manager li riadotta, e `one_for_one` basta. È lo stesso principio per cui
+`vs_cp_proto` rifà `lookup_pid/1` a ogni evento invece di tenersi il pid.
+
+`vs_ping` **non compare nel listato**, pur essendo ancora il primo figlio di `vs_station_sup`:
+è la sonda di M0, disarmata il 3 settembre (§7zm) togliendo `PING_TARGET` dal compose, e nel
+diagramma non aggiunge niente a un discorso che parla di strategie e dipendenze. La divergenza
+è consapevole e vale la pena saperla all'orale: nel codice i figli della stazione sono cinque,
+nel disegno quattro. Se un giorno la child spec sparisce davvero, il documento è già allineato.
+
+Documento a 26 pagine, compila pulito. `style-lint` non segnala niente di nuovo: il WARN su
+`rather than` è preesistente e sparso su tutta la sezione.
+
 ## 9. Prossimo passo
 
 **Le quattro milestone di codice sono chiuse su entrambi i lati** e verificate in Docker. Il
