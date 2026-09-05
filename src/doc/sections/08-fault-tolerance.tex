@@ -251,6 +251,26 @@ Each supervision strategy encodes a claim about dependencies between processes,
 and the three supervisors in this system make three different claims. Choosing
 between them is a design decision of the same kind as the ones above.
 
+\begin{lstlisting}[caption={The two supervision trees. The station nests a second
+                   supervisor inside the first; the coordinator does not.},
+                   label={lst:suptrees}]
+vs_station_sup                      one_for_one
+  +-- vs_connector_sup              simple_one_for_one
+  |     +-- vs_connector            connector 1   started at boot by
+  |     +-- vs_connector            connector 2   vs_station_mgr, one
+  |     +-- vs_connector            connector N   per physical connector
+  +-- vs_station_mgr
+  +-- vs_claim_client
+  +-- vs_station_db
+
+vs_coord_sup                        rest_for_one
+  +-- vs_coord_srv                  claim table, cluster map
+  +-- vs_coord_bo                   JInterface bridge to the back office
+  +-- vs_coord_election             bully election
+  +-- vs_coord_membership           heartbeat and quorum
+      declaration order is dependency order
+\end{lstlisting}
+
 \begin{itemize}
   \item \texttt{vs\_coord\_sup} uses \texttt{rest\_for\_one}. The children are
         started in dependency order, so restarting one restarts everything
@@ -265,6 +285,13 @@ between them is a design decision of the same kind as the ones above.
         one per connector, and a connector that terminates normally stays
         terminated.
 \end{itemize}
+
+Underneath the three sits a single question: which processes have stored a
+reference to another's state? The bridge publishes what \texttt{vs\_coord\_srv}
+holds, so a restarted server leaves it with a handle on a table that is gone, and
+it has to restart as well. Connectors store nothing about the station manager.
+They look it up by registered name each time, and a manager that comes back
+re-adopts them, which is why \texttt{one\_for\_one} costs nothing there.
 
 Two defects found while reviewing this code show that supervision only works if
 the rest of the code cooperates, and both were failures of supervision rather
