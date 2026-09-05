@@ -4080,6 +4080,136 @@ nel disegno quattro. Se un giorno la child spec sparisce davvero, il documento �
 Documento a 26 pagine, compila pulito. `style-lint` non segnala niente di nuovo: il WARN su
 `rather than` è preesistente e sparso su tutta la sezione.
 
+---
+
+## 7zq. Relazione, la mia parte: §9.2 e §9.3 scritte — 4 settembre
+
+Prime due sezioni mie della relazione, nell'ordine che B aveva consigliato nella nota
+(`contracts/nota-per-A-doc.md` §8): i due canali WebSocket, perché sono i più meccanici e i più
+lunghi da mettere in tabella. Le due skill di B (`.claude/skills/tech-report-latex` e
+`voltshare-doc`) sono installate e seguite; il nome del progetto resta **VoltShare**.
+
+**Da dove vengono i fatti.** `ws-driver.md` e `ws-chargepoint.md` per la specifica, poi il codice
+per ogni numero e ogni comportamento: `vs_driver_proto.erl` (cache 64/60 s consultata prima del
+dispatch, `cacheable/1` che esclude lo `state`, i nove codici, il `call_connector/1` con gli 8 s
+del caso peggiore), `vs_driver_ws.erl` (tick 5 s con il ping, idle 60 s, il filtro delle
+notifiche nella testa di clausola), `vs_cp_proto.erl` (handshake 4404 solo permanente, boot
+`accepted: false` con le due `reason`, `max_kw` obbligatorio, `charging_seconds` opzionale, il
+reattach 5 x 500 ms che chiude 1012), `vs_cp_ws.erl` (idle = 2 x 30 s, il `stop(station_shutdown)`
+prima del 1001), `vs_connector.erl` (`max(stored, reported)`, le sei ragioni di `stop`),
+`cp.js` e `ws.js` per i backoff (1 s → 30 s; 500 ms → 10 s).
+
+**Due divergenze contratto/codice trovate scrivendo**, entrambe risolte a favore del codice:
+`NOT_YOUR_TURN` è in `ws-driver.md` §6 ma non ha un percorso che lo produca (la waitlist non
+esiste), quindi nel documento i codici sono nove e non dieci; la tabella §4.2 di
+`ws-chargepoint.md` dice `charging | closing` per il rifiuto del `plugged`, il codice rifiuta
+anche `complete` (commento in `authorise/5`), e nel documento c'è la terna.
+
+**Le misure citate**, con la fonte: 12,042 kWh in una riga da 23 s (§7v, 28/08, la prova
+dell'offset che ha fatto nascere `charging_seconds`); 34,795 → 34,812 kWh attraverso `docker
+kill station2` (DEMO.md, 3/09), che è la riconciliazione §6 vista dal vivo.
+
+**Il conto delle pagine non torna, e va detto a B.** Il budget era 2 pagine per §9.2+§9.3;
+sono **3,3** dopo due passate di taglio (da 21 400 a 18 000 caratteri), con quattro tabelle. Ma
+§9.1 di B è 1,7 pagine su un budget condiviso di 2 con §9.4 e §9.5, e §9 intera è a **~8
+pagine su 4**. Il documento è a **30 pagine** con §2, §3, §6, §10, §11, §12 ancora segnaposto
+(10,5 pagine di budget): la proiezione è **~40**, sopra il tetto di 35. Da decidere insieme
+nella revisione incrociata dove tagliare; io propongo di tenere le tabelle e tagliare la prosa
+di raccordo in §9, e di stare stretti su §2 e §11.
+
+**Lint e compilazione.** `style-lint.py` su `09-api-specification.tex`: 0 FAIL, SD 14,7, un
+solo `neg_appositive` (di B). Nessun em dash, nessun participio in coda, quattro parallelismi
+negativi tolti in rilettura (tre erano miei). `latexmk`: zero riferimenti indefiniti, nessun
+overfull sopra i 10 pt dopo `\allowbreak` nell'URL del charge point e `sloppypar` sull'elenco
+delle notifiche.
+
+### Secondo giro, stesso giorno: figure, scelte in evidenza, §2, §3, §6, §12
+
+**Figure.** Tre, tutte in TikZ nel sorgente (niente PNG, niente file esterni; `main.tex` ha
+`\usepackage{tikz}` + `positioning`): la sequenza della prenotazione con claim, retry dalla
+cache e rifiuto del coordinatore (§9.2, `fig:seq-reserve`, quella che la nota di B chiedeva);
+la sessione sul canale charge point con la seconda auto che arriva e il limite 150 → 130 di
+`station2` del 28/08 (§9.3, `fig:seq-cp`); la macchina a stati del connettore (§3,
+`fig:connector-states`), ricavata dal diagramma ASCII in testa a `vs_connector.erl`. Il
+diagramma di deployment resta lo `\stub{figure: ...}` di B in §4.2; §11 avrà bisogno di
+screenshot della demo, che si fanno con Docker acceso.
+
+**Scelte progettuali in evidenza.** Ogni sottosezione di §9 mia chiude con un blocco
+`\paragraph{Decisions on this channel.}`: scelta in grassetto, alternativa, motivo (cinque
+per il canale driver, sette per il charge point). §6 ha la scelta del browser che parla
+*direttamente* alla stazione e non passa da Tomcat, con l'alternativa scartata e il prezzo
+(la seconda autenticazione), e la regola «one writer per table» dello schema.
+
+**§2** (2 pagine): tabella attori, requisiti funzionali e non con `\cref` alla sezione che li
+soddisfa, e un paragrafo che dichiara i tre requisiti *non* consegnati (waiting list,
+modifica/cancellazione profilo, filtri della lista). **§3** (1,5 pagine): le regole nell'ordine
+in cui un driver le incontra, la macchina a stati, e la tabella dei parametri con default e
+valori demo, tutti verificati (`LEASE_SECONDS` 900/90, `CLAIM_GRACE_SECONDS` 60/30,
+`OVERSTAY_GRACE_SECONDS` 300/20, `PENALTY_NO_SHOWS` 2, `PENALTY_DAYS` 1, `MIN_CHARGE_KW` 6,
+`tariff_cents_min_overstay` 50, `BILLING_SWEEP_SECONDS` 60/10, budget 350→200 e 180).
+**§6** (1,5 pagine): tabella degli archi (protocollo, chi apre, cosa porta), client-facing e
+internal come BlackNet. **§12** (1 pagina): quattro estensioni con il motivo del rinvio, e il
+log replicato dichiarato *fuori* lista con il 2,29 s del failover misurato.
+
+**Verifiche fatte scrivendo:** `ProfileServlet` è in sola lettura (nessun `doPost`), nessun
+filtro in `stations.jsp`, nessun refresh token (la sessione è `HttpSession` + JWT da 60 min):
+lo SCOPE §3.1 prometteva «access/refresh tokens» e il documento dice quello che c'è. La
+revoca del claim viaggia nella risposta al `renew`, il coordinatore non chiama la stazione
+(`vs_coord_srv.erl:752`); il coordinatore indirizza `{vs_claim_client, Node}`
+(`vs_coord_rebuild.erl:100`).
+
+**`DESIGN-NOTES.md` §9** riscritto da «decisioni aperte» a «decisioni chiuse»: nome VoltShare
+confermato (come proposto da B), emulatore in Node.js, fair share con hand-back, waitlist
+fuori scope, due stazioni.
+
+**Conto pagine:** 36 con §4.2-figura, §10 e §11 ancora segnaposto (stima finale ~40). Le mie
+sono nel budget salvo §9.2+9.3 (3,5 con le figure su 2). Da tagliare in revisione incrociata,
+e i candidati sono la prosa di raccordo in §9 e §7/§8 di B.
+
+**Lint:** 0 FAIL su tutte e sei le sezioni; SD 22,5 / 12,1 / 10,6 / 15,2 / 17,1.
+`latexmk`: zero riferimenti indefiniti, nessun overfull sopra i 10 pt.
+
+### Terzo giro, 5 settembre: §10, §11, la figura di deployment, e la lista dei tagli
+
+Demo e compose congelati, quindi **§10** (1,7 pp.) e **§11** (2 pp.) scritte. Tutto dal
+`docker-compose.yml` e dai file di `deploy/`, non dalla memoria: sette container su **una
+rete** sola (la seconda rete per sito del 3/09 è raccontata come esperimento smentito dalla
+misura, com'è nei commenti del compose); OTP pinnato a 29.0.5 e il `catch Expr` che il
+disallineamento nascondeva; healthcheck a 60 tentativi per il primo boot da sei minuti;
+`start-node.sh` al posto di una release; colonnine sull'host e non nel compose. §11: **395**
+test EUnit (`EXPECTED_TESTS`) con la storia dei tre modi di rompere la suite a «0 failures»;
+il carico del 28/08 in tabella (500 driver, 1 accettata, 100 ms max); la mappa scene →
+problemi della demo con la data in cui ogni scena è stata vista; i quattro difetti del 3/09
+trovati guardando, con la suite verde a 386.
+
+**Figura di deployment fatta in TikZ e messa in §4.2 al posto dello `\stub` di B**: sette
+container, il browser e gli emulatori sull'host, il protocollo su ogni arco, il gruppo dei
+coordinatori. B, se preferisci la tua da draw.io, sostituisci la `figure` con
+`\includegraphics`: la label `fig:deployment` è già citata da §4.2 e §10.
+
+**`\stub` rimosso da `main.tex`**, come da regola: nessun segnaposto resta, e un residuo
+non compilerebbe. Aggiunto `\usetikzlibrary{positioning}`.
+
+**Seconda passata di taglio sulle mie sezioni**: via i doppioni con §3/§7/§8 (decisioni
+di §9 da 5+7 a 4+5, «one network» e «images» in §10 accorciate, Ranch e l'intro di §11).
+
+**Stato: 39 pagine, tetto 35.** La decisione su cosa levare è in **`doc/TAGLI.md`**:
+sezione per sezione cosa dice, quanto pesa all'esame, cosa si può togliere e quanto rende,
+con tre menu (−4,1 solo prosa; −5,5 consigliato; −8 aggressivo) e la lista di ciò che non
+si tocca. Le righe A le eseguo io a menu deciso; le righe B sono sue.
+
+**Rilettura finale sul PDF** (passata 1 e 3 della skill, sulle mie sezioni): tre frasi
+rimaste nella forma vecchia dopo un taglio abortito (§9.2 ping, §9.3 silence, §11 i quattro
+difetti) rimesse a posto; «outlet» → «connector» in §11 (glossario); la tabella del claim di
+B (§9.4) da `[t]` a `[h]`, perché finiva in cima alla pagina in mezzo alla mia lista di
+decisioni.
+
+**Lint:** 0 FAIL su dodici sezioni, tutte le mie a «ok»; 3 WARN in sezioni di B (tricolon
+in §1 e §4, `rather than` ×8 in §8). `latexmk`: zero riferimenti
+indefiniti, zero overfull sopra i 10 pt.
+
+---
+
 ## 9. Prossimo passo
 
 **Le quattro milestone di codice sono chiuse su entrambi i lati** e verificate in Docker. Il

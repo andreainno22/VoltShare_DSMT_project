@@ -1,8 +1,106 @@
 \section{Domain Rules}
 \label{sec:domain-rules}
 
-\stub{1.5 pages. The rules the system enforces, needed to follow the sections that
-come after: reservation under a lease, no-show and suspension, session
-authorisation against the reservation, overstay and grace period, power sharing
-within the site budget, tariffs. Sources: SCOPE §3.3--3.6. Keep it short: these
-are rules, not discussion. The equivalent of BlackNet's "Game Rules".}
+These are the rules the system enforces, in the order a driver meets them. They are what
+the later sections implement, so they are stated here without discussion. Every number is
+configuration; \cref{tab:params} gives the defaults and the shorter values used for the
+demonstration. Nothing in the demonstration profile scales a clock.
+
+\paragraph{Reservation and lease.} A reservation is for one connector at one station and
+holds it for \texttt{LEASE\_SECONDS}, 15 minutes by default. When the lease runs out with
+nobody plugged in, the connector frees itself: no operator, no client. Two minutes before
+the end the driver is warned, when the lease is long enough for a warning to mean
+anything. A reservation is only ever granted after the coordinator has
+issued a \textbf{claim} for the vehicle (\cref{sec:p2}); the claim is what makes the
+network-wide rule hold, one vehicle, one reservation, and it outlives the reservation by
+\texttt{CLAIM\_GRACE\_SECONDS} so that it never expires underneath one that is still alive.
+
+\paragraph{No-show and suspension.} Turning up resets the counter. After
+\texttt{PENALTY\_NO\_SHOWS} consecutive expired reservations (two) the account loses the
+right to reserve for \texttt{PENALTY\_DAYS} (one). The suspension is on the account, so a
+second vehicle does not escape it, and it suspends reserving only: a suspended driver can
+still walk in and charge on a free connector. It is enforced where the reservation already
+passes, at claim time, by the coordinator. A missed reservation costs no money.
+
+\paragraph{Authorisation.} A session starts when the charge point reports a cable, and
+only then. On a held connector the vehicle has to be the one that reserved; any other is
+refused and the reservation stays. On a free connector any registered vehicle starts a
+walk-in session, with no claim involved. Identification is by vehicle: the account is
+resolved from it on the station, which is why an isolated station cannot start a new
+session (\cref{sec:station-failures}).
+
+\paragraph{End of charge, grace, overstay.} A session ends when the driver stops it, when
+the battery reaches 100\%, or when the coordinator revokes the claim. The cable is still in
+the car at that point, and the connector stays occupied. For \texttt{OVERSTAY\_GRACE\_SECONDS}
+(five minutes) that costs nothing; from the first second after it the connector is
+\texttt{overstay} and every started minute is charged at the station's overstay rate. The
+overstay is the one charge in the system that is a deterrent, and it is the only thing the
+software can do about a parked car: no timer moves one, so the system notices, tells the
+driver, and makes waiting expensive.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[>=stealth, font=\footnotesize, x=1cm, y=1cm,
+  st/.style={draw, rounded corners=2pt, minimum height=0.6cm, minimum width=1.9cm, font=\footnotesize\ttfamily},
+  ev/.style={font=\scriptsize, fill=white, inner sep=1.5pt, align=center}]
+  \node[st] (free) at (0,0) {free};
+  \node[st] (held) at (4.4,0) {held};
+  \node[st] (charging) at (8.8,0) {charging};
+  \node[st] (complete) at (8.8,-3.6) {complete};
+  \node[st] (closing) at (4.4,-3.6) {closing};
+  \node[st] (oos) at (0,-3.6) {out\_of\_service};
+  \draw[->] (free) -- node[ev, above] {reserve, claim granted} (held);
+  \draw[->] (held) -- node[ev, above] {plugged, reserved vehicle} (charging);
+  \draw[->] (held) to[bend left=25] node[ev, below] {cancel, lease expired,\\ claim revoked} (free);
+  \draw[->] (free) to[bend left=32] node[ev, above] {plugged on a free connector: walk-in} (charging);
+  \draw[->] (charging) -- node[ev, right] {stop, battery full,\\ claim revoked} (complete);
+  \draw[->] (complete) -- node[ev, above] {unplugged} (closing);
+  \draw[->] (charging) -- node[ev, sloped, above, pos=0.6] {unplugged} (closing);
+  \draw[->] (closing) -- node[ev, sloped, above, pos=0.35] {row written} (free);
+  \draw[->] (free) to[bend right=38] node[ev, left] {charge point faulted,\\ or silent past\\ the grace} (oos);
+  \draw[->] (oos) -- node[ev, right, pos=0.45] {boots available} (free);
+\end{tikzpicture}
+\caption{The connector's states, one \texttt{gen\_statem} per connector.
+\texttt{overstay} is \texttt{complete} past the grace and \texttt{suspended} is
+\texttt{charging} at a limit of zero; both are derived and reported to drivers as states of
+their own. The fault arc leaves every state and is drawn once; \texttt{closing} returns to
+\texttt{free} once the session row is written and the claim released.}
+\label{fig:connector-states}
+\end{figure}
+
+\paragraph{Power.} A site has a budget lower than the sum of its connectors' ratings. The
+budget is split among the active sessions by \emph{max-min fair share with hand-back}
+(\cref{sec:p5}): every session starts from an equal share, a car that cannot absorb its
+share hands the surplus back, and the surplus is split again. The split is recomputed on
+every arrival, every departure and every tick, and each charge point is told its limit. A
+session whose share would fall below \texttt{MIN\_CHARGE\_KW} (6~kW) is \texttt{suspended}
+instead: alive, drawing nothing, and told so.
+
+\paragraph{Tariff and billing.} Each station has a tariff in cents per kWh and an overstay
+rate in cents per minute. A session's cost is energy at the tariff plus the overstay
+minutes, rounded up to the started minute; it is computed by the back office after the
+session row has been written, on a periodic sweep, so billing is never a contended
+resource. A driver reads the cost in the history page.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{The parameters behind the rules. All are environment variables read at start-up;
+the demonstration profile is \texttt{deploy/.env.demo}.}
+\label{tab:params}
+\begin{tabularx}{\textwidth}{@{}l r r X@{}}
+\toprule
+Parameter & Default & Demo & Meaning \\
+\midrule
+\texttt{LEASE\_SECONDS} & 900 & 90 & reservation lease \\
+\texttt{CLAIM\_GRACE\_SECONDS} & 60 & 30 & how long a claim outlives its reservation \\
+\texttt{PENALTY\_NO\_SHOWS} & 2 & 2 & consecutive no-shows that suspend the account \\
+\texttt{PENALTY\_DAYS} & 1 & 1 & length of the suspension \\
+\texttt{OVERSTAY\_GRACE\_SECONDS} & 300 & 20 & free time after the end of the charge \\
+\texttt{tariff\_cents\_min\_overstay} & 50 & 50 & overstay rate, per station, in the database \\
+\texttt{MIN\_CHARGE\_KW} & 6 & 6 & below this a session is suspended \\
+\texttt{SITE\_POWER\_KW} & 350 / 180 & 200 / 180 & site budget of the two stations \\
+\texttt{BILLING\_SWEEP\_SECONDS} & 60 & 10 & how often closed sessions are priced \\
+\bottomrule
+\end{tabularx}
+\end{table}

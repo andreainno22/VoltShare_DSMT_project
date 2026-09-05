@@ -1,8 +1,40 @@
 \section{Future Works}
 \label{sec:future}
 
-\stub{1 page. Site power shared across stations on the same grid connection;
-partitioning the vehicle space across coordinators; operator dashboard with the
-ability to take connectors out of service; native push notifications, which the
-overstay notice needs. Short and honest: these are things not done, not promises.
-Sources: SCOPE §10, DESIGN-NOTES §7.}
+Four extensions were identified while the system was being built. None of them is started,
+and each is listed with the reason it was set aside.
+
+\paragraph{Site power shared across stations.} Today the budget of \cref{sec:p5} is
+coordinated inside one station. Two stations on the same grid connection would share one
+budget, which is a divisible quantity to be lent and returned between nodes: a lease over a
+continuous value, where the leases of this document are over exclusive resources. It is the
+natural next problem for the coordinator, and it was left out because it would have added a
+second network-wide invariant before the first one was demonstrably safe under failover.
+
+\paragraph{Partitioning the vehicle space across coordinators.} Each claim would be
+decided by the node responsible for a hash of the vehicle identifier, so no node would see
+all the traffic and a failure would block one shard. \Cref{sec:p2} explains why it was rejected for now: every node must
+agree on the partition map, the map must be rebalanced when membership changes, and each
+shard still needs the election and quorum this project already has. The extension composes
+with the current design instead of replacing it, and that is the order to build it in.
+
+\paragraph{The waiting list.} Specified in \cref{sec:functional} and absent from the
+delivered system. It needs a per-station queue with an owner, an offer that is itself a
+lease (the same mechanism that stops a no-show from freezing a connector would stop an
+absent waiter from freezing the queue), and a seventh notification kind that the driver
+channel already names. The protocol side is in place: \texttt{join\_waitlist} is answered
+as an unknown action until a process exists to answer it.
+
+\paragraph{Native push notifications, and an operator console.} The overstay notice reaches
+a driver who is looking at the page or who reopens the application later; there is no
+mobile push. The grace period therefore assumes an attentive driver, which is a limitation
+of the client channel and of nothing in the coordination logic. On the operator side the
+back office is read-only: taking a connector out of service by hand, or pricing by demand,
+would be commands from the web tier into the cluster, a direction the JInterface bridge
+already carries for suspensions.
+
+What is deliberately not on this list is a replicated log between coordinators. The rebuild
+of \cref{sec:rebuild} costs a few seconds of refused reservations after a failover (a new
+leader was serving 2.29~s after a partition of the old one, \cref{sec:detectors}); a log
+would remove that window at the price of a replication protocol, which is a larger system to
+get right than the one that was asked for.
