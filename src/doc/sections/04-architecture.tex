@@ -154,9 +154,51 @@ MySQL & MySQL 8.0 & durable state \\
 \end{tabularx}
 \end{table}
 
-\stub{figure: deployment diagram. Seven boxes, the protocol on each edge (HTTP, two
-WebSocket channels, distributed Erlang, JInterface, JDBC and mysql-otp), the Docker network.
-Export as PDF from draw.io into figures/ and reference it here.}
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[>=stealth, font=\footnotesize, x=1cm, y=1cm,
+  nd/.style={draw, rounded corners=2pt, align=center, minimum height=0.7cm, inner sep=3pt},
+  host/.style={nd, fill=black!4},
+  edge/.style={semithick},
+  lab/.style={font=\scriptsize, fill=white, inner sep=1.5pt, align=center}]
+  % the one Docker network
+  \draw[black!45, dashed, rounded corners=4pt] (1.2,-4.35) rectangle (15.5,1.45);
+  \node[font=\scriptsize\itshape, text=black!55, anchor=south east] at (15.4,-4.33)
+    {Docker bridge network \texttt{voltshare}: one host, seven containers};
+  % nodes
+  \node[host] (browser) at (2.5,3.2) {browser\\ \scriptsize on the host};
+  \node[host] (emu) at (12.4,3.2) {charge point emulators\\ \scriptsize \texttt{cp.js}, one per connector, on the host};
+  \node[nd] (bo) at (2.5,0.5) {back office\\ \scriptsize Tomcat 10.1, hidden node \texttt{voltshare\_bo}};
+  \node[nd] (st1) at (9.0,0.5) {station1\\ \scriptsize \texttt{vs@station1}, 4 connectors};
+  \node[nd] (st2) at (13.4,0.5) {station2\\ \scriptsize \texttt{vs@station2}, 3 connectors};
+  \node[nd] (db) at (5.6,-2.4) {MySQL 8.0};
+  \node[nd] (c1) at (9.6,-2.4) {\texttt{vs@coord1}};
+  \node[nd] (c2) at (11.8,-2.4) {\texttt{vs@coord2}};
+  \node[nd] (c3) at (14.0,-2.4) {\texttt{vs@coord3}};
+  \draw[black!45, dotted, rounded corners=3pt] (8.5,-3.05) rectangle (15.1,-1.75);
+  \node[font=\scriptsize\itshape, text=black!55, anchor=north east] at (15.05,-3.05)
+    {coordinators: one leader, quorum 2 of 3};
+  % client-facing edges
+  \draw[edge, <->] (browser) -- node[lab, right] {HTTP :8080} (bo);
+  \draw[edge, <->] (browser.south east) -- node[lab, above, sloped, pos=0.42] {WebSocket :9101, :9102} (st1.north west);
+  \draw[edge, <->] (browser.east) -- (st2.north west);
+  \draw[edge, <->] (emu.south west) -- (st1.north east);
+  \draw[edge, <->] (emu.south) -- node[lab, left, pos=0.5] {WebSocket :9201, :9202} (st2.north);
+  % internal edges
+  \draw[edge, <->] (bo) -- node[lab, above, sloped] {JDBC} (db);
+  \draw[edge, ->] (st1.south west) -- node[lab, below, sloped, pos=0.55] {\texttt{mysql-otp}} (db.north east);
+  \draw[edge, <->] (st1.south) -- node[lab, right, pos=0.45] {distributed Erlang} (c2.north west);
+  \draw[edge, <->] (st2.south) -- (c2.north east);
+  \draw[edge, <->, rounded corners=3pt] (bo.south) |- (2.5,-3.85) -| node[lab, above, pos=0.25] {JInterface} (c2.south);
+\end{tikzpicture}
+\caption{The delivered deployment: seven containers on one Docker bridge network, and the
+protocol on each edge. Both stations write to MySQL through \texttt{mysql-otp}; one edge is
+drawn. The browser and the emulated hardware run on the host and reach the containers
+through published ports.}
+\label{fig:deployment}
+\end{figure}
+
+\Cref{fig:deployment} places the seven nodes on the one network they share.
 
 \paragraph{Back office (Java, Tomcat).} Renders every page server-side and owns everything
 durable. It authenticates the driver, mints the JWT that the station will verify on its own,

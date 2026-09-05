@@ -8,6 +8,8 @@
 
 \usepackage[a4paper,margin=2.7cm]{geometry}
 \usepackage{graphicx}
+\usepackage{tikz}                      % sequence diagrams (09) and the connector state machine (03)
+\usetikzlibrary{positioning}
 \usepackage{booktabs}
 \usepackage{tabularx}
 \usepackage{enumitem}
@@ -52,11 +54,8 @@
      {]}{{{\color{codekw}]}}}{1},
 }
 
-% Marca una sezione non ancora scritta. Va tolto il comando, non solo le
-% occorrenze, prima della consegna: se \stub non esiste piu', un residuo
-% non compila invece di passare inosservato.
-\newcommand{\stub}[1]{%
-  \par\medskip\noindent{\color{stubgray}\itshape [to be written --- #1]}\par\medskip}
+% \stub was the placeholder for unwritten sections; removed on 5 September, when the
+% last one was written, so that a residue fails to compile instead of being printed.
 
 \title{VoltShare}
 \author{}

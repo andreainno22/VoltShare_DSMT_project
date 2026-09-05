@@ -1,9 +1,89 @@
 \section{Architecture Protocols}
 \label{sec:protocols}
 
-\stub{1.5 pages. Which protocol runs on which edge and why that one, split into
-client-facing and internal as BlackNet does. HTTP browser to back office;
-WebSocket browser to station; WebSocket/JSON charge point to station; distributed
-Erlang station to coordinator; JInterface back office to coordinator; SQL to
-MySQL. Overview only: the message sets are specified in \cref{sec:api}.
-Sources: SCOPE §6, contracts/.}
+Six edges join the seven nodes of \cref{sec:components} and the browser, and no two of
+them carry the same protocol. \Cref{tab:edges} is the map; the reasons for the three
+middleware choices are argued in \cref{sec:why-middleware}, and the messages on each edge
+are specified in \cref{sec:api}. What this section adds is the shape of the map: which
+party opens each connection, which way authority flows, and what was deliberately kept off
+an edge.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{The edges of the system. ``Opened by'' is the side that dials.}
+\label{tab:edges}
+\begin{tabularx}{\textwidth}{@{}l l l X@{}}
+\toprule
+Edge & Protocol & Opened by & Carries \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Client-facing}} \\
+browser $\leftrightarrow$ back office & HTTP & browser & forms and server-rendered pages;
+  login session in \texttt{HttpSession} \\
+browser $\leftrightarrow$ station & WebSocket, JSON & browser & reserve, cancel, stop; the
+  station snapshot and the live session, pushed \\
+charge point $\leftrightarrow$ station & WebSocket, JSON & charge point & cable and meter
+  reports up, power limits and stop commands down; reduced OCPP 1.6-J \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Internal}} \\
+station $\leftrightarrow$ coordinator & distributed Erlang & station & claims, renewals,
+  announcements, statistics; node monitoring in both directions \\
+back office $\leftrightarrow$ coordinator & JInterface & back office & the station
+  directory and the leader, pushed; suspensions, pushed back \\
+station, back office $\to$ MySQL & SQL & each & one \texttt{INSERT} per closed session
+  from the station (\texttt{mysql-otp}); everything else from Java (JDBC) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Client-facing edges}
+\label{sec:protocols-client}
+
+The browser talks to two servers, and that is the first decision on this map. Pages come
+from the back office over HTTP, rendered by servlets and JSP (\cref{sec:ssr}); everything
+that happens at a station, reserving, watching a charge, stopping it, goes over a WebSocket
+opened \emph{directly to the station node}. The alternative was to route driver traffic
+through Tomcat, which would have kept one origin and one authentication scheme. We rejected
+it because it puts the web tier on the path of every reservation and every live frame: a
+Tomcat restart would have blanked every charging page in the network, and the station could
+no longer keep a site working while the back office is down. The price is a second
+authentication: the back office mints a JWT, the station verifies it locally and never
+calls back (\cref{sec:api-jwt}).
+
+The charge point has an edge of its own, kept apart from the driver's on purpose. Driver
+and hardware are two parties that must never be confused: one asks and the other reports.
+Matching a reported cable against a reservation is the station's job
+(\cref{sec:domain-rules}). The charge point dials the station, one socket per connector, as
+real equipment dials an operator's backend from behind a site network; the station never
+dials hardware. WebSocket with JSON on this edge is what OCPP itself uses, so the emulator
+speaks a subset of a real protocol (\cref{sec:api-ws-cp}).
+
+\subsection{Internal edges}
+\label{sec:protocols-internal}
+
+Between Erlang nodes the protocol is distributed Erlang. A station addresses the
+coordinator as \texttt{\{vs\_coord\_srv, Node\}} and the coordinator addresses a station as
+\texttt{\{vs\_claim\_client, Node\}}, registered names on both sides, so nobody holds an
+address; the same connection carries \texttt{nodedown}, so a crashed peer becomes a message
+in a mailbox (\cref{sec:detectors}). The direction of the edge is fixed: stations call and the
+coordinator answers; a revocation travels in the reply to the next renewal. The
+coordinator is never on the path of a charge, which is what lets a coordination outage cost
+only new reservations (\cref{sec:api-claim}).
+
+The back office joins the same cluster as a hidden Erlang node through JInterface. It
+receives the station directory and the identity of the leader as they change, and it pushes
+suspensions back; no page of the web tier ever asks the cluster a question at request time
+(\cref{sec:api-bridge}). Being hidden means it takes no part in the quorum: the web tier
+must never influence who leads.
+
+MySQL is reached from two runtimes, and the rule that makes that safe is written at the top
+of \texttt{schema.sql}: \textbf{one writer per table}. The station writes one row, the
+closed session, through \texttt{mysql-otp} (it also reads the vehicle-to-account mapping).
+Java owns the other tables (users, vehicles, notifications) and the cost of a session
+after the fact. The no-show counter lives in
+\texttt{users} and is written by Java alone: a station reports the no-show to the
+coordinator, which relays it. A counter incremented from several nodes would have been a
+second contended object, and the schema forbids it.
+
+What is kept off the internal edges is as telling as what travels on them: no replicated
+log between the coordinators (\cref{sec:rebuild}), and no station talking to another.

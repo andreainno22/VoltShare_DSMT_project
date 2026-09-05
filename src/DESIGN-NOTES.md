@@ -413,14 +413,16 @@ Useful for the oral exam, and for showing the material is actually being used.
 
 ---
 
-## 9. Minor decisions still open
+## 9. Minor decisions, now closed
 
-- Project name (`VoltShare` is a placeholder).
-- Language for the charge-point emulator: Erlang reuses the JSON codec and message definitions and adds no toolchain; Python would be quicker to write but is a third language in the build.
-- Power allocation policy: fair share, proportional to demand, or reservation-holders first; plus the minimum viable power below which a session is suspended rather than starved.
-- Real parameters: lease duration, site budget, connector ratings, tariffs, grace period before overstay.
-- Whether the waiting list (§3.3) stays in scope.
-- Number of stations to deploy for the demonstration (two is enough to show cross-node claims; three looks better).
+All settled by 4 September; kept here so the history of the choice is not lost.
+
+- Project name: **VoltShare**, confirmed. It is in the code, the containers and the database.
+- Language for the charge-point emulator: **Node.js** (`emulator/cp.js`), together with the driver load generator (`emulator/driver.js`). One toolchain for both test tools, and no Erlang in the part that stands for hardware.
+- Power allocation policy: **max-min fair share with hand-back**, with `MIN_CHARGE_KW` (6 kW) as the floor below which a session is suspended. Reasons in `vs_power.erl` and in the report, §7.5.
+- Real parameters: defaults and demo values are tabled in the report, §3 (`LEASE_SECONDS` 900/90, `OVERSTAY_GRACE_SECONDS` 300/20, `CLAIM_GRACE_SECONDS` 60/30, penalty 2 no-shows / 1 day, site budgets 350→200 and 180 kW).
+- Waiting list (§3.3): **out of the delivered scope**, recorded as future work in the report, §12. `join_waitlist` is answered `BAD_REQUEST`.
+- Stations in the demonstration: **two**, enough to show cross-node claims and a partition of one site.
 
 ---
 

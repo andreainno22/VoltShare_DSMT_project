@@ -1,9 +1,139 @@
 \section{Testing and Demonstration}
 \label{sec:testing}
 
-\stub{2 pages. What is tested automatically (EUnit, scripts/eunit\_check.sh, with
-the expected test count) and what is shown live. The scenarios are in DEMO.md:
-contention on one connector, cross-node claim, no-show, power sharing in real
-time, coordinator failover, station crash, station partition. For each one: what
-appears on screen and which problem of \cref{sec:problems} it demonstrates. That
-mapping is what turns a demo into evidence.}
+Three kinds of evidence: a unit suite that runs without the cluster, a load test against
+the deployed containers, and a demonstration in which every scene maps to one problem of
+\cref{sec:problems}.
+
+\subsection{Automated tests}
+\label{sec:tests-unit}
+
+\begin{sloppypar}
+The Erlang suite is 395 EUnit tests over the three applications, run by
+\texttt{scripts/eunit\_check.sh}. Most of them exercise the station:
+\texttt{vs\_connector\_tests} drives the state machine of \cref{fig:connector-states}
+through every arc, including the reconciliation of a \texttt{plugged} that arrives after a
+restart; \texttt{vs\_power\_tests} checks the fair share, the hand-back and the floor;
+\texttt{vs\_driver\_proto\_tests} and \texttt{vs\_cp\_proto\_tests} check the two contracts
+of \cref{sec:api} frame by frame; \texttt{vs\_claim\_client\_tests} covers the walk over the
+coordinator list and the renewals. On the coordinator side
+\texttt{vs\_coord\_membership\_tests} and \texttt{vs\_coord\_rebuild\_tests} cover the
+quorum arithmetic and the rebuild, including the empty rebuild of \cref{sec:rebuild}.
+\end{sloppypar}
+
+None of these tests starts Cowboy, a coordinator or MySQL. The collaborators of every
+module are injected as module names (\texttt{claim\_mod}, \texttt{db\_mod},
+\texttt{conn\_mod}), and the suite substitutes stubs, \texttt{vs\_claim\_stub},
+\texttt{vs\_db\_stub}, \texttt{vs\_cp\_stub}; the two protocol modules are pure functions
+over a session map, which is why the WebSocket handlers hold no logic of their own
+(\cref{sec:api-ws-driver}). Integration against a real coordinator uses
+\texttt{vs\_mock\_coord}, a minimal coordinator that grants and refuses claims without an
+election; it is a test tool outside the delivered system. On the Java side,
+\texttt{BillingServiceTest} and \texttt{JwtUtilTest} are 14 unit tests on the pricing
+arithmetic and the token; three integration tests need a database and a cluster.
+
+\texttt{eunit\_check.sh} asserts the test count as well as the absence of failures. Three
+ways of breaking the suite on purpose, a fixture that raises, an exit in a test process, a
+generator that raises, all printed ``0 failures'' with 307, 299 and 286 tests: the total is
+how far EUnit got in enumerating the tree, and a run can lose two dozen tests while
+reporting success. The script therefore requires the summary to read exactly ``395 tests,
+0 failures'', and updating the number is part of adding a test.
+
+\subsection{Load}
+\label{sec:tests-load}
+
+\texttt{emulator/driver.js} opens $N$ WebSocket connections with $N$ signed tokens and
+fires the same action from all of them in the same instant. Measured on 28 August, on the
+five-node deployment that preceded the replicated coordinator, from the host.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{Contention on one free connector: $N$ drivers, $N$ vehicles, one \texttt{reserve}
+each at the same instant.}
+\label{tab:load}
+\begin{tabularx}{\textwidth}{@{}r r r l r r X@{}}
+\toprule
+Drivers & Accepted & Refused & Code & Max & Mean & \\
+\midrule
+20 & 1 & 19 & \texttt{ALREADY\_HELD} & 21~ms & 16~ms & \\
+50 & 1 & 49 & \texttt{ALREADY\_HELD} & 23~ms & 16~ms & \\
+100 & 1 & 99 & \texttt{ALREADY\_HELD} & 32~ms & 17~ms & \\
+200 & 1 & 199 & \texttt{ALREADY\_HELD} & 68~ms & 33~ms & \\
+500 & 1 & 499 & \texttt{ALREADY\_HELD} & 100~ms & 48~ms & the station reports one
+  \texttt{held} connector, the winner's \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The count closes exactly on every row, $1 + (N-1)$, and the maximum grows roughly linearly
+with $N$, which is the signature of the actor model of \cref{sec:p1}: $N$ requests for one
+connector are $N$ messages in one mailbox, served in order. The same vehicle sent to five
+connectors of two stations at once got one \texttt{ok} and four \texttt{NO\_CLAIM} in 5~ms,
+which is \cref{sec:p2} seen from the client. A sustained run, ten drivers cycling
+\texttt{join}, \texttt{reserve}, \texttt{cancel} on both stations for 150~s while two
+charge points delivered 150 and 50~kW, produced 5620 requests, 2904 accepted, 2716 refused,
+a maximum response of 62~ms, zero connectors left \texttt{held} and zero error reports on
+any node. The limit of Cowboy and Ranch was not reached.
+
+\subsection{The demonstration}
+\label{sec:tests-demo}
+
+One run of eight to ten minutes. Emulated charge points charge in the background on
+\texttt{station2}, the presenter drives a browser and the failure commands, and a second
+person starts the world and pastes the commands that answer the presenter's actions. The
+demonstration profile shortens the leases so that a no-show matures in ninety seconds; no
+clock is scaled. \Cref{tab:demo} is the map from what appears on screen to the problem it
+demonstrates, with the date each scene was first seen working, because nothing is shown for
+the first time in front of the examiner.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{The scenes of the demonstration and the problem each one is evidence for.}
+\label{tab:demo}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.6cm} l X l@{}}
+\toprule
+Scene & Problem & What is seen & Seen \\
+\midrule
+two tabs, one account, \texttt{reserve} on two stations & P2 & the second tab reads
+  \texttt{NO\_CLAIM}: the vehicle already holds a reservation; the coordinator logs the
+  grant and the refusal & 27 Aug \\
+$N$ drivers on one connector (\texttt{driver.js}) & P1 & one accepted, $N-1$
+  \texttt{ALREADY\_HELD}, no lock anywhere & 28 Aug \\
+reserve and never arrive, twice & P3 & \texttt{reservation\_expired} on the page; ``1 of
+  2'', then ``2 of 2, suspended 1 day''; the next \texttt{reserve} is \texttt{SUSPENDED} &
+  2 Sep \\
+a second car plugs in during a charge & P5 & the session page's kilowatts drop and its ETA
+  jumps in one frame & 28 Aug \\
+stay plugged in after the charge & overstay & \texttt{complete} to \texttt{overstay},
+  the counter climbing, then \texttt{1.58~kWh, 10~min, EUR~5.71} in the history & 1 Sep \\
+\texttt{docker network disconnect station2} & P4 & the lobby loses the site and its claims
+  are dropped while the cars keep charging; a new car is refused for want of MySQL &
+  3 Sep \\
+\texttt{docker kill station2} & P4 & sessions lost, no row written; the energy survives in
+  the charge point, 34.795 then 34.812~kWh & 3 Sep \\
+\texttt{docker kill coord3}, the leader, mid-charge & P2b & election in the logs, the charge
+  on screen untouched, \texttt{reserve} refused during the rebuild and accepted after &
+  1 Sep \\
+\texttt{docker network disconnect} on a coordinator & P2b & \texttt{QUORUM LOST (1 of 3)},
+  every \texttt{reserve} refused, the charge continues & 1 Sep \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+P6 and P7 have no scene of their own: they hold by construction across the whole run, and
+a lost frame never desynchronises a page. The crash and the partition of a station are shown
+one after the other on purpose, because they are two failures with two detectors and two
+outcomes, and the difference is the point of \cref{sec:station-failures}.
+
+\paragraph{What the demonstration found.} Rehearsing the whole run on 3 September, with
+the suite green at 386 tests, turned up four defects that no test had seen. The
+coordinator logged twenty-three things and not the one act it exists for, granting or
+refusing a claim, so the central line of the presentation had nothing in the logs to back
+it; two \texttt{logger:notice} calls fixed that. Four log panes, one per service, broke one
+story into pieces, and were replaced by a single time-ordered stream of all seven
+containers. The other two were in the emulated hardware: the world script did not restart a
+charge point that died, and \texttt{cp.js} exited when its car unplugged, so a charge point
+lived as long as one session. Unit tests protect the contracts; only running the system the
+way it will be shown protects the demonstration.

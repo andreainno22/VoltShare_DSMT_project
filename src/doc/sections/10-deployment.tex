@@ -1,9 +1,92 @@
 \section{Deployment}
 \label{sec:deployment}
 
-\stub{2 pages. Seven nodes, the containers, the networks, how the system is
-started. Taken from deploy/docker-compose.yml, not from memory. State precisely
-that the deployment runs on one host with seven Erlang and JVM nodes, and that a
-genuine network partition is produced with \texttt{docker network disconnect}
-rather than with a second machine. Include the per-site networks, which exist to
-make a site partition demonstrable. Sources: deploy/, DEMO.md.}
+The system runs as seven containers on one host, joined by a single Docker bridge network
+(\cref{fig:deployment}). Each container is one node: three coordinators and two stations,
+plus Tomcat and MySQL. The course asks for a system deployed over several \emph{nodes}, and the
+reference project graded before ours ran on one host in the same way. What a single host
+does not give for free is a network partition, a node that is alive and unreachable; that
+is produced here with \texttt{docker network disconnect}, which leaves the container
+running, convinced it is alive, and sending no FIN. It is the failure \texttt{docker kill}
+cannot show, and the reason the coordinators run a heartbeat of their own beside
+\texttt{nodedown} (\cref{sec:detectors}).
+
+\paragraph{Images.} Two. \texttt{Dockerfile.erlang} builds every Erlang application in a
+first stage with \texttt{rebar3} and copies only the compiled \texttt{ebin} directories into
+a runtime stage; the role of a container is the \texttt{ERL\_APP} variable,
+\texttt{vs\_station} or \texttt{vs\_coord}, so stations and coordinators are the same image
+with different environments. The base image is pinned to \texttt{erlang:29.0.5}, the OTP on
+the developers' machines, because \texttt{rebar.config} has \texttt{warnings\_as\_errors} and
+a compiler newer on one side than the other fails the build asymmetrically. The pin found
+a real defect: aligning the image from OTP 26 to 29 surfaced a \texttt{catch Expr} that
+OTP 29 deprecates, which the mismatch had been hiding. The image is Debian, because the
+\texttt{29.0.5-alpine} tag ships only 386 and arm variants and Docker selects the 32-bit
+one silently on an amd64 host. \texttt{Dockerfile.backoffice} builds the WAR with Maven and deploys
+it as \texttt{ROOT} on Tomcat 10.1 (Jakarta EE 10), together with \texttt{epmd}: JInterface
+publishes the hidden node's name on the port mapper of its own host, and a container with
+only Tomcat has none.
+
+\paragraph{Naming and configuration.} Every Erlang node is \texttt{vs@<hostname>}, short
+names, because on a compose network the containers resolve each other by service name and
+long names would buy nothing. The three coordinators share one configuration and differ by
+hostname alone; there is no \texttt{COORD\_ID}, the bully priority being the position of a
+node in the sorted \texttt{COORD\_NODES} list that all of them already hold, so a healthy
+start elects \texttt{coord3}. Everything else is an environment variable with a development
+default (\cref{tab:params}), so the project can be cloned and started with no configuration
+at all, and the demonstration profile in \texttt{.env.demo} overrides the leases and the
+site budget of \texttt{station1}. Secrets are the Erlang cookie and the JWT secret, both
+shared by the nodes that need them and nothing more.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{Published ports. Inside the containers every station listens on 8080 and 8081, so
+the application does not know which station it is; the remapping happens only where the host
+has one port 8080.}
+\label{tab:ports}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+Host port & Container & What it carries \\
+\midrule
+8080 & backoffice & HTTP, the web application \\
+9101, 9102 & station1, station2 & the driver WebSocket (\cref{sec:api-ws-driver}) \\
+9201, 9202 & station1, station2 & the charge point WebSocket (\cref{sec:api-ws-cp}) \\
+3306 & mysql & SQL, for inspection during the demonstration \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Starting it.} From \texttt{src/deploy/}, \texttt{docker compose build} once
+and \texttt{docker compose up -d} afterwards, both with \texttt{.env.demo} as the env file.
+The stations and the back office wait for MySQL's health check, and the check allows sixty
+retries at five seconds, because the first boot on a cold volume measured over six minutes
+on a developer laptop, forty seconds of it InnoDB alone; with the earlier twenty retries the
+check gave up first and the other nodes refused to start against a database that was merely
+slow. The schema is mounted read-only from \texttt{contracts/schema.sql}, so there is one
+copy to change, and the data lives in a named volume that survives \texttt{docker compose
+down}: starting clean is \texttt{down -v}, a deliberate act. The charge points are not in
+the compose file. They are emulated hardware, outside the system boundary of
+\cref{sec:requirements}, and they run on the host with \texttt{emulator/demo/world.sh},
+which supervises one \texttt{cp.js} per connector and restarts one that exits, because a
+charge point that dies takes its connector out of service thirty seconds later.
+
+\paragraph{One network, after trying two.} On 3 September a second network per site was
+added, with the emulators containerised on it, on the premise that disconnecting a station
+from the cluster network also cut its chargers, since the emulators reach the station
+through a published port. Measuring properly showed the premise wrong: a published port
+keeps working while the container is off the bridge, and an emulator on the host went on
+charging through the partition, 0.248 to 0.403 to 0.558~kWh, beside a containerised one at
+14.069 to 14.208. What had looked like proof of the opposite was a reconnect window sampled
+too fast, three readings in six seconds against a five-second meter tick. The second network
+was removed the same day. A partition of a site is demonstrable exactly as it was, and the
+compose file records the experiment so that nobody repeats it.
+
+\paragraph{Decisions.} A container per node. Several \texttt{-sname} nodes on one
+operating system would have been quicker, and it is how the election is tried in
+development, but nodes sharing a filesystem, a network stack and a fate prove nothing about
+isolation, while \texttt{docker kill} on a container is a real failure of a node. A three-line \texttt{start-node.sh} that
+runs \texttt{erl} with \texttt{-sname}, \texttt{-setcookie} and \texttt{-pa} instead of an
+OTP release: a release is the right shape for production, but it adds \texttt{vm.args},
+\texttt{sys.config} and release profiles at the point where the risk to retire was making two
+nodes talk, and the script shows in three lines exactly how a node is named, which is where
+things break.

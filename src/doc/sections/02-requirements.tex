@@ -1,15 +1,103 @@
 \section{Requirements Specification}
 \label{sec:requirements}
 
+VoltShare coordinates three things for a network of electric-vehicle charging stations:
+which vehicle gets which connector, how the electrical capacity of a site is shared among
+the vehicles charging there, and what happens to both when a node fails. Five parties take
+part, and the names in \cref{tab:actors} are used in this exact sense for the rest of the
+document.
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.15}
+\caption{Actors. The charge point is a peer of the system; the browser is a client of it.}
+\label{tab:actors}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+Actor & Role \\
+\midrule
+Driver & a registered user with one vehicle profile; searches, reserves, charges, is billed \\
+Station & a physical site with $N$ connectors and a maximum site power, run by one node \\
+Connector & one physical outlet, the exclusive resource of the system \\
+Charge point & the equipment governing a connector: it reports cable and meter, and obeys
+  power limits. It reaches the system over its own channel, separate from the driver's \\
+Operator & the back office: registry, history, billing. Read-only in this scope \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
 \subsection{Functional requirements}
 \label{sec:functional}
 
-\stub{1.5 pages. Account and vehicle, station discovery, reservation, charging
-session, power allocation, billing and history, notifications. Source: SCOPE §3.
-Bullet lists are legitimate here: the material is genuinely enumerable.}
+\begin{description}[leftmargin=0pt, itemsep=3pt, font=\normalfont\itshape]
+  \item[Account and vehicle.] Registration and login. A vehicle profile with battery
+        capacity (kWh) and maximum charging power (kW); both feed the power allocation. The
+        login session lives in the back office, which also hands the browser a signed token
+        for the station channel (\cref{sec:api-jwt}).
+  \item[Station discovery.] A list of stations, each with its connectors (free, held,
+        charging), its site power and its tariff. The figures reflect the live state of the
+        cluster.
+  \item[Reservation.] A driver reserves a specific connector. The reservation is granted
+        with a \textbf{lease}: a fixed window to plug in, after which the connector is
+        released with no operator action and no cooperation from the client. The driver may
+        cancel early. \emph{A vehicle holds at most one active reservation across the whole
+        network}, even when the driver issues concurrent requests to two stations. Repeated
+        no-shows suspend the right to reserve.
+  \item[Charging session.] The charge point reports a cable; the station authorises the
+        session by matching the connector's reservation, and a walk-in on a free connector
+        is authorised against the driver's account. While charging, the driver's page
+        receives power, energy, state of charge and an estimated completion time by push.
+        The session ends on the driver's command or when the battery is full. A car left
+        plugged in after that occupies the resource without using it: after a grace period
+        the connector is flagged as overstaying and a per-minute charge accrues.
+  \item[Power allocation.] The site power is lower than the sum of the connectors' ratings.
+        It is split among the active sessions and recomputed on every arrival, every
+        departure and on a periodic tick that follows the charging curve. Each session is
+        told its allocation and the driver sees it change. Below a minimum viable power a
+        session is suspended, so that no car is starved.
+  \item[Billing and history.] Cost is computed after a session ends, from energy at the
+        station tariff plus the overstay charge. Per-user history with receipts. A missed
+        reservation costs no money: it costs the privilege.
+  \item[Notifications.] Reservation about to expire, reservation expired, claim revoked,
+        charge complete, overstay started, session interrupted by a failure. Delivered live
+        on the open page and stored for the next visit.
+\end{description}
+
+Three items of the original scope were specified and not delivered, and the sections that
+follow do not pretend otherwise. The \textbf{waiting list} for a full station (join, be
+offered the next free connector under a short lease) needs a per-station queue that no
+process owns; the driver channel answers \texttt{join\_waitlist} as an unknown action
+(\cref{sec:api-ws-driver}). Profile \textbf{editing and account deletion} stop at a
+read-only profile page. Station \textbf{filters} by power and availability were dropped
+from a list that, with two stations, has nothing to filter. All three went unbuilt because
+the time went to the coordination problems of \cref{sec:problems}, which is what the
+project is graded on.
 
 \subsection{Non-functional requirements}
 \label{sec:non-functional}
 
-\stub{1 page. Exclusive use, no resource lost to a failure, station autonomy,
-real time by server push, horizontal growth. Source: SCOPE §4.}
+\begin{description}[leftmargin=0pt, itemsep=3pt, font=\normalfont\itshape]
+  \item[Exclusive use.] A connector serves at most one session at a time, and a vehicle
+        holds at most one reservation network-wide. Neither invariant may be broken by
+        concurrent requests, by a node failure, or by a network partition. This is the
+        requirement the architecture is built around (\cref{sec:p1,sec:p2,sec:p2b}).
+  \item[No resource is lost to a failure.] A crashed station must leave no connector
+        reserved for ever and no driver holding a phantom reservation that blocks them
+        elsewhere. Every hold in the system therefore expires on its own
+        (\cref{sec:p3,sec:station-failures}).
+  \item[Station autonomy.] A station keeps serving the vehicles already plugged in while
+        the rest of the network is unreachable. This is what a site controller does in a
+        real installation, and it was measured on an isolated station
+        (\cref{sec:station-failures}).
+  \item[Real time.] State changes reach connected clients by server push, with no polling
+        anywhere in the system: the browser is pushed a complete snapshot, the back office
+        is pushed the station list, and stations announce themselves to the coordinator
+        (\cref{sec:p6,sec:api-bridge}).
+  \item[Horizontal growth.] Adding a station means adding a node, with no change to the
+        existing ones: a station announces itself to the coordinator at start-up and the
+        directory follows (\cref{sec:api-claim}).
+\end{description}
+
+Out of scope from the start: real payment processing (billing produces records, with no
+provider behind them), full OCPP compliance, maps and routing, a native mobile application,
+and plug-and-charge authentication (ISO 15118).
