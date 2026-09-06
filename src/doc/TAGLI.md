@@ -4,7 +4,7 @@
 > §10, §11, §12 tagliate di doppioni e prosa di raccordo, in due passate (via la seconda
 > figura di §9.3, la tabella dei frame di §9.2, quella del `plugged` e quella delle porte);
 > indice in una pagina. Le sezioni di B sono intatte: le righe B qui sotto restano la
-> proposta per lui. Dettaglio in `PROGRESS.md` §7zr.
+> proposta per lui. Dettaglio in `PROGRESS.md` §7zs.
 
 
 Stato: **39 pagine** (37 di corpo, più frontespizio e indice), tutte le dodici sezioni
@@ -84,3 +84,33 @@ la sua prosa dice *perché* ogni problema è difficile, che la tabella non dice.
 Le righe **A** le taglio io appena decidi il menu. Le righe **B** sono sue: gli passo
 questo file com'è. La revisione incrociata parte dopo, sul documento già alla lunghezza
 giusta, altrimenti si rilegge prosa destinata a sparire.
+
+## Stato delle righe B — 5 settembre
+
+Fatte, menu minimo più due voci del consigliato. **39 → 38 pagine**, −658 parole. Il PDF
+scende di una sola pagina perché le sezioni non ricominciano dove finisce la prosa tolta:
+il grosso della resa si vede quando anche le righe A sono applicate.
+
+| voce | prima → dopo | nota |
+|---|---|---|
+| §1.3 + §1.4 | 207 → 106 | **non tolte del tutto**: due paragrafi senza titolo in coda a §1.2, con `\cref` a `sec:boundary` e a `sec:no-tolerance`. Il perimetro reale/emulato resta in prima pagina, che è dove un docente lo cerca |
+| §4.1 volatile/durable | 236 → 196 | il blocco su Mnesia non è toccato: è un'alternativa scartata |
+| §5.1 prosa | 225 → 129 | tabella invariata; resta la conseguenza sulla mutua esclusione per veicolo, che è materia d'esame |
+| §5.5 | 199 → 154 | |
+| §7 testa | 110 → 40 | **non era in lista**: il paragrafo introduttivo di §7 ripeteva §5.1 quasi parola per parola, scenario delle due schede compreso. Ora rimanda con `\cref{sec:two-exclusions}` |
+| §7.1 | 214 → 165 | |
+| §7.5 P5 | 495 → 435 | entrambe le alternative scartate intatte |
+| §7.6 P6 | 226 → 185 | |
+| §8.2 detectors | 393 → 350 | misure del 1/09 intatte |
+| §8.4 «hole» | 300 → 228 | i tre numeri (272 ms, 13.65 s, 2000/10000 ms) intatti |
+| §8.6 supervisione | 428 → 300 | l'elenco dei tre supervisori è fuso col criterio del riferimento: il listato `lst:suptrees` diceva già la struttura, la prosa la ripeteva |
+| §8.8 | 226 → 180 | |
+| §9.1 XSS | 139 → 105 | |
+| §9.4 behavioural rules | 91 → 72 | da `enumerate` a prosa: in pagina rende più delle parole, sei item erano dieci righe |
+
+Non toccate, per scelta: §7.3 e §7.4 (sono le due sottosezioni più lunghe di §7, ma la
+prosa di raccordo lì è poca e il resto è meccanismo), §9.5 «detail that cost a day»
+(sessanta parole già, e sono un limite ammesso).
+
+`style-lint`: nessun FAIL, burstiness sopra soglia in tutti e sei i file, una terzina in
+meno in §8. I WARN su `rather than` sono preesistenti.

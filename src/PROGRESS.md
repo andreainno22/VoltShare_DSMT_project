@@ -4210,7 +4210,45 @@ indefiniti, zero overfull sopra i 10 pt.
 
 ---
 
-## 7zr. Relazione: passata di taglio sulle sezioni di A, 39 → 36 pagine — 6 settembre
+## 7zr. I tagli sulle sezioni di B: 39 → 38 pagine, −658 parole — 5 settembre
+
+A ha consegnato la sua metà della relazione e con essa `doc/TAGLI.md`, l'analisi di cosa
+pesa e cosa si può togliere per rientrare nelle 35 pagine concordate. Prima di applicarla
+l'ho verificata: le **39 pagine** sono giuste (ricompilato), la duplicazione fra §12 e §8.4
+sul log replicato c'è davvero, ma i **conteggi di parole sono sistematicamente bassi del
+10-25%** (§8.2 è 393 e non 350, §5.1 è 225 e non 190, §8.8 è 226 e non 188). L'errore è
+nella direzione innocua: le rese in pagina sono sottostimate, quindi applicando i target si
+taglia più di quanto la tabella prometta.
+
+Due dati che in `TAGLI.md` non c'erano e che cambiano la lettura. Primo, la **ripartizione
+del testo**: le mie sezioni sono 10 874 parole, quelle di A 6 479, cioè il 62% contro il
+38% — i tagli chiesti a me sono proporzionati, non sbilanciati. Secondo, **§8.6 era stato
+misurato prima del merge** dei due alberi di supervisione (§7zp), quindi «da 309 a 200»
+partiva da un testo che nel frattempo era diventato di 428 parole.
+
+Fatte tutte le righe B del menu minimo più due del consigliato; il dettaglio voce per voce
+è in coda a `doc/TAGLI.md`. Due decisioni che si discostano dalla lista:
+
+- **§1.3 non è sparita**, è diventata due paragrafi senza titolo in coda a §1.2. Toglierla
+  del tutto avrebbe spostato a pagina nove l'unico punto in cui diciamo cosa *non* abbiamo
+  costruito, ed è la prima cosa che un docente cerca.
+- **§8.6 si è accorciata togliendo l'elenco dei tre supervisori**, non il listato: la figura
+  dice già annidamento, strategia e ordine di dipendenza, e la prosa lo ripeteva. Il criterio
+  del riferimento («riparte con te chi ha memorizzato un riferimento al tuo stato») è ora la
+  spiegazione unica di tutte e tre le strategie invece di un paragrafo a parte.
+
+Il taglio più grosso non era in lista: **il paragrafo introduttivo di §7 ripeteva §5.1 quasi
+parola per parola**, scenario delle due schede del browser compreso. Centodieci parole
+diventate un `\cref`.
+
+Nessun fatto perso: le misure del 1/09 e del 3/09, i tre numeri del buco di §8.4, tutte le
+alternative scartate di §7.5 e il blocco su Mnesia di §4.1 sono intatti. `style-lint` non dà
+FAIL, la burstiness resta sopra soglia in tutti e sei i file e §8 ha una terzina in meno.
+Restano da applicare le righe A: con quelle si arriva alle 35.
+
+---
+
+## 7zs. Relazione: passata di taglio sulle sezioni di A, 39 → 36 pagine — 6 settembre
 
 Caleb ha letto la relazione di BlackNet e ha chiesto di togliere tutto ciò che è ininfluente
 o già detto altrove. Prima passata su tutto il documento (39 → 32), poi la sua correzione:

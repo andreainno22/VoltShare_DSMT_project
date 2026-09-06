@@ -1,10 +1,10 @@
 \section{System Architecture}
 \label{sec:architecture}
 
-\subsection{Key design decisions}
+\subsection{Design decisions}
 \label{sec:design-decisions}
 
-Five decisions shaped the system, and each is given here with the alternative we discarded
+We present five decisions that shaped the system and some alternatives are discarded
 and the reason. The sixth and largest, how the network-wide uniqueness of a reservation is
 enforced, belongs with the problem it answers and is in \cref{sec:p2}.
 
@@ -29,37 +29,28 @@ station list from the coordinator and to push suspensions to it. The two runtime
 memory, no type system and no object model, so something has to translate. JInterface lets
 the JVM join the Erlang cluster as a \emph{hidden node}: it speaks the same distribution
 protocol, it is addressable by node name, and it exchanges the same terms the Erlang side
-already sends. The discarded alternative was a REST endpoint on the Tomcat side that the
-coordinator would call. It would have worked and it would have inverted the direction of
-control: the cluster would depend on the availability of the web tier to report its own
-state, and a restart of Tomcat would leave the coordinator retrying HTTP requests instead of
-doing its job.
+already sends.
 
 \paragraph{Towards browsers and charge points: WebSocket.} A charging page is open for the
 length of a charge, and the power allocated to a car changes every few seconds. The server
 has to speak first, which HTTP request-response does not allow, and polling at the frequency
-the data changes would be both late and expensive. Cowboy terminates these connections
-inside the station node itself, so a state change in a connector process reaches the socket
-process without leaving the node.
+the data changes would be both late and expensive. These sockets do not end at Tomcat:
+Cowboy, the Erlang web server, runs inside the station node and pushes each new charging
+state straight to the browser, where a script renders it into the page Tomcat had served.
 
 \subsubsection{Server-side rendering, with real time only where it moves}
 \label{sec:ssr}
 
-The web front end is servlets plus JSP, rendered on the server. The browser holds no
-application state of its own except in two views, the station page and the live session,
-which are driven entirely by their WebSocket.
+The web front end is servlets plus JSP. A servlet gathers what a page needs, a JSP turns it
+into HTML, and what leaves Tomcat is a finished document. The browser draws it and keeps no
+application state of its own: every fresh view is a fresh request.
 
-We considered a single-page application, which is the obvious modern choice and is what the
-reference project for this course used. We set it aside for two reasons. The pages that list
-stations, sessions and notifications are read-mostly and change on a human timescale, so
-drawing them in a client application costs more code for a result the servlet already
-produces. And the course recommends the basic Java web technologies, which is a legitimate
-constraint on a university project even where a different choice would be defensible in
-industry.
-
-The consequence to be honest about: server-side rendering cannot push, so anything that has
-to update by itself needs the WebSocket. We did not spread that across the whole front end.
-Two pages have it, and they are the two where a value on screen goes stale in seconds.
+What that costs is the ability to push. A page is produced when it is asked for, so a value
+that changes on its own is seen again only on a reload. Most pages lose nothing by it, since
+they change when a person does something. Two views are different: the station page and the
+live session, where the allocated power and the delivered energy move every few seconds while
+the driver is watching. Those two open the WebSocket of \cref{sec:api-ws-driver}, and the
+script writes the moving values into a page the server had rendered.
 
 \subsubsection{Coordination separated from the sites}
 \label{sec:split}
@@ -84,54 +75,36 @@ with a station cut off from the cluster.
 \subsubsection{Volatile state in memory, durable state in MySQL}
 \label{sec:state-split}
 
-Two kinds of state, in two places, on purpose.
+Two kinds of state, in two places, on purpose. Coordination state (who holds which
+connector, what each session is drawing, how far a battery has come) lives in the state of
+the Erlang processes that own it: it changes several times a second per connector, it is
+worthless once the thing it describes is over, and the hardware can rebuild it on
+reconnection. Durable state (accounts, vehicles, completed sessions, invoices) lives in
+MySQL, which is what the back office reads to draw its pages.
 
-Coordination state (who holds which connector, what each session is drawing right now, how
-far a battery has come) lives in the memory of the Erlang processes that own it. It changes
-several times a second per connector, it is worthless once the thing it describes is over,
-and it can be rebuilt from the hardware on reconnection. Durable state (accounts, vehicles,
-completed sessions, invoices) lives in MySQL, which is also what the back office reads to
-draw its pages.
-
-The rule that follows is the one worth defending: \textbf{nothing on the interactive path
-reads the database.} Granting a claim, allocating power, pushing a new state to a browser:
-none of these issues a SQL query, so a database that is slow or briefly unavailable does not
-stop cars from charging. The exception is authorising a \emph{new} session, which has to resolve
-a vehicle to its owner, and \cref{sec:station-failures} describes what happens to an
-isolated site because of it.
-
-We did not use Mnesia. It would have given us replicated tables inside the Erlang cluster,
-and the reference project's documentation describes exactly that. Our coordination state is
-derived from what the stations already hold authoritatively, so replicating it would mean
-maintaining a second copy of something that can simply be asked for. The argument is in
-\cref{sec:rebuild}.
+Nothing on the interactive path (granting a claim, allocating power) reads the database, so a database that is slow or briefly away does not stop
+cars from charging. The exception is authorising a \emph{new} session, which has to resolve
+a vehicle to its owner, and \cref{sec:station-failures} describes what that costs an
+isolated site.
 
 \subsubsection{Where the system stops, and what an emulator stands in for}
 \label{sec:boundary}
 
 What we built is the coordination backend and its clients, which in industry terms is a
-charging-station management system together with its site controllers. What cannot exist in
-a university project is the hardware: the outlet, its contactor, its energy meter and the
-car attached to it.
+charging-station management system together with its site controllers. The outlet, its contactor, its energy meter and the car attached to it are emulated.
 
 The boundary is placed where a real interface already exists. Charge points talk to
-management systems over OCPP, an open protocol carried on WebSocket with JSON payloads,
-whose message set already covers what we need: status notifications, meter values,
+management systems over OCPP~\cite{ocpp16j}, an open protocol carried on WebSocket with JSON payloads,
+whose message set covers status notifications, meter values,
 reservations with an expiry, and charging profiles that cap the power of a connector. Our
-charge-point channel implements a \textbf{reduced message set modelled on OCPP 1.6-J}, and
-we make no claim of compliance with the full specification.
-
-What this buys is worth stating plainly: replacing the emulator with real equipment means
-replacing a client that speaks that protocol. Everything on the coordination side, which is
-the entire subject of this project, is the logic that would ship.
+charge-point channel implements a \textbf{reduced message set modelled on OCPP 1.6-J}.
 
 \subsection{Architectural components}
 \label{sec:components}
 
-The delivered deployment is \textbf{seven nodes}, each a container on one host.
-\Cref{tab:nodes} lists them. A single host is a deliberate limit and is discussed in
-\cref{sec:deployment}: the course requirement is several \emph{nodes}, and a genuine network
-partition is produced here by detaching a container from the Docker network.
+The delivered deployment is \textbf{seven nodes}, each a Docker container on one host.
+\Cref{tab:nodes} lists them.
+\Cref{fig:deployment} places the seven nodes on the one network they share.
 
 \begin{table}[t]
 \centering\small
@@ -198,28 +171,21 @@ through published ports.}
 \label{fig:deployment}
 \end{figure}
 
-\Cref{fig:deployment} places the seven nodes on the one network they share.
 
 \paragraph{Back office (Java, Tomcat).} Renders every page server-side and owns everything
 durable. It authenticates the driver, mints the JWT that the station will verify on its own,
 prices closed sessions, and applies the no-show suspensions. It also joins the Erlang
-cluster as a hidden node through JInterface, which is how it learns the live station list
-without polling the cluster: \texttt{StationDirectory} keeps that list in memory and every
-page read is served from there. A lobby refresh therefore never reaches a coordinator.
+cluster as a hidden node through JInterface. The leader pushes the station list to it
+whenever something visible changes, and at least every 30 seconds.
 
 \paragraph{Coordinator (Erlang/OTP, three instances).} One of them leads and the other two
-stand by; they are peers of equal capability, and calling them backups would suggest a
-passive copy of state that does not exist. The leader grants and refuses claims, keeps the
-map of which stations are up, and pushes station state towards the back office. Its
-supervision tree uses \texttt{rest\_for\_one} because its children are in dependency order,
-which \cref{sec:supervision} explains. The three configured node names are the same on every
-node (\texttt{vs@coord1}, \texttt{vs@coord2}, \texttt{vs@coord3}), which is what makes both
-the election and the quorum arithmetic well defined.
+stand by. The leader grants and refuses claims and keeps the map of which stations are up;
+how the other two take over when it goes is \cref{sec:p2b}.
 
 \paragraph{Station (Erlang/OTP with Cowboy, two instances).} Each station runs one
 \texttt{gen\_statem} per connector, a manager that arbitrates them and allocates the site
 power, and two WebSocket endpoints, one for drivers and one for charge points. The two
-stations of the delivered deployment are configured differently on purpose:
+stations of the delivered deployment are configured differently:
 
 \begin{itemize}
   \item \texttt{station1}: four connectors rated 150, 150, 150 and 50~kW, on a site budget
@@ -228,16 +194,14 @@ stations of the delivered deployment are configured differently on purpose:
   \item \texttt{station2}: three connectors rated 150, 50 and 50~kW, on 180~kW.
 \end{itemize}
 
-Both sites are oversubscribed, which is the point. Four connectors that can draw 500~kW
+Both sites are oversubscribed like in a real scenario. Four connectors that can draw 500~kW
 between them sit behind a 350~kW connection, so the moment three fast chargers are busy the
 station has to apportion rather than serve, which is P5 in \cref{sec:p5}.
 
 \paragraph{MySQL.} One instance, holding accounts, vehicles, reservations that completed,
 sessions, invoices and notifications. It is a single point of failure for durable data and
-we declare it as one in \cref{sec:no-tolerance}, together with the list of things that keep
-working without it.
+we declare it as one in \cref{sec:no-tolerance}.
 
 \paragraph{The browser is not a node.} Pages arrive rendered, and the only state a browser
-holds is what its WebSocket has just pushed into the two live views. This matters for the
-failure analysis: there is no client-side cache to reconcile after a reconnection, so a page
+holds is what its WebSocket has just pushed into the two live views so there is no client-side cache to reconcile after a reconnection, so a page
 that comes back gets a complete snapshot and is immediately correct.
