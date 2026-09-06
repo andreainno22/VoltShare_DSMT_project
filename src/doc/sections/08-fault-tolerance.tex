@@ -190,7 +190,7 @@ out of reach for this project. This choice leads some limitations:
 \textbf{Sessions on a dead station are lost}, as \cref{sec:station-failures}
 describes. The process that was metering them is gone.
 
-\textbf{The rebuild can still miss a station that is unreachable at exactly the
+\textbf{The rebuild of the claim table can still miss a station that is unreachable at exactly the
 wrong moment.} Its claims are absent from the new leader's table, so one of its
 vehicles could obtain a second claim before the conflict is noticed. The window
 is narrow and it is real, and it closes when the station returns and re-presents
