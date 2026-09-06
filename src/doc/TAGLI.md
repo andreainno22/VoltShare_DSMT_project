@@ -1,5 +1,12 @@
 # Cosa dice la relazione, cosa pesa, cosa si può tagliare — 5 settembre
 
+> **Eseguito il 6 settembre sulle sezioni di A: 39 → 35 pagine.** §2, §3, §6, §9.2, §9.3,
+> §10, §11, §12 tagliate di doppioni e prosa di raccordo, in due passate (via la seconda
+> figura di §9.3, la tabella dei frame di §9.2, quella del `plugged` e quella delle porte);
+> indice in una pagina. Le sezioni di B sono intatte: le righe B qui sotto restano la
+> proposta per lui. Dettaglio in `PROGRESS.md` §7zr.
+
+
 Stato: **39 pagine** (37 di corpo, più frontespizio e indice), tutte le dodici sezioni
 scritte, nessun segnaposto. Tetto concordato: **35**. Da togliere: **almeno 4 pagine**.
 

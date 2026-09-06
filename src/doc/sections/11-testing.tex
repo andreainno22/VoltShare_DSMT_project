@@ -8,36 +8,22 @@ the deployed containers, and a demonstration in which every scene maps to one pr
 \subsection{Automated tests}
 \label{sec:tests-unit}
 
-\begin{sloppypar}
 The Erlang suite is 395 EUnit tests over the three applications, run by
-\texttt{scripts/eunit\_check.sh}. Most of them exercise the station:
-\texttt{vs\_connector\_tests} drives the state machine of \cref{fig:connector-states}
-through every arc, including the reconciliation of a \texttt{plugged} that arrives after a
-restart; \texttt{vs\_power\_tests} checks the fair share, the hand-back and the floor;
-\texttt{vs\_driver\_proto\_tests} and \texttt{vs\_cp\_proto\_tests} check the two contracts
-of \cref{sec:api} frame by frame; \texttt{vs\_claim\_client\_tests} covers the walk over the
-coordinator list and the renewals. On the coordinator side
-\texttt{vs\_coord\_membership\_tests} and \texttt{vs\_coord\_rebuild\_tests} cover the
-quorum arithmetic and the rebuild, including the empty rebuild of \cref{sec:rebuild}.
-\end{sloppypar}
+\texttt{scripts/eunit\_check.sh}; most of them drive the connector state machine of
+\cref{fig:connector-states}, the power allocation and the two protocol modules. None of
+them starts Cowboy, a coordinator or MySQL: the collaborators of every module are injected
+as module names (\texttt{claim\_mod}, \texttt{db\_mod}, \texttt{conn\_mod}) and the suite
+substitutes stubs, and the two protocol modules are pure functions over a session map
+(\cref{sec:api-ws-driver}). Integration against a coordinator uses
+\texttt{vs\_mock\_coord}, a test tool outside the delivered system. On the Java side there
+are 14 unit tests on the pricing arithmetic and the token, and three integration tests that
+need a database and a cluster.
 
-None of these tests starts Cowboy, a coordinator or MySQL. The collaborators of every
-module are injected as module names (\texttt{claim\_mod}, \texttt{db\_mod},
-\texttt{conn\_mod}), and the suite substitutes stubs, \texttt{vs\_claim\_stub},
-\texttt{vs\_db\_stub}, \texttt{vs\_cp\_stub}; the two protocol modules are pure functions
-over a session map, which is why the WebSocket handlers hold no logic of their own
-(\cref{sec:api-ws-driver}). Integration against a real coordinator uses
-\texttt{vs\_mock\_coord}, a minimal coordinator that grants and refuses claims without an
-election; it is a test tool outside the delivered system. On the Java side,
-\texttt{BillingServiceTest} and \texttt{JwtUtilTest} are 14 unit tests on the pricing
-arithmetic and the token; three integration tests need a database and a cluster.
-
-\texttt{eunit\_check.sh} asserts the test count as well as the absence of failures. Three
-ways of breaking the suite on purpose, a fixture that raises, an exit in a test process, a
-generator that raises, all printed ``0 failures'' with 307, 299 and 286 tests: the total is
-how far EUnit got in enumerating the tree, and a run can lose two dozen tests while
-reporting success. The script therefore requires the summary to read exactly ``395 tests,
-0 failures'', and updating the number is part of adding a test.
+\texttt{eunit\_check.sh} asserts the test count as well as the absence of failures: three
+ways of breaking the suite on purpose all printed ``0 failures'' with 307, 299 and 286
+tests, because the total is how far EUnit got in enumerating the tree. The script requires
+the summary to read exactly ``395 tests, 0 failures'', and updating the number is part of
+adding a test.
 
 \subsection{Load}
 \label{sec:tests-load}
@@ -66,26 +52,22 @@ Drivers & Accepted & Refused & Code & Max & Mean & \\
 \end{tabularx}
 \end{table}
 
-The count closes exactly on every row, $1 + (N-1)$, and the maximum grows roughly linearly
-with $N$, which is the signature of the actor model of \cref{sec:p1}: $N$ requests for one
-connector are $N$ messages in one mailbox, served in order. The same vehicle sent to five
-connectors of two stations at once got one \texttt{ok} and four \texttt{NO\_CLAIM} in 5~ms,
-which is \cref{sec:p2} seen from the client. A sustained run, ten drivers cycling
+The count closes exactly on every row and the maximum grows roughly linearly with $N$,
+the signature of $N$ messages in one mailbox served in order (\cref{sec:p1}). The same
+vehicle sent to five connectors of two stations at once got one \texttt{ok} and four
+\texttt{NO\_CLAIM} in 5~ms (\cref{sec:p2}). A sustained run, ten drivers cycling
 \texttt{join}, \texttt{reserve}, \texttt{cancel} on both stations for 150~s while two
-charge points delivered 150 and 50~kW, produced 5620 requests, 2904 accepted, 2716 refused,
-a maximum response of 62~ms, zero connectors left \texttt{held} and zero error reports on
-any node. The limit of Cowboy and Ranch was not reached.
+charge points delivered, produced 5620 requests, 2904 accepted, 2716 refused, a maximum
+response of 62~ms, zero connectors left \texttt{held} and zero error reports on any node.
 
 \subsection{The demonstration}
 \label{sec:tests-demo}
 
-One run of eight to ten minutes. Emulated charge points charge in the background on
-\texttt{station2}, the presenter drives a browser and the failure commands, and a second
-person starts the world and pastes the commands that answer the presenter's actions. The
-demonstration profile shortens the leases so that a no-show matures in ninety seconds; no
-clock is scaled. \Cref{tab:demo} is the map from what appears on screen to the problem it
-demonstrates, with the date each scene was first seen working, because nothing is shown for
-the first time in front of the examiner.
+One run of eight to ten minutes: emulated charge points charge in the background, the
+presenter drives a browser and the failure commands, and a second person pastes the
+commands that answer the presenter's actions. \Cref{tab:demo} maps what appears on screen
+to the problem it demonstrates, with the date each scene was first seen working, because
+nothing is shown for the first time in front of the examiner.
 
 \begin{table}[h]
 \centering\small
@@ -122,18 +104,14 @@ stay plugged in after the charge & overstay & \texttt{complete} to \texttt{overs
 \end{tabularx}
 \end{table}
 
-P6 and P7 have no scene of their own: they hold by construction across the whole run, and
-a lost frame never desynchronises a page. The crash and the partition of a station are shown
-one after the other on purpose, because they are two failures with two detectors and two
-outcomes, and the difference is the point of \cref{sec:station-failures}.
+P6 and P7 have no scene of their own: they hold by construction across the whole run. The
+crash and the partition of a station are shown one after the other on purpose, because they
+are two failures with two detectors and two outcomes (\cref{sec:station-failures}).
 
 \paragraph{What the demonstration found.} Rehearsing the whole run on 3 September, with
-the suite green at 386 tests, turned up four defects that no test had seen. The
-coordinator logged twenty-three things and not the one act it exists for, granting or
-refusing a claim, so the central line of the presentation had nothing in the logs to back
-it; two \texttt{logger:notice} calls fixed that. Four log panes, one per service, broke one
-story into pieces, and were replaced by a single time-ordered stream of all seven
-containers. The other two were in the emulated hardware: the world script did not restart a
-charge point that died, and \texttt{cp.js} exited when its car unplugged, so a charge point
-lived as long as one session. Unit tests protect the contracts; only running the system the
-way it will be shown protects the demonstration.
+the suite green at 386 tests, turned up four defects no test had seen: the coordinator
+logged twenty-three things and not the one act it exists for, granting or refusing a claim;
+four log panes broke one story into pieces and became one time-ordered stream; and in the
+emulated hardware, the world script did not restart a charge point that died, and
+\texttt{cp.js} exited when its car unplugged. Unit tests protect the contracts; only running
+the system the way it will be shown protects the demonstration.

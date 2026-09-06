@@ -4210,6 +4210,50 @@ indefiniti, zero overfull sopra i 10 pt.
 
 ---
 
+## 7zr. Relazione: passata di taglio sulle sezioni di A, 39 → 36 pagine — 6 settembre
+
+Caleb ha letto la relazione di BlackNet e ha chiesto di togliere tutto ciò che è ininfluente
+o già detto altrove. Prima passata su tutto il documento (39 → 32), poi la sua correzione:
+**solo la parte di A, quella di B non si tocca**. Le sezioni di B sono state riportate al
+testo di `4a380ea`, identiche; le proposte per lui restano in `doc/TAGLI.md` (righe B).
+
+**Tagli fatti sulle sezioni di A** (si toglie, non si aggiunge; nessun fatto o misura è
+sparito):
+
+- **§2**: liste funzionali strette; via il paragrafo «due parti, due canali» (è in §6) e il
+  «out of scope» a una frase.
+- **§3**: intro, overstay e billing accorciati.
+- **§6**: intro, charge point, JInterface e MySQL accorciati; via «Both WebSocket edges
+  terminate in Cowboy» (è in §4.1) e la chiusura ridotta a una frase.
+- **§9.2**: tabella dei frame → prosa in un paragrafo; decisioni da 4 a 3 (la «session rides
+  on the state tick» è nella prosa).
+- **§9.3**: via la figura della sessione con la seconda auto (`fig:seq-cp`, la meno
+  necessaria delle quattro) e la tabella del `plugged` (→ prosa); riconciliazione e decisioni
+  strette.
+- **§10**: immagini, naming, avvio, «one network» e decisioni accorciati (il compose e i
+  numeri restano).
+- **§11**: intro, stub, `eunit_check`, carico, demo e «found» accorciati; tabelle intatte.
+- **§12**: i quattro paragrafi stretti.
+- **`main.tex`**: indice in `\footnotesize` con `tocdepth` 2, così sta in una pagina invece di
+  sbordare di tre righe sulla terza. È l'unica cosa fuori dalle mie sezioni: reversibile in
+  una riga se B preferisce l'indice grande.
+
+**Seconda passata sulle mie, su scelta di Caleb fra dodici proposte** (le sette a resa
+migliore): via l'inventario delle suite in §11.1 (resta 395 + iniezione + `eunit_check`);
+la tabella delle porte di §10 in una frase (sono già sugli archi della figura); le decisioni
+di §9.3 da 5 a 3 (via «one socket per connector» e «4404/1012», già dette nel testo);
+«Images» e «One network» di §10 a tre frasi; gli indirizzi Erlang in §6.2 (sono §9.4);
+§12 senza il paragrafo sul log replicato (è §8.4). Le cinque scartate (campi dei frame,
+riconciliazione, ragioni di `stop`, «found», decisioni §9.2) iniziano a limare la specifica.
+
+**Conto:** 35 pagine (frontespizio + indice + 33 di corpo). §9 resta 7,5 pagine, di cui
+4,5 di B. Le righe B di `TAGLI.md` valgono altre −3 pagine se lui le accetta.
+
+`style-lint`: 0 FAIL, tutte le mie sezioni «ok»; `latexmk`: zero riferimenti indefiniti,
+zero overfull sopra i 10 pt.
+
+---
+
 ## 9. Prossimo passo
 
 **Le quattro milestone di codice sono chiuse su entrambi i lati** e verificate in Docker. Il
