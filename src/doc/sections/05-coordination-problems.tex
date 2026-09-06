@@ -3,17 +3,15 @@
 
 This section states the problems the project set out to solve. The mechanisms that answer
 them are in \cref{sec:addressing}, and the ones that answer failures are in
-\cref{sec:fault-tolerance}; here we say only what is hard and why, because a problem
-described together with its solution is a problem the reader cannot weigh.
+\cref{sec:fault-tolerance}.
 
-Seven of them are numbered P1 to P7 and are referred to by those names throughout the
+Six of them are numbered P1 to P6 and are referred to by those names throughout the
 document.
 
-\subsection{The dividing line: one station, or the network}
+\subsection{The two exclusions in the system}
 \label{sec:two-exclusions}
 
-Two resources in this system are exclusive, and telling them apart is what shapes every
-decision that follows.
+Two resources in this system are exclusive:
 
 \begin{table}[h]
 \centering\small
@@ -30,22 +28,11 @@ P2 & the vehicle & stations, among themselves & across nodes \\
 \end{tabularx}
 \end{table}
 
-A connector belongs to exactly one station, always. No other node in the network can grant
-it, so the station can decide alone and no remote agreement is needed. The vehicle is the
-only entity in the system that can appear at two stations at the same time: the driver opens
-two browser tabs and presses \emph{reserve} on both. Each station checks its own connector,
-finds it free, and grants. Both stations were locally correct, both respected P1, and the
-network-wide guarantee is broken. Neither of them can detect this alone, because the fact
-that would reveal it is held by neither.
-
-\textbf{The connector is stationary and belongs to a node; the vehicle moves and belongs to
-the network.} The first exclusion is settled in-house. The second is not, and it is the
-reason this project has a coordination problem at all.
-
-One consequence deserves stating early, because it decided which algorithm we could use. The
-mutual-exclusion algorithms in the syllabus assume a single critical section. Here there is
-one per vehicle, and they are independent: two reservations for two different vehicles have
-no reason to wait for each other.
+A connector belongs to exactly one station, so the station decides alone. The vehicle instead, could appear at two stations at the same time, since the driver could open two browser
+tabs and presses \emph{reserve} on both, each station finds its own connector free and
+grants, and neither can detect the breach, because the fact that would reveal it is held by
+neither. The second exclusion is the reason this project has a coordination
+problem at all.
 
 \subsection{Problems inside one station}
 \label{sec:local-problems}
@@ -55,69 +42,46 @@ in the same millisecond. Both read the connector as free, both proceed, and the 
 up promised twice. This is the classic race on a shared resource, and its solution is
 \cref{sec:p1}.
 
-The difficulty lies in where the resource lives. A charging connector is a physical object
-with a cable in it, so what has to be protected goes beyond a row in a database: it is the
-authority to tell a piece of hardware to deliver power to one car.
-
 \paragraph{P5: the site cannot power everything at once.} The sum of what the connectors can
 deliver exceeds what the site's grid connection can supply, which is true of real
-installations and is the reason dynamic load management exists. Five cars plugged in at a
-site rated for three of them is a normal Tuesday, and none of them may be simply refused:
-they are already connected.
+installations and is the reason dynamic load management exists.
 
-This is a different species of problem from P1, and the pairing is deliberate. A connector
+A connector
 is exclusive and is therefore \emph{granted}. Electrical capacity is divisible and is
 therefore \emph{apportioned}, with the apportionment changing every time a car arrives,
-leaves, or slows down as its battery fills. Mutual exclusion and permits are two separate
-chapters of the course material, and this system runs into both inside the same node. See
+leaves, or slows down as its battery fills. See
 \cref{sec:p5}.
 
 \subsection{Problems between the client and the system}
 \label{sec:client-problems}
 
 \paragraph{P3: somebody stops answering.} A driver reserves a connector and never arrives,
-or disappears in the middle of a session with the cable still in the socket. Nothing in the
-protocol can force them back, and the connector cannot stay held for ever waiting for a
-party that is gone. The same problem in a second form: a station holds a claim at the
+or disappears in the middle of a session with the cable still in the socket. The same problem in a second form: a station holds a claim at the
 coordinator and dies, and the coordinator has no way to ask it whether the claim still
 matters. See \cref{sec:p3}.
 
-\paragraph{P6: everyone must see the same connector.} Two drivers looking at the same
-station, plus the charge point reporting from the hardware, plus the operator's back office:
-all of them display a connector whose state changes several times a minute. If each client
-computes what it believes the state to be, from the last event it happened to receive, they
-will disagree, and the one who disagrees in the wrong direction drives to an outlet that is
-already taken. See \cref{sec:p6}.
-
-\paragraph{P7: a command arrives twice.} The driver presses \emph{reserve}, the phone loses
-signal for two seconds, nothing appears on screen, and they press it again. If both messages
-reach the station, the naive outcome is two reservations for one car, or a session started
-twice on the same connector. Retries are not a client bug to be fixed: they are what any
-reasonable client does on an unreliable link, so the system has to tolerate them. See
-\cref{sec:p3}.
+\paragraph{P6: everyone must see the same connector.} Two drivers, the charge point and the
+back office all display a connector whose state changes several times a minute. The station
+pushes to all of them (\cref{sec:ssr}); what is left to decide is what it pushes. Sending
+only the change is smaller, but it leaves a client that misses one message wrong from then
+on, with nothing to tell it so. See \cref{sec:p6}.
 
 \subsection{Problems across nodes}
 \label{sec:distributed-problems}
 
-These are the problems that would not exist in a single-process version of the same
-application, and they are the subject of the project.
-
 \paragraph{P2: one vehicle, one reservation, network-wide.} The scenario of
 \cref{sec:two-exclusions}: the same car reserving at two stations at once, with each station
-locally correct. Whatever solves it must place a decision somewhere that both stations
-consult before committing, and it must do so without turning every reservation into a
-network-wide serialisation of every other. See \cref{sec:p2}.
+locally correct. See \cref{sec:p2}.
 
 \paragraph{P2b: the authority itself fails.} Once P2 is answered by an authority, that
-authority becomes the thing that can fail. Two failures, with different consequences. If it
+authority becomes the thing that can fail. If it
 crashes, nobody can reserve until something replaces it. If a partition splits the network,
 both sides may conclude that the other is gone and each appoint its own authority, and two
 authorities granting claims for the same vehicle break exactly the guarantee the authority
-exists to provide. Split brain is worse than downtime here, because downtime refuses and
+exists to provide. "Split brain" is worse than downtime here, because downtime refuses and
 split brain grants. See \cref{sec:p2b}.
 
-\paragraph{P4: a station node goes away.} It can crash, or its uplink can be cut. Both look
-similar from a distance and they are different failures.
+\paragraph{P4: a station node goes away.} It can crash, or its uplink can be cut.
 
 A crashed node takes its sessions with it: the process metering them is gone and no row
 reaches the database. A partitioned node keeps delivering power to the cars plugged into it
@@ -125,34 +89,3 @@ while the rest of the network stops hearing from it, so the site works and the o
 blind. In both cases the vehicles that station was holding are stranded: their claims are
 alive in the coordinator, and their drivers cannot reserve anywhere else until those claims
 expire. See \cref{sec:station-failures}.
-
-\paragraph{Detecting any of this is itself a problem.} A failure that is not noticed is a
-failure that is not handled, and the detector the runtime gives us for free does not cover
-both cases. Erlang delivers \texttt{nodedown} when a TCP connection breaks, which is what a
-killed container looks like. A node that stops answering \emph{while its socket stays open},
-which is what a partition looks like, remains invisible until the distribution's own tick
-expires, and \texttt{net\_ticktime} defaults to sixty seconds. Sixty seconds is a long time
-for a coordinator to keep granting claims it has no right to grant. \Cref{sec:detectors}
-gives the measurements and the answer.
-
-\subsection{Communication problems}
-\label{sec:communication-problems}
-
-Three of them, and together they are the reason this system needs middleware at all.
-\Cref{sec:design-decisions} argues that point in full; here we state what has to be carried.
-
-\begin{itemize}
-  \item \textbf{Heterogeneous runtimes exchanging structured data.} Authentication, the
-        station directory, billing and the web front end live in a JVM; coordination and
-        the connectors live in Erlang. The two halves have to exchange typed messages, and
-        they run in processes that share no memory, no language and no object model.
-  \item \textbf{Long-lived, low-latency connections towards many clients.} A charging page
-        is watched for the length of a charge, which is half an hour or more, while power
-        allocations change every few seconds. Polling would be both late and wasteful, so
-        the connection has to stay open and the server has to be able to speak first.
-  \item \textbf{Asynchronous propagation between nodes.} The back office draws its station
-        list from what the cluster knows, and the cluster changes when nobody is looking at
-        it. Asking on every page view would put the operator's web traffic on the critical
-        path of the coordinator; the cluster therefore has to push, and the back office has
-        to be reachable as a peer.
-\end{itemize}
