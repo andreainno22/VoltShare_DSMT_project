@@ -49,35 +49,19 @@ MySQL & connection errors &
 \subsection{Two failure detectors, because there are two failures}
 \label{sec:detectors}
 
-\texttt{net\_kernel:monitor\_nodes/1} comes for free and fires the instant a TCP
-connection breaks, which is what a killed container looks like. A partition breaks
-nothing: the peer is unreachable but its socket stays open, so no
-\texttt{nodedown} is delivered until the distribution's own tick expires, and
-\texttt{net\_ticktime} defaults to sixty seconds. A minority leader would go on
-granting claims for a minute without knowing it had lost its quorum.
+A coordinator that crashes and one that is cut off look different on the wire. A
+crash closes the socket, and \texttt{net\_kernel:monitor\_nodes/1} reports it at
+once. A partition closes nothing: the peer is unreachable while its connection
+stays open, so nothing arrives to say so, and a leader in the minority would go
+on granting claims believing it still had its quorum.
 
 Liveness is therefore decided by a heartbeat among the coordinators, implemented
 in \texttt{vs\_coord\_membership}: each announces itself once a second, and three
-missed announcements mean gone. Three seconds instead of sixty. It runs among the
+missed announcements mean gone. A node that finds itself below a majority
+suspends itself and stops serving, leader or not. The heartbeat runs among the
 three coordinators only, because that is where a stale view produces two leaders;
-a station that goes silent is still noticed on the tick, at the cost
-\cref{tab:failures} states. \texttt{monitor\_nodes} stays subscribed for the crash
-case, where it is faster still.
-
-Measured on 1 September, isolating the leader with
-\texttt{docker network disconnect}:
-
-\begin{itemize}
-  \item \texttt{QUORUM LOST (1 of 3) \ldots{} abdicating} at \textbf{2.12~s};
-  \item a new leader serving with both claims at \textbf{2.29~s};
-  \item the distribution's own \texttt{nodedown} at \textbf{64.6~s}.
-\end{itemize}
-
-That last number is the argument. Without the heartbeat the system would have
-been incorrect for a full minute, and no test would have revealed it, because
-\texttt{docker kill}, the obvious way to simulate a failure, closes the socket
-and never exercises this path at all. Two kinds of failure need two experiments,
-which is why the demonstration shows both \texttt{kill} and \texttt{disconnect}.
+a station that goes silent is noticed later, at the cost \cref{tab:failures}
+states.
 
 \subsection{A station dies}
 \label{sec:station-failures}
