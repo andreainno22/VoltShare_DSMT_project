@@ -26,3 +26,4 @@ src/doc/*.fdb_latexmk
 src/doc/*.synctex.gz
 src/doc/sections/*.aux
 src/doc/*.tmp
+__pycache__/

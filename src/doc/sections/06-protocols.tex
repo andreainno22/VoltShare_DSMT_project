@@ -1,10 +1,10 @@
 \section{Architecture Protocols}
 \label{sec:protocols}
 
-\Cref{tab:edges} maps the edges of the system; the middleware choices are argued in
-\cref{sec:why-middleware} and the messages are specified in \cref{sec:api}. What this
-section adds is which party opens each connection, which way authority flows, and what was
-kept off an edge.
+\Cref{tab:edges} maps the edges of the system. The middleware choices are argued in
+\cref{sec:why-middleware} and the messages are specified in \cref{sec:api}. This section
+adds three things: which party opens each connection, which way authority flows, and what
+was kept off an edge.
 
 \begin{table}[h]
 \centering\small
@@ -37,43 +37,45 @@ station, back office $\to$ MySQL & SQL & each & one \texttt{INSERT} per closed s
 \subsection{Client-facing edges}
 \label{sec:protocols-client}
 
-The browser talks to two servers, and that is the first decision on this map. Pages come
-from the back office over HTTP, rendered by servlets and JSP (\cref{sec:ssr}); everything
-that happens at a station, reserving, watching a charge, stopping it, goes over a WebSocket
-opened \emph{directly to the station node}. The alternative was to route driver traffic
-through Tomcat, which would have kept one origin and one authentication scheme. We rejected
-it because it puts the web tier on the path of every reservation and every live frame: a
-Tomcat restart would have blanked every charging page in the network, and the station could
-no longer keep a site working while the back office is down. The price is a second
-authentication: the back office mints a JWT, the station verifies it locally and never
-calls back (\cref{sec:api-jwt}).
+The browser talks to two servers. That is the first decision on this map. Pages come from
+the back office over HTTP, rendered by servlets and JSP (\cref{sec:ssr}). Everything that
+happens at a station goes over a WebSocket opened \emph{directly to the station node}:
+reserving a connector, watching a charge, stopping it.
 
-The charge point has an edge of its own, kept apart from the driver's. One party asks and
-the other reports; matching a reported cable against a reservation is the station's job.
-The charge point dials the station, one socket per connector, as real equipment dials an
-operator's backend from behind a site network; the station never dials hardware
+The alternative was to route driver traffic through Tomcat, which would have kept one origin
+and one authentication scheme. We rejected it, because it puts the web tier on the path of
+every reservation and every live frame. A Tomcat restart would then blank every charging
+page in the network, and no station could keep a site working while the back office is down.
+The price of the direct connection is a second authentication. The back office mints a JWT,
+and the station verifies it locally without ever calling back (\cref{sec:api-jwt}).
+
+The charge point has an edge of its own, kept apart from the driver's. The driver asks for a
+connector, the hardware reports what is plugged into it, and matching the two is the
+station's job. The charge point
+dials the station, one socket per connector, the way real equipment dials an operator's
+backend from behind a site network. The station never dials hardware
 (\cref{sec:api-ws-cp}).
 
 \subsection{Internal edges}
 \label{sec:protocols-internal}
 
-Between Erlang nodes the protocol is distributed Erlang, with registered names on both
-sides so that nobody holds an address, and the same connection carries \texttt{nodedown}
-(\cref{sec:detectors}). Stations call, the coordinator answers. It is never on the path of
-a charge, which is what lets a coordination outage cost only new reservations
-(\cref{sec:api-claim}).
+Between Erlang nodes the protocol is distributed Erlang. Both sides address each other by
+registered name, so nobody holds an address, and the same connection carries
+\texttt{nodedown} (\cref{sec:detectors}). Stations call, the coordinator answers. The
+coordinator is never on the path of a charge, so a coordination outage costs only new
+reservations (\cref{sec:api-claim}).
 
 The back office joins the cluster as a hidden Erlang node through JInterface: it receives
-the directory and the leader as they change and pushes suspensions back, and no page ever
-asks the cluster a question at request time (\cref{sec:api-bridge}). Being hidden, it takes
-no part in the quorum: the web tier must never influence who leads.
+the directory and the leader as they change, and it pushes suspensions back. No page ever
+asks the cluster a question at request time (\cref{sec:api-bridge}). A hidden node takes no
+part in the quorum, and the web tier must never influence who leads.
 
-MySQL is reached from two runtimes, and the rule that makes that safe is written at the top
-of \texttt{schema.sql}: \textbf{one writer per table}. The station writes one row, the
-closed session, through \texttt{mysql-otp}; Java owns the other tables and the cost of a
-session after the fact. The no-show counter is written by Java alone, from a report the
-station sends through the coordinator: a counter incremented from several nodes would have
-been a second contended object.
+MySQL is reached from two runtimes. The rule that makes that safe is written at the top of
+\texttt{schema.sql}: \textbf{one writer per table}. The station writes one row, the closed
+session, and Java owns the other tables and the price of a session after the fact. The
+no-show counter is written by Java alone, from a report the station sends through the
+coordinator, because a counter incremented from several nodes would have been a second
+contended object.
 
-What is kept off the internal edges is as telling as what travels on them: no replicated
-log between the coordinators (\cref{sec:rebuild}), and no station talking to another.
+Two things are deliberately absent from the internal edges: a replicated log between the
+coordinators (\cref{sec:rebuild}), and any link from one station to another.

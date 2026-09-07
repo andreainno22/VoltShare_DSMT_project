@@ -4292,6 +4292,118 @@ zero overfull sopra i 10 pt.
 
 ---
 
+## 7zt. Il registro della relazione: frasi spezzate, profondità tolta, astrazione rimessa a posto — 6 settembre
+
+Caleb ha chiesto se il linguaggio della relazione fosse troppo formale. Misurato invece che
+opinato, con `scripts/style-lint.py`: il lessico è pulito su tutto il documento (niente
+padding accademico, verbi semplici, nessun `utilize`), ma la **lunghezza media delle frasi**
+divide il documento in due. Le sezioni di B stanno fra 15,8 e 19,8 parole; le mie stavano fra
+**24,4 e 35,2**. Non era il registro: erano le passate di taglio di §7zs, che avevano *fuso*
+frasi invece di eliminarle. Tagliare a parità di contenuto produce periodi lunghi.
+
+**Tre lavori, in un giro solo.**
+
+① **Frasi spezzate** in tutte le sezioni mie, senza togliere niente. Dopo: `§2 22,2 · §3 14,7
+· §6 18,7 · §9 20,9 · §10 21,2 · §11 17,8 · §12 15,7`, cioè dentro la fascia di B. Effetto
+collaterale da correggere a mano: spezzando tutto, la varianza crolla (tutte le frasi diventano
+medie) e `style-lint` ha segnato WARN di *burstiness* su §3 e §6. Rimessa la varianza a mano —
+un periodo lungo accanto a uno molto corto — SD a 9,1 e 9,7.
+
+② **Profondità fuori tema, tolta.** Il quirk di enumerazione di EUnit con i tre totali
+307/299/286 (§11) sceso a una frase; il pin dell'immagine Erlang e l'argomento
+`start-node.sh` contro release `relx` (§10); la catena di timeout da ~8 s (§9.2); il caso
+speculare del riattacco (§9.3). Sono buone risposte all'**orale**, non righe di relazione:
+tutte conservate in `proj/DIFESA_SCELTE_A.md`, che ora lo dice in testa.
+
+③ **Livello di astrazione.** Caleb ha notato «nei requisiti parli di un cavo, cosa c'entra?
+non stiamo parlando di cose fisiche». Aveva ragione, ed era un errore di registro tecnico, non
+di stile: §2 e §3 descrivono il *dominio*, e nel dominio l'evento è «un veicolo si è
+collegato», non «un cavo è stato inserito». Sostituito ovunque nei requisiti, nelle regole,
+in §6 e in §9.2. Il vocabolario fisico resta **solo in §9.3**, dove i messaggi del protocollo
+si chiamano letteralmente `plugged` e `unplugged` e la controparte è hardware.
+
+**Conto: 28 pagine** (da 35; B ha fatto in parallelo i suoi tagli). `latexmk` a zero,
+zero riferimenti indefiniti, zero overfull sopra i 10 pt, `style-lint` 0 FAIL e 0 WARN su
+tutte le sezioni mie.
+
+Rigenerati i due file di studio italiani, fuori da git: `proj/RELAZIONE_PARTE_A_IT.md`/`.pdf`
+(11 pagine, 1:1 col testo inglese nuovo) e `proj/DIFESA_SCELTE_A.md`/`.pdf` (9 pagine).
+
+### Coda, 7 settembre: le tre voci non consegnate spariscono da §2
+
+Caleb ha chiesto se il paragrafo «tre voci specificate e non consegnate» fosse fondamentale.
+No, e non tutte allo stesso modo. Profilo in sola lettura e filtri delle stazioni erano
+**mancanze che nessuno può notare**: nessun'altra parte del documento li nomina, ed erano nel
+*nostro* perimetro iniziale, non nei requisiti del corso. Dichiararle serviva solo a mettere
+in vetrina due buchi su feature che nessuno cerca. Via del tutto.
+
+La waiting list era diversa, perché **tre sezioni si puntavano fra loro**: §2.1 la dichiarava
+non consegnata, §9.2 la teneva in tabella (`join_waitlist` → `BAD_REQUEST`, campo `waitlist`
+costante) e §12 diceva «Specificata in §2.1». Scelta di Caleb: **vive solo in §12**, come
+lavoro futuro, e non è citata altrove. Quindi ripuliti tutti e tre i punti in un giro solo,
+altrimenti restavano riferimenti a un fantasma.
+
+La frase che vale, *«il tempo è andato ai problemi di coordinazione di §5»*, non è stata
+buttata: è stata spostata in §12 attaccata alla waiting list. Lì non è una scusa, è un
+argomento di priorità.
+
+**Cosa si perde, e va saputo:** il campo `waitlist` è **davvero sul filo**
+(`vs_driver_proto.erl:467` lo emette come `#{length => 0, my_position => null}`, e il test a
+`vs_driver_proto_tests.erl:601` lo asserisce), ma §9.2 non lo nomina più. Difendibile perché
+quel paragrafo descrive lo snapshot per sommi capi e non ha mai enumerato ogni chiave; da
+tenere presente se qualcuno chiede la specifica esatta del frame `state`. Il contratto
+completo resta in `contracts/ws-driver.md` §4.4 e §5.1.
+
+Verificato: nessun «waitlist» residuo in `src/doc/` fuori da §12; i nove codici d'errore di
+§9.2 sono ancora nove (contati sul codice); `latexmk` zero riferimenti indefiniti, zero
+overfull sopra i 10 pt; **28 pagine**, invariate — il taglio era sette righe, non una pagina.
+
+### Coda, 7 settembre: due prestiti dallo stile di BlackNet in §9.2
+
+Caleb trova la nostra parte WebSocket «molto densa» e chiede se si può adattare alla loro.
+Misurate tutte e due invece di andare a sensazione.
+
+**La loro §8.2** (pp. 14–15): 401 parole, **un canale solo**, sei azioni client e due
+messaggi server, 30% di righe in elenco, ciclo di connessione numerato 1/2/3, il **JSON
+letterale** dei frame più un blocco pretty-printed dello `state`. Ack unico `{ok, detail}`,
+nessuna tassonomia di errori, nessun close code oltre il timeout di 5 s, nessuna gestione
+dei guasti. E nessuna motivazione dentro §8.2: sta in §4.1.3.
+
+**La nostra**: §9.2 896 parole + §9.3 1142, ~4 pagine (p18–21), **due canali**, nove codici
+d'errore, quattro close code, riconciliazione dopo il riavvio, 336 parole di «Decisions».
+**Per canale: 401 contro ~1019, densi 2,5 volte.** Ma il confronto onesto non è 2 pagine
+contro 4: è un canale senza gestione guasti né codici d'errore contro due che hanno entrambi.
+
+**Fatti (scelta di Caleb: solo i due cosmetici).**
+
+- **L'envelope come JSON, non a parole.** Era un paragrafo di prosa; ora è `lst:envelope`,
+  un `reserve` in salita e il suo `ack` in discesa. Non è una limatura, era un **buco**: una
+  specifica di API che non mostrava mai un frame. §9.3 ora fa `\cref` al listato invece che
+  alla sezione, quindi il codec unico dei due canali si vede.
+- **Handshake → elenco numerato** (Open / Join / Serve), lunghezza uguale, scansione molto
+  migliore. La pagina 17 non è più un muro: prosa, blocco di codice, elenco, prosa.
+- **Lo stesso in §9.3.** Alla prima passata l'avevo fatto solo in §9.2, e Caleb se n'è
+  accorto. «Ammissione e boot» era dieci righe di prosa fitta che contenevano una sequenza,
+  un ramo e quattro valori di configurazione: ora è Open / Boot / Serve. I due canali hanno
+  la **stessa forma**, e quella simmetria vale di per sé — si legge che sono due istanze di
+  un contratto solo, non due protocolli diversi.
+
+**Non fatto, deliberatamente** (era l'opzione «tutte e tre»): spostare i blocchi «Decisions»
+in §6. Resterebbe da valutare, vale ~0,7 pagine.
+
+**Rifiutato, e il perché va saputo all'orale:** il loro `{ok, detail}` al posto dei nostri
+nove codici. Loro hanno **un'autorità sola**, il game server. Noi ne abbiamo due, e
+`ALREADY_HELD` (rifiuta il processo del connettore, P1) contro `NO_CLAIM` (rifiuta il
+coordinatore, P2) è la prova che i due invarianti sono fatti rispettare a **livelli
+diversi**. Appiattirli cancellerebbe l'evidenza della coordinazione. Stessa cosa per la
+riconciliazione e il budget di silenzio: è gestione dei guasti, ed è il punto dove **siamo
+noi più forti di loro** — BlackNet non ne ha.
+
+28 pagine, invariate; zero riferimenti indefiniti, zero overfull sopra i 10 pt, `style-lint`
+0 FAIL su §9. Il file italiano passa a 12 pagine (il blocco JSON).
+
+---
+
 ## 9. Prossimo passo
 
 **Le quattro milestone di codice sono chiuse su entrambi i lati** e verificate in Docker. Il

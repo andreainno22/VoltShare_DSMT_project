@@ -86,25 +86,42 @@ quote in its URL would have run its own script on every driver's page.
 
 The page opens \texttt{ws://<station>:8080/ws/driver?station\_id=<id>}. Host and port are
 what the station announced about itself, republished by \texttt{StationDirectory}
-(\cref{sec:api-bridge}); the query string is appended by \texttt{js/ws.js} from the station
-the page believes it is showing, and \texttt{vs\_driver\_ws} closes with \texttt{4400} on a
-mismatch. Frames are text, one JSON object each, with one envelope in both directions: an
-\texttt{action} going in (a \texttt{type} coming back), a \texttt{request\_id}, and a
-\texttt{payload} that is \texttt{\{\}} when there is nothing to say. Every decision is taken
-in \texttt{vs\_driver\_proto}, a module of pure functions over a session map, so the whole
-contract runs under EUnit without a listener; \texttt{vs\_driver\_ws} holds the Cowboy
-callbacks and nothing else.
+(\cref{sec:api-bridge}). The page appends the query string, naming the station it believes
+it is showing. A mismatch closes the socket with \texttt{4400}.
 
-\paragraph{Handshake.} The first frame has to be \texttt{join}, carrying the JWT of
-\cref{sec:api-jwt}, and it has to arrive within 5~s (\texttt{JOIN\_TIMEOUT\_MS}). The
-station verifies it locally
-and binds \texttt{user\_id} and \texttt{vehicle\_id} to the connection; the reply is an
-\texttt{ack} with a first \texttt{state} behind it in the same write. Four close codes:
-\texttt{4400} for a binary frame, malformed JSON or a wrong \texttt{station\_id};
-\texttt{4401} for a bad token, an action before \texttt{join}, or no \texttt{join} in time;
-\texttt{4408} for an expired token, so the page can tell ``log in again'' from ``something
-is wrong''; \texttt{1001} when the station shuts down, which the page answers by
-reconnecting with backoff.
+Frames are text, one JSON object each, and both directions share one envelope.
+
+\begin{lstlisting}[language=json, label={lst:envelope},
+  caption={The envelope of both WebSocket channels. A \texttt{payload} is \texttt{\{\}} when
+  there is nothing to say.}]
+// browser -> station
+{ "action": "reserve", "request_id": "3f2c9a",
+  "payload": { "connector_id": 3 } }
+
+// station -> browser
+{ "type": "ack", "request_id": "3f2c9a",
+  "payload": { "expires_at": 1757250000000, "lease_seconds": 900 } }
+\end{lstlisting}
+
+Every decision is taken in \texttt{vs\_driver\_proto}, a module of pure functions over a
+session map. The whole contract therefore runs under EUnit with no listener.
+\texttt{vs\_driver\_ws} holds the Cowboy callbacks and nothing else.
+
+\paragraph{Connection lifecycle.}
+\begin{enumerate}[leftmargin=*, itemsep=1pt, topsep=3pt, parsep=0pt]
+  \item \textbf{Open.} The page connects. The socket starts unauthenticated.
+  \item \textbf{Join.} The first frame has to be \texttt{join} with the JWT of
+        \cref{sec:api-jwt}, within 5~s. The station verifies it locally, and binds
+        \texttt{user\_id} and \texttt{vehicle\_id} to the connection.
+  \item \textbf{Serve.} An \texttt{ack}, with a first \texttt{state} behind it in the same
+        write. From here the station pushes.
+\end{enumerate}
+
+There are four close codes. \texttt{4400} covers a binary frame, malformed JSON or a wrong
+\texttt{station\_id}. \texttt{4401} covers a bad token, an action before \texttt{join}, or
+no \texttt{join} in time. \texttt{4408} is an expired token, kept apart so that the page can
+tell ``log in again'' from ``something is wrong''. \texttt{1001} is the station shutting
+down, and the page answers it by reconnecting with backoff.
 
 \begin{table}[h]
 \centering\small
@@ -124,20 +141,16 @@ Action & Effect, and what the \texttt{ack} carries & Refused with \\
 \texttt{cancel\_reservation} & frees the connector at once and releases the claim. No
   penalty: that is the incentive & \texttt{NOT\_YOURS}, \texttt{INVALID\_STATE} \\
 \texttt{stop\_session} & the charge point is told to stop and the connector's share
-  returns to the pool; the session row waits for the cable to come out &
+  returns to the pool; the session row waits for the vehicle to disconnect &
   \texttt{NOT\_YOURS}, \texttt{INVALID\_STATE} \\
-\texttt{join\_waitlist}, \texttt{leave\_waitlist} & specified but unimplemented; the
-  \texttt{waitlist} field of the snapshot is a declared constant & \texttt{BAD\_REQUEST} \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \texttt{BAD\_REQUEST}, \texttt{UNAUTHENTICATED} and \texttt{UNKNOWN\_CONNECTOR} complete
-the set of nine codes. \texttt{NO\_CLAIM} also covers a timeout: behind
-\texttt{vs\_connector:reserve/3} the claim client may walk three coordinators at 2~s each
-plus one retry, about 8~s in the worst case, and \texttt{call\_connector/1} catches the
-exit that used to kill the socket process with the caller. \Cref{fig:seq-reserve} shows
-the two outcomes of a \texttt{reserve} and the retry in between.
+the set of nine codes. \texttt{NO\_CLAIM} also covers a coordinator that never answers. A
+driver waiting on a reservation always gets a verdict. \Cref{fig:seq-reserve} shows the two
+outcomes of a \texttt{reserve}, with the retry in between.
 
 \begin{figure}[t]
 \centering
@@ -172,69 +185,72 @@ is refused by the coordinator before the station touches the connector.}
 \label{fig:seq-reserve}
 \end{figure}
 
-\paragraph{Frames from the station.} \texttt{ack} and \texttt{error} answer an action
-and echo its \texttt{request\_id}; the other three carry \texttt{null}. \texttt{state} is
-the whole station (site and allocated power, tariff, \texttt{coordinator\_reachable}, one
-entry per connector with \texttt{state}, \texttt{power\_kw}, \texttt{expires\_at},
-\texttt{held\_by\_me}, \texttt{mine}), sent on join, on every change and every
-\texttt{STATE\_TICK\_MS} (5~s); the tick earns its place because meter readings change
-\texttt{power\_kw} without raising a connector event, and a WebSocket \texttt{ping} rides
-on it so that Cowboy's inbound-only idle timeout (60~s) does not hang up on a page that is
-only watching. \texttt{session} goes with each \texttt{state} to the owner of a running
-session only: \texttt{phase}, \texttt{power\_kw}, \texttt{energy\_kwh},
-\texttt{soc\_pct}, \texttt{eta\_seconds}, \texttt{started\_at} and
-\texttt{overstay\_seconds}, the last already net of the grace and the same number that
-ends up in \texttt{sessions.overstay\_seconds}. A session ends by disappearing from the
-snapshot, and \texttt{session\_push/3} turns that disappearance into a final frame with
-the phase \texttt{closed}. \texttt{notification} carries \texttt{kind}, \texttt{text}
-and \texttt{connector\_id}.
+\paragraph{Frames from the station.} \texttt{ack} and \texttt{error} answer an action and
+echo its \texttt{request\_id}. The other three carry \texttt{null}.
+
+\texttt{state} is the whole station: site and allocated power, the tariff,
+\texttt{coordinator\_reachable}, and one entry per connector with its state,
+\texttt{power\_kw}, \texttt{expires\_at}, \texttt{held\_by\_me} and \texttt{mine}. It is
+sent on join, on every change, and every 5~s. The tick earns its place because meter
+readings change \texttt{power\_kw} without raising a connector event. A WebSocket
+\texttt{ping} rides on the same tick. Without it, Cowboy's inbound-only idle timeout would
+hang up on a page that is only watching.
+
+\texttt{session} goes with each \texttt{state}, and only to the owner of a running session.
+It carries \texttt{phase}, \texttt{power\_kw}, \texttt{energy\_kwh}, \texttt{soc\_pct},
+\texttt{eta\_seconds}, \texttt{started\_at} and \texttt{overstay\_seconds}. The last is
+already net of the grace. It is the same number that ends up in
+\texttt{sessions.\allowbreak overstay\_seconds}. A session ends by disappearing from the snapshot, and
+that disappearance becomes a final frame with the phase \texttt{closed}.
+\texttt{notification} carries \texttt{kind}, \texttt{text} and \texttt{connector\_id}.
 
 \begin{sloppypar}
-The station produces six notification kinds, \texttt{reservation\_expiring},
+The station produces six notification kinds: \texttt{reservation\_expiring},
 \texttt{reservation\_expired}, \texttt{claim\_revoked}, \texttt{charge\_complete},
-\texttt{overstay\_started} and \texttt{session\_interrupted}; a seventh,
-\texttt{waitlist\_offer}, is specified and has no code path that can raise it. The manager
-broadcasts each event to every subscribed socket, and the socket delivers it only when the
-user it names is the user the token bound. One table, \texttt{notification\_text/1},
-supplies the sentence for this frame and for the durable copy that reaches
-\texttt{notifications.jsp}.
+\texttt{overstay\_started} and \texttt{session\_interrupted}. The manager
+broadcasts each event to every subscribed socket. A socket delivers it only when the user it
+names is the user its token bound. One table supplies the sentence for this frame and for
+the durable copy that reaches \texttt{notifications.jsp}, so both say the same words.
 \end{sloppypar}
 
 \paragraph{Decisions on this channel.}
 \begin{itemize}
   \item \textbf{Identity comes from the token alone.} \texttt{held\_by\_me}
-        and \texttt{mine} are computed on the station, and a notification is delivered only
-        when the user it names is the one the token bound, a filter written as a pattern in
-        the clause head of \texttt{websocket\_info/2}. The alternative, a \texttt{user\_id}
-        field in the request, would let a driver reserve or cancel on behalf of somebody
-        else by editing a frame.
-  \item \textbf{One \texttt{RETRY\_LATER}, the cause in the message.} Three facts share the
-        code (the coordinator is rebuilding, the station is starting, the connector process
-        is between a crash and its restart) because the client must do the same thing in all
+        and \texttt{mine} are computed on the station. A notification is delivered only when
+        the user it names is the one the token bound, a filter written as a pattern in the
+        clause head of \texttt{websocket\_info/2}. The alternative was a \texttt{user\_id}
+        field in the request. It would let a driver reserve or cancel for somebody else by
+        editing a frame.
+  \item \textbf{One \texttt{RETRY\_LATER}, with the cause in the message.} Three facts share
+        the code: the coordinator is rebuilding, the station is starting, or the connector
+        process is between a crash and its restart. The client does the same thing in all
         three. Three codes would put a piece of the station's internals into every client.
         The third case used to be answered \texttt{UNKNOWN\_CONNECTOR}, a permanent code for
         a condition that lasts milliseconds.
-  \item \textbf{The socket is stateless; the reservation is not.} Reconnection is the
-        client's job (backoff from 500~ms, capped at 10~s, fresh \texttt{join}), and the
-        station keeps nothing for a disconnected socket, because the reservation lives in
-        the connector process and survives the browser being closed.
+  \item \textbf{The socket keeps no state; the connector process does.} Reconnection is the
+        client's job: backoff from 500~ms, capped at 10~s, then a fresh \texttt{join}. The
+        station keeps nothing for a disconnected socket. The reservation lives in the
+        connector process and survives the browser being closed.
 \end{itemize}
 
 \subsection{WebSocket: charge point to station}
 \label{sec:api-ws-cp}
 
-This channel is the boundary of the system: above it is production logic, below it is
-emulated hardware, and the emulator is credible only if a real charge point could
-implement the interface. The message set is a reduced OCPP 1.6-J~\cite{ocpp16j}, with the same direction
-of authority and a fraction of the surface; \cref{tab:cp-messages} maps every message to
-its original. The charge point is the client and dials
-\texttt{ws://<station>:8081/ws/cp?\allowbreak station\_id=<id>\&connector\_id=<n>}, as
-real equipment dials an operator's backend from behind the NAT of a site network. The
-envelope is the one of \cref{sec:api-ws-driver}, so one codec serves both channels, but
-\texttt{request\_id} is only a correlation key for the logs: nothing on this channel is
-retried and there are no \texttt{error} frames, so a frame the station cannot read is
-logged and dropped. There is no authentication: the link is site-local, and in a
-deployment it would be mutual TLS, which we did not implement.
+This channel is the boundary of the system. Above it is production logic, below it is
+emulated hardware. The emulator is credible only if a real charge point could implement the
+same interface. The message set is a reduced OCPP 1.6-J~\cite{ocpp16j}: the same direction
+of authority, a fraction of the surface. \Cref{tab:cp-messages} maps every message to its
+original.
+
+The charge point is the client. It dials
+\texttt{ws://<station>:8081/\allowbreak ws/cp?\allowbreak station\_id=<id>\allowbreak
+\&connector\_id=<n>} the way real equipment dials an operator's backend from behind the
+NAT of a site network. The
+envelope is the one of \cref{lst:envelope}, so one codec serves both channels. Here
+\texttt{request\_id} is only a correlation key for the logs. Nothing is retried on this
+channel and there are no \texttt{error} frames, so a frame the station cannot read is
+logged and dropped. There is no authentication either. The link is site-local. A real
+deployment would use mutual TLS, which we did not implement.
 
 \begin{table}[h]
 \centering\small
@@ -270,78 +286,89 @@ Message & Dir. & OCPP 1.6-J & Payload and effect \\
 \end{tabularx}
 \end{table}
 
-\paragraph{Admission and boot.} \texttt{vs\_cp\_proto:handshake/2} closes with
-\texttt{4404} only for a permanent condition: the connector is not one of this station's,
-or the query names another station. A connector that is configured here but has no
-process behind it at that instant, because the node is starting or the supervisor is
-restarting the process, is admitted, and the answer comes at the \texttt{boot} as
-\texttt{accepted: false} with the reason \texttt{connector not ready}; the equipment
-retries on its own backoff (1~s, doubling, capped at 30~s in \texttt{cp.js}); a second
-socket for the same connector replaces the first, closed with \texttt{4409}. The
-\texttt{boot} ack carries everything the equipment needs in order to behave, so it carries
-no configuration of its own: \texttt{heartbeat\_interval\_s} (30),
-\texttt{meter\_interval\_s} (5), \texttt{server\_time}, and the \texttt{limit\_kw} in force.
+\paragraph{Connection lifecycle.}
+\begin{enumerate}[leftmargin=*, itemsep=1pt, topsep=3pt, parsep=0pt]
+  \item \textbf{Open.} The handshake closes with \texttt{4404} only for a permanent
+        condition: the connector is not one of this station's, or the query names another
+        station. A second socket for the same connector replaces the first, which is closed
+        with \texttt{4409}.
+  \item \textbf{Boot.} A connector configured here may have no process behind it at that
+        instant, because the node is starting or its supervisor is restarting it. The socket
+        is admitted anyway. The answer comes at the \texttt{boot}, as
+        \texttt{accepted: false} with the reason \texttt{connector not ready}, and the
+        equipment retries on its own backoff.
+  \item \textbf{Serve.} The \texttt{boot} ack carries everything the equipment needs in
+        order to behave, so the equipment holds no configuration of its own. It gets back
+        \texttt{heartbeat\_interval\_s} (30), \texttt{meter\_interval\_s} (5),
+        \texttt{server\_time}, and the \texttt{limit\_kw} in force.
+\end{enumerate}
 
-\paragraph{Silence.} A heartbeat every 30~s and a meter reading every 5~s while charging:
-the contract obliges the equipment to speak, so Cowboy's inbound-only idle timeout
-\emph{is} the missed-heartbeat rule, and this channel needs no \texttt{ping}. The budget is
-three intervals, 90~s, split as \cref{sec:cp-failure} describes.
+\paragraph{Silence.} A heartbeat every 30~s, and a meter reading every 5~s while charging.
+The contract obliges the equipment to speak, so Cowboy's inbound-only idle timeout \emph{is}
+the missed-heartbeat rule. This channel needs no \texttt{ping}. The budget is three
+intervals, 90~s, split as \cref{sec:cp-failure} describes.
 
 \paragraph{Authorisation happens at \texttt{plugged}, and nowhere else.} The payload names
-a vehicle, and the station resolves it to an account locally through
-\texttt{vs\_station\_db:user\_for\_vehicle/1}, the lookup that an isolated station
-cannot make (\cref{sec:station-failures}). On a held connector the reserved vehicle starts
-a session and any other gets \texttt{stop} with \texttt{not\_your\_reservation} while the
-reservation stays; on a free connector any registered vehicle starts a walk-in, a suspended
-account included; on \texttt{charging}, \texttt{complete} or \texttt{closing} the
-\texttt{plugged} is refused with no frame and logged as a divergence between physical and
-logical state. \texttt{max\_kw} is mandatory: without it the allocator of \cref{sec:p5}
-would compute a demand of zero and the car would sit at zero kilowatts for ever with
-nothing in any log to say why.
+a vehicle, and the station resolves it to an account locally. That lookup is the one an
+isolated station cannot make (\cref{sec:station-failures}).
+
+On a held connector the reserved vehicle starts a session. Any other gets \texttt{stop} with
+\texttt{not\_your\_reservation}, and the reservation stays. On a free connector any
+registered vehicle starts a walk-in, a suspended account included. On \texttt{charging},
+\texttt{complete} or \texttt{closing} the
+\texttt{plugged} is refused with no frame, and logged as a divergence between physical and
+logical state. \texttt{max\_kw} is mandatory. Without it the allocator of \cref{sec:p5}
+computes a demand of zero, and the car sits at zero kilowatts for ever with nothing in any
+log to say why.
 
 \paragraph{Meter and commands.} \texttt{energy\_kwh} is cumulative since the session
-started, and the connector stores \texttt{max(stored, reported)} so that a counter which
-resets on a firmware glitch cannot subtract energy already billed. A \texttt{meter} for a
-connector with no session is dropped and logged. \texttt{unplugged} carries the final
-total; at that point the station writes the \texttt{sessions} row with energy and
-overstay, releases the claim and moves the connector to \texttt{free}.
-\texttt{set\_limit} is the allocator's output; \texttt{limit\_kw: 0} means suspended. \texttt{stop} carries one of six reasons (\texttt{driver\_stopped},
+started. The connector stores \texttt{max(stored, reported)}, so a counter that resets on a
+firmware glitch cannot subtract energy already billed. A \texttt{meter} for a connector with
+no session is dropped and logged. \texttt{unplugged} carries the final total. At that point
+the station writes the \texttt{sessions} row with energy and overstay, releases the claim,
+and moves the connector to \texttt{free}.
+\texttt{set\_limit} is the allocator's output, and \texttt{limit\_kw: 0} means suspended.
+\texttt{stop} carries one of six reasons (\texttt{driver\_stopped},
 \texttt{target\_reached}, \texttt{claim\_revoked}, \texttt{not\_your\_reservation},
-\texttt{faulted}, \texttt{station\_shutdown}), the last sent by \texttt{vs\_cp\_ws} just
+\texttt{faulted}, \texttt{station\_shutdown}). The last is sent by \texttt{vs\_cp\_ws} just
 before the \texttt{1001} close, because after the listener is gone there is nobody left to
-tell. A \texttt{stop} ends the delivery and the connector stays occupied until
-\texttt{unplugged}; \texttt{faulted} is the exception, closed at once with the energy last
-measured, because faulted equipment may never send another frame.
+tell. A \texttt{stop} ends the delivery, and the connector stays occupied until
+\texttt{unplugged}. \texttt{faulted} is the exception: the session is closed at once with
+the energy last measured, because faulted equipment may never send another frame.
 
 \paragraph{Reconciliation after a station restart.} The connector processes die with the
-node. The charge point reconnects, boots, and re-sends \texttt{plugged} with two optional
-fields, \texttt{energy\_kwh} and \texttt{charging\_seconds}; the station opens a session
-from those figures instead of stopping a car that is charging happily, with
-\texttt{started\_at} set to \emph{now} minus \texttt{charging\_seconds} on its own clock,
-so that two machines whose clocks are minutes apart still produce the same instant. Before
-the field existed, on 28 August, a session that crossed two restarts was written as
-12.042~kWh in twenty-three seconds. Measured on 3 September with \texttt{docker kill
-station2}: 34.795~kWh before the kill, 34.812 after the restart, no row for the session
-that was lost. The reservation is not reconstructed. The mirror case, the connector process
-dying under a healthy socket, is handled by the socket monitoring the connector and
-retrying the attachment five times at 500~ms, replaying the last \texttt{status} and
-\texttt{plugged}, before closing with \texttt{1012}, Service Restart.
+node, so the station has no memory of the session. The charge point reconnects, boots, and
+re-sends \texttt{plugged} with two optional fields: \texttt{energy\_kwh} and
+\texttt{charging\_seconds}. The station opens a session from those figures instead of
+stopping a car that is charging happily.
+
+\texttt{started\_at} is \emph{now} minus \texttt{charging\_seconds}, read on the station's
+own clock. Two machines whose clocks are minutes apart still produce the same instant.
+Before the field existed,
+on 28 August, a session that crossed two restarts was written as 12.042~kWh in twenty-three
+seconds. Measured on 3 September with \texttt{docker kill station2}: 34.795~kWh before the
+kill, 34.812 after the restart, and no row for the session that was lost. The reservation is
+not reconstructed. The mirror case is the connector process dying under a healthy socket.
+There the socket monitors the connector, retries the attachment and replays the last
+\texttt{status} and \texttt{plugged}. After
+\texttt{reattach\_tries\_max} attempts it gives up and closes with \texttt{1012}, Service
+Restart.
 
 \paragraph{Decisions on this channel.}
 \begin{itemize}
   \item \textbf{A subset of OCPP 1.6-J, with the same direction of authority.} Full OCPP
         was rejected for its surface: configuration keys, id tags, a nine-state model,
-        charging profiles with stacking levels, none of which the coordination problem
-        needs. An invented protocol was rejected too, because it would have left the
-        emulator with nothing to be an emulator of. \Cref{tab:cp-messages} is the
-        reduction, message by message.
+        charging profiles with stacking levels. The coordination problem needs none of it.
+        An invented protocol was rejected too, because it would have left the emulator with
+        nothing to be an emulator of. \Cref{tab:cp-messages} is the reduction, message by
+        message.
   \item \textbf{Limits are repeated on every tick}, even when unchanged, so a missed frame
-        is corrected within one tick; delta tracking was rejected on a channel with no
+        is corrected within one tick. Delta tracking was rejected on a channel with no
         ordering problem to justify it.
   \item \textbf{Timestamps that matter are the station's.} The equipment sends quantities
-        it measured itself, cumulative energy and a duration, never an instant. A
-        \texttt{started\_at} from the hardware was rejected because two clocks minutes
-        apart would have produced two different sessions from one cable.
+        it measured itself: cumulative energy and a duration, never an instant. A
+        \texttt{started\_at} from the hardware was rejected, because two clocks minutes
+        apart would produce two different sessions from one charge.
 \end{itemize}
 
 \subsection{Claims: station to coordinator}

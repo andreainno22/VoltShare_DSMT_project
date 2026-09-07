@@ -2,35 +2,33 @@
 \label{sec:testing}
 
 Three kinds of evidence: a unit suite that runs without the cluster, a load test against
-the deployed containers, and a demonstration in which every scene maps to one problem of
+the deployed containers, and a demonstration where every scene maps to a problem of
 \cref{sec:problems}.
 
 \subsection{Automated tests}
 \label{sec:tests-unit}
 
-The Erlang suite is 395 EUnit tests over the three applications, run by
-\texttt{scripts/eunit\_check.sh}; most of them drive the connector state machine of
-\cref{fig:connector-states}, the power allocation and the two protocol modules. None of
-them starts Cowboy, a coordinator or MySQL: the collaborators of every module are injected
-as module names (\texttt{claim\_mod}, \texttt{db\_mod}, \texttt{conn\_mod}) and the suite
-substitutes stubs, and the two protocol modules are pure functions over a session map
-(\cref{sec:api-ws-driver}). Integration against a coordinator uses
-\texttt{vs\_mock\_coord}, a test tool outside the delivered system. On the Java side there
-are 14 unit tests on the pricing arithmetic and the token, and three integration tests that
-need a database and a cluster.
+The Erlang suite is 395 EUnit tests over the three applications. Most of them drive the
+connector state machine of \cref{fig:connector-states}, the power allocation and the two
+protocol modules.
 
-\texttt{eunit\_check.sh} asserts the test count as well as the absence of failures: three
-ways of breaking the suite on purpose all printed ``0 failures'' with 307, 299 and 286
-tests, because the total is how far EUnit got in enumerating the tree. The script requires
-the summary to read exactly ``395 tests, 0 failures'', and updating the number is part of
-adding a test.
+None of them starts Cowboy, a coordinator or MySQL. The collaborators of every module are
+injected as module names (\texttt{claim\_mod}, \texttt{db\_mod}, \texttt{conn\_mod}), and
+the suite substitutes stubs, while the two protocol modules are pure functions over a
+session map (\cref{sec:api-ws-driver}). Integration against a coordinator uses
+\texttt{vs\_mock\_coord}, a test tool outside the delivered system. On the Java side there
+are 14 unit tests on the pricing arithmetic and the token.
+
+The suite is run by \texttt{scripts/eunit\_check.sh}, which asserts the exact test count
+as well as the absence of failures. A run that dies while enumerating the tests still
+reports zero failures, so the count is the part that catches it.
 
 \subsection{Load}
 \label{sec:tests-load}
 
-\texttt{emulator/driver.js} opens $N$ WebSocket connections with $N$ signed tokens and
-fires the same action from all of them in the same instant. Measured on 28 August, on the
-five-node deployment that preceded the replicated coordinator, from the host.
+\texttt{emulator/driver.js} opens $N$ WebSocket connections with $N$ signed tokens, and
+fires the same action from all of them in the same instant. Measured on 28 August, from the
+host, on the five-node deployment that preceded the replicated coordinator.
 
 \begin{table}[h]
 \centering\small
@@ -52,22 +50,24 @@ Drivers & Accepted & Refused & Code & Max & Mean & \\
 \end{tabularx}
 \end{table}
 
-The count closes exactly on every row and the maximum grows roughly linearly with $N$,
-the signature of $N$ messages in one mailbox served in order (\cref{sec:p1}). The same
+The count closes exactly on every row. The maximum grows roughly linearly with $N$, which
+is the signature of $N$ messages in one mailbox served in order (\cref{sec:p1}). The same
 vehicle sent to five connectors of two stations at once got one \texttt{ok} and four
-\texttt{NO\_CLAIM} in 5~ms (\cref{sec:p2}). A sustained run, ten drivers cycling
-\texttt{join}, \texttt{reserve}, \texttt{cancel} on both stations for 150~s while two
-charge points delivered, produced 5620 requests, 2904 accepted, 2716 refused, a maximum
-response of 62~ms, zero connectors left \texttt{held} and zero error reports on any node.
+\texttt{NO\_CLAIM} in 5~ms (\cref{sec:p2}).
+
+A sustained run followed: ten drivers cycling \texttt{join}, \texttt{reserve} and
+\texttt{cancel} on both stations for 150~s, while two charge points delivered. It produced
+5620 requests, 2904 accepted and 2716 refused, with a maximum response of 62~ms. No
+connector was left \texttt{held}, and no node logged an error.
 
 \subsection{The demonstration}
 \label{sec:tests-demo}
 
-One run of eight to ten minutes: emulated charge points charge in the background, the
-presenter drives a browser and the failure commands, and a second person pastes the
-commands that answer the presenter's actions. \Cref{tab:demo} maps what appears on screen
-to the problem it demonstrates, with the date each scene was first seen working, because
-nothing is shown for the first time in front of the examiner.
+One run of eight to ten minutes. Emulated charge points charge in the background. The
+presenter drives the browser and the failure commands, and a second person pastes the
+answers. \Cref{tab:demo} maps what appears on screen to the problem it
+demonstrates. It also carries the date each scene was first seen working, because nothing is
+shown for the first time in front of the examiner.
 
 \begin{table}[h]
 \centering\small
@@ -104,14 +104,12 @@ stay plugged in after the charge & overstay & \texttt{complete} to \texttt{overs
 \end{tabularx}
 \end{table}
 
-P6 and P7 have no scene of their own: they hold by construction across the whole run. The
+P6 and P7 have no scene of their own. They hold by construction across the whole run. The
 crash and the partition of a station are shown one after the other on purpose, because they
 are two failures with two detectors and two outcomes (\cref{sec:station-failures}).
 
-\paragraph{What the demonstration found.} Rehearsing the whole run on 3 September, with
-the suite green at 386 tests, turned up four defects no test had seen: the coordinator
-logged twenty-three things and not the one act it exists for, granting or refusing a claim;
-four log panes broke one story into pieces and became one time-ordered stream; and in the
-emulated hardware, the world script did not restart a charge point that died, and
-\texttt{cp.js} exited when its car unplugged. Unit tests protect the contracts; only running
-the system the way it will be shown protects the demonstration.
+Rehearsing the whole run on 3 September, with the suite green, turned up four defects no
+test had seen. The worst one: the coordinator logged twenty-three kinds of event, and
+granting or refusing a claim was not among them. The central act of the presentation had
+nothing behind it in the logs. Unit tests protect the contracts, and only a rehearsal
+protects the demonstration.

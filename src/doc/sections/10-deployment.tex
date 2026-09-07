@@ -2,55 +2,53 @@
 \label{sec:deployment}
 
 Seven containers on one host, joined by a single Docker bridge network
-(\cref{fig:deployment}), each one a node. The course asks for several \emph{nodes}, and
-the reference project ran on one host in the same way. What a single host does not give for
-free is a network partition, a node that is alive and unreachable; \texttt{docker network
-disconnect} produces it, leaving the container running, convinced it is alive, and sending
-no FIN, which is the failure \texttt{docker kill} cannot show (\cref{sec:detectors}).
+(\cref{fig:deployment}), each one a node. The course asks for several \emph{nodes},
+and the reference project ran on one host in the same way. One failure a single host does
+not give for free is the network partition: a node that is alive and unreachable.
+\texttt{docker network disconnect} produces one. The container keeps running, believes
+itself alive and sends no FIN. That is the failure \texttt{docker kill} cannot show
+(\cref{sec:detectors}).
 
-\paragraph{Images.} Two. \texttt{Dockerfile.erlang} builds every Erlang application with
-\texttt{rebar3} and copies only the compiled \texttt{ebin} directories into the runtime
-stage, pinned to \texttt{erlang:29.0.5}, the OTP on the developers' machines; the role of a
-container is the \texttt{ERL\_APP} variable, so stations and coordinators are one image
-with different environments. \texttt{Dockerfile.backoffice} deploys the WAR as
-\texttt{ROOT} on Tomcat 10.1 together with \texttt{epmd}, because JInterface publishes the
-hidden node's name on the port mapper of its own host.
+\paragraph{Images.} Two, both multi-stage. \texttt{Dockerfile.erlang} compiles every Erlang
+application and copies only the compiled \texttt{ebin} directories into the runtime stage.
+The role of a container is the \texttt{ERL\_APP} variable, so stations and coordinators are
+one image with two environments. \texttt{Dockerfile.backoffice} deploys the WAR on Tomcat
+together with \texttt{epmd}, because JInterface publishes the hidden node's name on the port
+mapper of its own host.
 
 \paragraph{Naming and configuration.} Every Erlang node is \texttt{vs@<hostname>}, short
 names, because containers on a compose network resolve each other by service name. The three
-coordinators share one configuration and differ by hostname alone: there is no
-\texttt{COORD\_ID}, the bully priority being the position of a node in the sorted
-\texttt{COORD\_NODES} list all of them hold, so a healthy start elects \texttt{coord3}.
-Everything else is an environment variable with a development default (\cref{tab:params}),
-so the project starts with no configuration at all, and \texttt{.env.demo} overrides the
-leases and the site budget of \texttt{station1}.
+coordinators share one configuration and differ by hostname alone. There is no
+\texttt{COORD\_ID}. The bully priority is a node's position in the sorted
+\texttt{COORD\_NODES} list, which all three already hold, so a healthy start elects
+\texttt{coord3} without anyone being told. Everything else is an environment variable with a
+development default (\cref{tab:params}). The project therefore starts with no configuration
+at all, and \texttt{.env.demo} overrides the leases and the site budget of
+\texttt{station1}.
 
 Inside the containers every station listens on 8080 and 8081, so the application does not
-know which station it is; the remapping to the published ports of \cref{fig:deployment}
-(9101/9102 for drivers, 9201/9202 for charge points, 8080 for the web application) happens
-only where the host has one port 8080.
+know which station it is. The remapping to the published ports of \cref{fig:deployment}
+happens only outside, where the host has one port 8080.
 
-\paragraph{Starting it.} From \texttt{src/deploy/}, \texttt{docker compose build} once
-and \texttt{docker compose up -d} afterwards, with \texttt{.env.demo} as the env file. The
-stations and the back office wait for MySQL's health check, which allows sixty retries at
-five seconds because the first boot on a cold volume measured over six minutes on a laptop;
-with the earlier twenty retries the other nodes refused to start against a database that
-was merely slow. The schema is mounted read-only from \texttt{contracts/schema.sql}, and
-the data lives in a named volume that survives \texttt{docker compose down}. The charge
-points are not in the compose file: they are emulated hardware, and they run on the host
-with \texttt{emulator/demo/world.sh}, which supervises one \texttt{cp.js} per connector
-and restarts one that exits.
+\paragraph{Starting it.} From \texttt{src/deploy/}, \texttt{docker compose build} once and
+\texttt{docker compose up -d} afterwards, with \texttt{.env.demo} as the env file. The
+stations and the back office wait for MySQL's health check. That check is generous on
+purpose: a first boot on a cold volume took over six minutes, and with a shorter budget the
+other nodes refused to start against a database that was merely slow. The schema is mounted
+read-only from \texttt{contracts/schema.sql}, and the data lives in a named volume that
+survives \texttt{docker compose down}.
 
-\paragraph{One network, after trying two.} A second network per site was added on 3
-September on the premise that disconnecting a station from the cluster also cut its
-chargers. Measuring showed the premise wrong (a published port keeps working while the
-container is off the bridge, \cref{sec:station-failures}), and it was removed the same
-day.
+The charge points are not in the compose file. They are emulated hardware, outside the
+system boundary, and they run on the host with \texttt{emulator/demo/world.sh}, which
+supervises one \texttt{cp.js} per connector and restarts one that exits.
 
-\paragraph{Decisions.} A container per node: several \texttt{-sname} nodes on one
-operating system are how the election is tried in development, but nodes sharing a
-filesystem, a network stack and a fate prove nothing about isolation, while \texttt{docker
-kill} on a container is a real failure of a node. A three-line \texttt{start-node.sh}
-instead of an OTP release: a release adds \texttt{vm.args}, \texttt{sys.config} and
-profiles at the point where the risk to retire was making two nodes talk, and the script
-shows exactly how a node is named, which is where things break.
+\paragraph{Two decisions.} The first is a container per node, instead of several
+\texttt{-sname} nodes on one operating system. Several nodes on one host is how the election
+gets tried during development. But nodes that share a filesystem, a network stack and a fate
+prove nothing about isolation, while \texttt{docker kill} on a container is a real failure
+of a node.
+
+The second is the single network. A second network per site was added on 3 September, on the
+premise that disconnecting a station from the cluster also cut its chargers. Measuring showed
+the premise wrong: a published port keeps working while the container is off the bridge
+(\cref{sec:station-failures}). It was removed the same day.
