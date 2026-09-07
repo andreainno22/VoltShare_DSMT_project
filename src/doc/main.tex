@@ -54,6 +54,14 @@
      {]}{{{\color{codekw}]}}}{1},
 }
 
+% One wire message per block, uncaptioned and unnumbered: in §9.2 and §9.3 the examples are
+% read in sequence with the prose, not referred to from elsewhere.
+\lstdefinestyle{msg}{
+  language=json,
+  basicstyle=\ttfamily\scriptsize,
+  aboveskip=5pt, belowskip=5pt,
+}
+
 % \stub was the placeholder for unwritten sections; removed on 5 September, when the
 % last one was written, so that a residue fails to compile instead of being printed.
 
@@ -95,8 +103,6 @@
 \input{sections/07-addressing-problems}
 \input{sections/08-fault-tolerance}
 \input{sections/09-api-specification}
-\input{sections/10-deployment}
-\input{sections/11-testing}
 \input{sections/12-future-works}
 
 \newpage

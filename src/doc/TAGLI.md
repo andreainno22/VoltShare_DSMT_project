@@ -1,5 +1,21 @@
 # Cosa dice la relazione, cosa pesa, cosa si può tagliare — 5 settembre
 
+> **7 settembre, terzo giro: via anche §10 Deployment.** Future Works diventa §10, documento a
+> **28 pagine** su 35. Una riga di §1 di B ritargettata da `sec:deployment` a `sec:components`
+> perché il `\cref` non restasse orfano: da dire a B. Il requisito «più nodi» resta in §4.2.
+> Dettaglio in `PROGRESS.md` §7zw.
+
+> **7 settembre, secondo giro: §9.2 e §9.3 rifatte a esempi JSON in sequenza**, §12 da quattro
+> voci a tre. Ripristinata `tab:plugged`, `tab:driver-actions` sostituita da `tab:driver-errors`.
+> Documento a **29 pagine** su 35. Le due tabelle che questa lista aveva proposto di togliere
+> da §9 erano tabelle di decisione: toglierle è ciò che aveva reso illeggibili le due
+> sottosezioni. Dettaglio in `PROGRESS.md` §7zv.
+
+> **7 settembre: §11 Testing and Demonstration cancellata, §10 ridotta a 412 parole.** La demo
+> si fa dal vivo. Documento a **26 pagine** su un tetto di 35: il conteggio «35» qui sotto era
+> sbagliato, il PDF di `df1caac` ne aveva 28. Dettaglio in `PROGRESS.md` §7zt; §11 si recupera
+> con `git show df1caac:src/doc/sections/11-testing.tex`.
+
 > **Eseguito il 6 settembre sulle sezioni di A: 39 → 35 pagine.** §2, §3, §6, §9.2, §9.3,
 > §10, §11, §12 tagliate di doppioni e prosa di raccordo, in due passate (via la seconda
 > figura di §9.3, la tabella dei frame di §9.2, quella del `plugged` e quella delle porte);

@@ -1,18 +1,7 @@
 \section{Future Works}
 \label{sec:future}
 
-Four extensions, none started, each with the reason it was set aside.
-
-\paragraph{Site power shared across stations.} Two stations on the same grid connection
-would share one budget. That is a divisible quantity, lent and returned between nodes: a
-lease over a continuous value, where every lease in this document is over an exclusive
-resource. It was left out because it would have added a second network-wide invariant before
-the first one was demonstrably safe under failover.
-
-\paragraph{Partitioning the vehicle space across coordinators.} Each claim would be decided
-by the node responsible for a hash of the vehicle identifier. No node would see all the
-traffic, and a failure would block one shard while the rest kept serving. \Cref{sec:p2}
-gives the reasons it was set aside. It would keep the current election and quorum.
+Three extensions, none started, each with the reason it was set aside.
 
 \paragraph{A waiting list for a full station.} A driver who finds every connector taken has
 nothing to join. The feature needs a per-station queue with an owner, and an offer that is
@@ -20,8 +9,19 @@ itself a lease, so that a waiter who never comes back cannot freeze the queue. I
 first scope. The time went instead to the coordination problems of \cref{sec:problems}, where
 the exclusive-use invariants are won or lost.
 
-\paragraph{Native push notifications, and an operator console.} There is no mobile push. The
-overstay notice reaches a driver who is looking at the page, or who reopens the application
-later, so the grace assumes an attentive driver. The back office is read-only for a related
-reason: taking a connector out of service by hand would be a command from the web tier into
-the cluster, a direction the JInterface bridge already carries for suspensions.
+\paragraph{Native push notifications.} There is no mobile push. The overstay notice reaches a
+driver who is looking at the page, or who reopens the application later, so the grace period
+assumes an attentive driver, which is the one thing a driver who has walked away from the car
+is not. A mobile application would close that gap. The event to deliver already exists and
+the station already emits it, so what is missing is only the channel: the WebSocket of
+\cref{sec:api-ws-driver} lives as long as the tab, while a push registration belongs to the
+device and outlives the browser.
+
+\paragraph{An operator console.} The back office is read-only. Taking a connector out of
+service by hand, or closing a session that a charge point has left hanging, would be a
+command from the web tier into the cluster, and the JInterface bridge of
+\cref{sec:api-bridge} already carries that direction for suspensions. What is missing sits
+above the transport: a screen of its own in the web application, restricted to an operator
+role that the token does not yet distinguish, and a durable record of who overrode what. A
+manual exception to an exclusive-use invariant is the event most likely to need an
+explanation afterwards.

@@ -4493,3 +4493,131 @@ Se lo si fa, la conseguenza tecnica è una sola e va saputa prima: `-sname` non 
 corti funzionano solo dentro lo stesso dominio DNS, e `Dockerfile.erlang` dice *"long names would
 buy nothing here"* — vero su un host, falso su due. Servirebbe `-name` con FQDN o IP, e con esso
 cambiano `COORD_NODES` e `JINTERFACE_NODE` su tutti i nodi.
+
+## 7zt. Relazione: via §11 Testing and Demonstration, §10 ridotta — 7 settembre
+
+Decisione di Caleb: la demo la facciamo dal vivo davanti al docente, quindi la sezione che la
+racconta a parole è un doppione. `sections/11-testing.tex` **cancellata** e tolta da
+`main.tex`; `10-deployment.tex` portata da 515 a 412 parole (immagini e nomi fusi in un
+paragrafo, la storia dell'health check di MySQL a una frase). Linter: 0 FAIL, 0 WARN, SD 9,8.
+Compila senza riferimenti indefiniti.
+
+**Cosa è uscito dal documento con §11**, e va saputo perché all'orale non c'è più la carta:
+i 395 test EUnit e `eunit_check.sh` che asserisce il conteggio esatto; la tabella di contesa
+(20/50/100/200/500 driver su un connettore libero, sempre 1 accettato, massimo 100 ms a 500);
+la run sostenuta del 28/08 (5620 richieste, 2904 accettate, massimo 62 ms, nessun connettore
+lasciato `held`); la mappa scena → problema della demo con le date di prima riuscita; e i
+quattro difetti trovati provando la demo il 3/09, fra cui il coordinatore che loggava
+ventitré tipi di evento e non il grant o il rifiuto di un claim.
+
+**§10 non si poteva togliere** anche volendo: `01-introduction.tex:41` chiude con
+`(\cref{sec:deployment})` e §1 è di B, che non si tocca.
+
+**Nota sul conteggio pagine.** `TAGLI.md` dava 35 pagine dopo la passata del 6/09, ma il PDF
+in repo (`df1caac`) ne aveva **28**, e dopo questo taglio ne ha **26**. Il tetto concordato è
+35 e l'obiettivo della skill è 25-35: eravamo larghi di sette pagine, non stretti. Se §11
+serve, si recupera da git (`git show df1caac:src/doc/sections/11-testing.tex`).
+
+## 7zu. Relazione: §12 Future Works da quattro voci a tre — 7 settembre
+
+Scelta di Caleb. Via **«Site power shared across stations»** e **«Partitioning the vehicle
+space across coordinators»**: la prima è un lease su una quantità divisibile che il documento
+non tratta da nessuna parte, la seconda ha già le sue ragioni in §7 (`sec:p2`) e qui le
+ripeteva. Nessuna delle due era referenziata altrove, quindi niente `\cref` da sistemare.
+
+Resta **«A waiting list for a full station»**, invariata. La quarta voce, che teneva insieme
+push e console dell'operatore, è stata **spezzata in due**:
+
+- **Native push notifications**: il gap è che il grace period dell'overstay presuppone un
+  driver attento; una app mobile lo chiude. L'evento esiste già e la stazione già lo emette,
+  quindi manca solo il canale, perché il WebSocket di §9.2 vive quanto la tab mentre una push
+  registration appartiene al dispositivo e sopravvive al browser.
+- **An operator console**: il back office è read-only. Il trasporto c'è già (il bridge
+  JInterface di §9.5 porta le sospensioni dal web tier al cluster), manca la schermata
+  dedicata nella webapp, un ruolo operatore che il token oggi non distingue, e la traccia
+  durevole di chi ha forzato cosa.
+
+Linter 0 FAIL 0 WARN (SD 14,4). Documento sempre a 26 pagine, nessun riferimento indefinito.
+
+## 7zv. §9.2 e §9.3 riscritte a esempi JSON in sequenza — 7 settembre
+
+Caleb: «non ci capiamo niente». Diagnosi prima di toccare: la passata di taglio del 6/09
+aveva convertito **due tabelle di decisione in prosa** (`tab:plugged` → il paragrafo
+*Authorisation happens at plugged*, cinque casi in quattro frasi; `tab:driver-frames` → tre
+paragrafi con i campi elencati dentro il periodo) per risparmiare 0,6 pagine che non
+servivano. In più i **due sistemi di codici** erano mescolati e i nove codici applicativi non
+comparivano mai insieme.
+
+**Nuovo taglio delle due sottosezioni**: si cammina il canale nell'ordine in cui i frame
+accadono, e ogni messaggio ha il suo **esempio JSON reale**, con i nomi di campo presi dal
+codice. Prosa solo per ciò che il JSON non può dire (vincoli, opzionalità, perché).
+Il sequence diagram `fig:seq-reserve` resta. Ripristinata `tab:plugged`; `tab:driver-actions`
+è stata **sostituita** da `tab:driver-errors`, i nove codici in tabella. Nuovo stile
+`msg` in `main.tex` per i blocchi di messaggio (scriptsize, senza caption né numero).
+
+Documento **26 → 29 pagine** su tetto 35. Linter su §9: 0 FAIL, 0 WARN, SD 15,4. Compila con
+0 errori, 0 riferimenti indefiniti, 1 overfull da 4,7 pt (preesistente).
+
+**Bug trovato compilando: il documento non compilava.** Nel working tree, non committata, la
+caption di `lst:envelope` era troncata a `caption={The envelope of both WebSocket channels.]`
+senza graffa di chiusura. Con un `.aux` vecchio l'errore restava nascosto; con `.aux` fresco
+sono cinque errori. Ripristinata da HEAD. **Regola: prima di consegnare, `rm -f main.aux
+main.toc main.out` e ricompilare da zero.**
+
+**Divergenze contratto/codice raccolte verificando i campi** (il codice vince, i contratti
+vanno corretti o almeno saputi all'orale):
+
+- `ws-driver.md` elenca dieci codici di errore, il codice ne produce nove: `NOT_YOUR_TURN`
+  (§6 e §4.4) è della waiting list, che non esiste.
+- `ws-driver.md:378` dichiara `SESSION_TICK_MS`, che il codice non legge: `session` viaggia
+  sullo stesso timer di `state`, un timer solo per non mandare due frame di due istanti.
+- `ws-driver.md:228` e `:196` sono note M1 stantie: dicono che il frame `session` non esiste
+  e che `suspended` non è producibile. Entrambe false da M2.
+- `ws-driver.md:179` mostra `waitlist` con `length: 3`; il codice emette sempre la costante
+  `{"length": 0, "my_position": null}`.
+- `ws-chargepoint.md:70,152` scrive `"limit_kw": 60` e `0`; sul filo sono **float**, `60.0` e
+  `0.0`.
+- `erlang/scelte_di_progetto.md:519` è stantia sul budget di silenzio: non è
+  `3 × 30 s` in parallelo ma **60 s di idle timeout cowboy e poi 30 s di grazia del
+  connettore, in serie**, e la riga giusta è `:1256`. `:1568` dice ancora che il socket si
+  arrende con un `4404`: il codice chiude **1012**.
+
+Fatti nuovi entrati nel documento e che prima non c'erano da nessuna parte: i due timer del
+silenzio in serie, `held_by_me` e `mine` che non sono sinonimi, l'ordine di precedenza delle
+`phase`, l'eviction del secondo socket che avviene al `boot` e non all'handshake, e il replay
+interno che scarta `charging_seconds` perché una durata invecchia mentre la copia sta ferma.
+
+## 7zw. Via anche §10 Deployment — 7 settembre
+
+Decisione di Caleb, stessa logica di §11: il deploy lo si vede alla demo.
+`sections/10-deployment.tex` cancellata e tolta da `main.tex`. Future Works diventa **§10**,
+il documento **29 → 28 pagine** su tetto 35. Compila con 0 errori e 0 riferimenti indefiniti.
+
+**Ho dovuto toccare una riga di §1, che è di B.** `01-introduction.tex:41` chiudeva con
+`(\cref{sec:deployment})`, che senza §10 diventa un `??` nel PDF consegnato. Ho cambiato il
+solo target del riferimento, da `sec:deployment` a `sec:components`, che è §4.2: stessa frase,
+stesso senso, e §4.2 parla esattamente di quello (`The delivered deployment is seven nodes,
+each a Docker container on one host`). Nessuna parola di B riscritta. Da dire a B alla
+revisione incrociata.
+
+**Il requisito «deploy su più nodi» resta coperto**, contro quanto temevo prima di guardare:
+sta in §4.2, che è di B e non si tocca — la frase sui sette nodi, `tab:nodes` che li elenca, e
+`fig:deployment` che li dispone sulla rete condivisa.
+
+**Cosa è uscito davvero con §10**, e all'orale non c'è più la carta:
+i comandi per farlo partire (`docker compose build`, `up -d` con `.env.demo`); le due immagini
+multi-stage e il fatto che `ERL_APP` faccia di una sola immagine sia stazione sia
+coordinatore; `epmd` nell'immagine del back office perché JInterface pubblica il nodo nascosto
+sul port mapper del proprio host; i nomi `vs@<hostname>` corti e l'assenza di `COORD_ID`, con
+la priorità bully che è la posizione nella lista ordinata `COORD_NODES`; l'health check di
+MySQL generoso perché un primo avvio su volume freddo prese più di sei minuti; i charge point
+fuori dal compose perché sono hardware emulato.
+
+E soprattutto le **due decisioni con l'alternativa scartata**, che sono la parte valutata:
+un container per nodo invece di più nodi `-sname` sullo stesso sistema operativo (nodi che
+condividono filesystem, stack di rete e destino non provano niente sull'isolamento, mentre un
+`docker kill` su un container è un guasto vero di un nodo); e la rete singola, dopo che la
+seconda rete per sito aggiunta il 3 settembre si rivelò basata su una premessa falsa, perché
+una porta pubblicata continua a funzionare mentre il container è staccato dal bridge.
+
+Se servono si recuperano: `git show df1caac:src/doc/sections/10-deployment.tex`.
