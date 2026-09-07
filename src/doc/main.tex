@@ -82,7 +82,8 @@
 {\large Academic Year 2025/2026\par}
 \end{titlepage}
 
-\tableofcontents
+\setcounter{tocdepth}{2}   % sections and subsections, in \small: one page of contents
+\begingroup\footnotesize\setlength{\parskip}{0pt}\tableofcontents\endgroup
 \newpage
 
 \input{sections/01-introduction}

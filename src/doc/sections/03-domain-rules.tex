@@ -1,19 +1,17 @@
 \section{Domain Rules}
 \label{sec:domain-rules}
 
-These are the rules the system enforces, in the order a driver meets them. They are what
-the later sections implement, so they are stated here without discussion. Every number is
-configuration; \cref{tab:params} gives the defaults and the shorter values used for the
-demonstration. Nothing in the demonstration profile scales a clock.
+The rules the system enforces, in the order a driver meets them, stated without
+discussion. Every number is configuration; \cref{tab:params} gives the defaults and the
+shorter values used for the demonstration, where no clock is scaled.
 
 \paragraph{Reservation and lease.} A reservation is for one connector at one station and
 holds it for \texttt{LEASE\_SECONDS}, 15 minutes by default. When the lease runs out with
 nobody plugged in, the connector frees itself: no operator, no client. Two minutes before
-the end the driver is warned, when the lease is long enough for a warning to mean
-anything. A reservation is only ever granted after the coordinator has
-issued a \textbf{claim} for the vehicle (\cref{sec:p2}); the claim is what makes the
-network-wide rule hold, one vehicle, one reservation, and it outlives the reservation by
-\texttt{CLAIM\_GRACE\_SECONDS} so that it never expires underneath one that is still alive.
+the end the driver is warned. A reservation is only ever granted after the coordinator has
+issued a \textbf{claim} for the vehicle (\cref{sec:p2}), which enforces the network-wide
+rule and outlives the reservation by \texttt{CLAIM\_GRACE\_SECONDS}, so that it never
+expires underneath one that is still alive.
 
 \paragraph{No-show and suspension.} Turning up resets the counter. After
 \texttt{PENALTY\_NO\_SHOWS} consecutive expired reservations (two) the account loses the
@@ -31,12 +29,11 @@ session (\cref{sec:station-failures}).
 
 \paragraph{End of charge, grace, overstay.} A session ends when the driver stops it, when
 the battery reaches 100\%, or when the coordinator revokes the claim. The cable is still in
-the car at that point, and the connector stays occupied. For \texttt{OVERSTAY\_GRACE\_SECONDS}
-(five minutes) that costs nothing; from the first second after it the connector is
-\texttt{overstay} and every started minute is charged at the station's overstay rate. The
-overstay is the one charge in the system that is a deterrent, and it is the only thing the
-software can do about a parked car: no timer moves one, so the system notices, tells the
-driver, and makes waiting expensive.
+the car, and the connector stays occupied. For \texttt{OVERSTAY\_GRACE\_SECONDS} (five
+minutes) that costs nothing; after it the connector is \texttt{overstay} and every started
+minute is charged at the station's overstay rate. It is the only thing the software can do
+about a parked car: no timer moves one, so the system notices, tells the driver, and makes
+waiting expensive.
 
 \begin{figure}[t]
 \centering
@@ -77,10 +74,9 @@ session whose share would fall below \texttt{MIN\_CHARGE\_KW} (6~kW) is \texttt{
 instead: alive, drawing nothing, and told so.
 
 \paragraph{Tariff and billing.} Each station has a tariff in cents per kWh and an overstay
-rate in cents per minute. A session's cost is energy at the tariff plus the overstay
-minutes, rounded up to the started minute; it is computed by the back office after the
-session row has been written, on a periodic sweep, so billing is never a contended
-resource. A driver reads the cost in the history page.
+rate in cents per minute. Cost is energy at the tariff plus the started overstay minutes,
+computed by the back office on a periodic sweep after the session row has been written, so
+billing is never a contended resource.
 
 \begin{table}[h]
 \centering\small
