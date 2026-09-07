@@ -4621,3 +4621,45 @@ seconda rete per sito aggiunta il 3 settembre si rivelò basata su una premessa 
 una porta pubblicata continua a funzionare mentre il container è staccato dal bridge.
 
 Se servono si recuperano: `git show df1caac:src/doc/sections/10-deployment.tex`.
+
+## 7 settembre — §9.3 riscritta perché non si capiva cosa dicessero i messaggi
+
+Il difetto era la tabella `tab:cp-messages`: la colonna «Payload and effect» teneva insieme i
+campi del payload e ciò che era stato tolto da OCPP, e in mezzo non diceva mai in parole
+semplici *cosa afferma* un frame. Chi legge trovava `plugged | Authorize + StartTransaction |
+vehicle_id, soc_pct, battery_kwh, max_kw; id tags and the local authorisation cache are
+dropped` e non ne ricavava che il messaggio significa «un cavo è entrato in una macchina, ed è
+questa».
+
+Resta **una tabella sola**. `tab:cp-messages` ha ora una colonna «What it says» in inglese
+piano (una frase per messaggio) e una «Payload» con i soli campi; la mappatura verso OCPP
+1.6-J è scesa nella decisione che la giustifica, come una frase in prosa invece che come una
+seconda tabella. Al primo tentativo avevo fatto proprio la seconda tabella e la sezione era
+cresciuta: era l'opposto di quello che serviva, e la mappatura in prosa dice le stesse otto
+corrispondenze in dieci righe.
+
+Prima della tabella un paragrafo di quattro frasi dà la sequenza di vita di un connettore
+(`boot`, poi `heartbeat` e `status`, poi `plugged`, `meter` ogni 5 s, `unplugged`, e i due
+ordini in discesa). Era l'informazione che mancava del tutto: la vecchia versione elencava
+otto messaggi senza dire in che ordine accadono.
+
+I bullet sono accorciati, perché ora la tabella dice già significato e payload e a loro resta
+solo ciò che la tabella non può dire. `boot` da 13 righe a 9, `plugged` da 10 a 7,
+`heartbeat` e `status` da quattro righe a una e a due. Aggiunta una frase su `power_kw` sotto
+il limite quando l'auto fa tapering, presa da `contracts/ws-chargepoint.md:128`: senza,
+`meter` sembrava un dato da registrare e basta.
+
+Seconda passata, togliendo i dettagli implementativi che in una sezione di specifica non
+servono: via la atom table dal bullet di `status` (resta «logged and dropped»; il perché sta
+nel commento a `vs_cp_proto.erl:909`), `max(stored, reported)` diventa «the stored total is
+never allowed to go down», via il nome `vs_cp_ws` dal bullet di `stop`, via «Cowboy» dal
+paragrafo Silence (il calcolo 60+30=90 s resta, che è la parte che vale), e i cinque
+tentativi a 500 ms della quarta chiusura diventano «waits a few seconds for the supervisor».
+
+Bilancio: §9.3 va da 176 righe a 169, con dentro i significati che prima non c'erano.
+Documento da 26 a 25 pagine.
+
+Corrette anche due righe di §9.2 che uscivano nel margine (95 pt) sull'elenco delle sei
+notifiche, spezzabili dopo l'underscore.
+
+Linter ok, `latexmk` pulito, 26 pagine, nessun riferimento indefinito.
