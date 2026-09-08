@@ -4663,3 +4663,10 @@ Corrette anche due righe di §9.2 che uscivano nel margine (95 pt) sull'elenco d
 notifiche, spezzabili dopo l'underscore.
 
 Linter ok, `latexmk` pulito, 26 pagine, nessun riferimento indefinito.
+
+Riscritto il secondo bullet di «Decisions on this channel» in §9.3, che diceva la decisione
+senza dire il meccanismo: «Timestamps that matter are the station's» diventa «The station
+keeps the clock», e il bullet ora esplicita il conto, la stazione sottrae
+`charging_seconds` dalla propria ora corrente e ottiene `started_at`. L'esempio dei quattro
+minuti di sfasamento sostituisce il generico «two clocks minutes apart». Via anche il
+«never an instant», che era un parallelismo negativo in più.

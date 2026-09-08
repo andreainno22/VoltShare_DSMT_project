@@ -287,17 +287,7 @@ rule is the idle timeout on the socket and this channel needs no \texttt{ping}.
 The budget is three heartbeats, 90~s, and the part worth knowing is that it is spent in
 series and not in parallel. The listener waits 60~s, two intervals, and closes the socket.
 Only then does the connector see the socket die and arm its own 30~s of grace. Adding the
-two gives the 90~s. An earlier version had both timers computing the whole budget, and a
-mute charge point stayed reservable for three minutes.
-
-\paragraph{Four ways the socket closes.} The permanent one is decided at the handshake, when
-the query string is unreadable, or names another station, or names a connector this station
-does not own. A second socket booting for the same connector evicts the first, and the
-eviction waits for the \texttt{boot}, so that a half-open connection cannot throw out a
-working charge point before saying a word. The station shutting down closes after its
-\texttt{stop} frame. The fourth is the connector process dying under a socket that is
-perfectly healthy: the socket waits a few seconds for the supervisor to put a replacement in
-its place, hands it what it knows about the connector, and closes only if none arrives.
+two gives the 90~s.
 
 \paragraph{Reconciliation after a station restart.} The connector processes die with the
 node, so the station has no memory of the session. The charge point reconnects, boots, and
@@ -312,26 +302,8 @@ because a duration measured earlier no longer says how long the charge has been 
 
 \paragraph{Decisions on this channel.}
 \begin{itemize}
-  \item \textbf{A subset of OCPP 1.6-J, with the same direction of authority.} Full OCPP
-        was rejected for its surface: configuration keys, id tags, a nine-state model,
-        charging profiles with stacking levels. The coordination problem needs none of it.
-        An invented protocol was rejected too, because it would have left the emulator with
-        nothing to be an emulator of. Message by message: \texttt{boot} is
-        \texttt{BootNotification} without the configuration keys, \texttt{status} is
-        \texttt{StatusNotification} with nine states cut to four, \texttt{plugged} is
-        \texttt{Authorize} plus \texttt{StartTransaction} with the vehicle identifying itself
-        instead of an id tag, \texttt{meter} is \texttt{MeterValues} down to three
-        measurands, \texttt{unplugged} is \texttt{StopTransaction}, \texttt{set\_limit} is
-        \texttt{SetChargingProfile} stripped of profiles and stacking levels, and
-        \texttt{stop} is \texttt{RemoteStopTransaction}. The four operations OCPP adds for
-        firmware, resets and cable release have no counterpart here.
-  \item \textbf{Limits are repeated on every tick}, even when unchanged, so a missed frame
-        is corrected within one tick. Delta tracking was rejected on a channel with no
-        ordering problem to justify it.
-  \item \textbf{Timestamps that matter are the station's.} The equipment sends quantities
-        it measured itself: cumulative energy and a duration, never an instant. A
-        \texttt{started\_at} from the hardware was rejected, because two clocks minutes
-        apart would produce two different sessions from one charge.
+  \item \textbf{Limits are repeated on every tick}, even when unchanged, so a missed frame is corrected within one tick. 
+  \item \textbf{The station keeps the clock.} What the charge point reports is a duration: the seconds it has been charging. The station subtracts it from its own current time, and that is \texttt{started\_at}. An instant sent by the hardware was rejected, because nothing keeps the two clocks together.
 \end{itemize}
 
 \subsection{Claims: station to coordinator}
