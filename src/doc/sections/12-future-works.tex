@@ -5,9 +5,7 @@ Three extensions, none started, each with the reason it was set aside.
 
 \paragraph{A waiting list for a full station.} A driver who finds every connector taken has
 nothing to join. The feature needs a per-station queue with an owner, and an offer that is
-itself a lease, so that a waiter who never comes back cannot freeze the queue. It was in the
-first scope. The time went instead to the coordination problems of \cref{sec:problems}, where
-the exclusive-use invariants are won or lost.
+itself a lease, so that a waiter who never comes back cannot freeze the queue.
 
 \paragraph{Native push notifications.} There is no mobile push. The overstay notice reaches a
 driver who is looking at the page, or who reopens the application later, so the grace period
@@ -19,9 +17,4 @@ device and outlives the browser.
 
 \paragraph{An operator console.} The back office is read-only. Taking a connector out of
 service by hand, or closing a session that a charge point has left hanging, would be a
-command from the web tier into the cluster, and the JInterface bridge of
-\cref{sec:api-bridge} already carries that direction for suspensions. What is missing sits
-above the transport: a screen of its own in the web application, restricted to an operator
-role that the token does not yet distinguish, and a durable record of who overrode what. A
-manual exception to an exclusive-use invariant is the event most likely to need an
-explanation afterwards.
+command for the operator dashboard. 
